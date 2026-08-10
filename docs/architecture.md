@@ -43,6 +43,10 @@ Controller 定期通过已经固定 host key 的 Worker `status` 命令获取角
 
 `/api/v1/metrics` 汇总任务状态、成功 Attempt 的阶段平均耗时、Agent 调用/失败/成本、依赖下载与缓存命中，以及归档副本状态。第一版由认证后的 Web UI 消费该 JSON，不另行引入 Prometheus、Redis 或消息系统。
 
+Controller 每 24 小时或按管理员请求执行一次控制面一致性备份。备份使用 SQLite `VACUUM INTO` 从 WAL 数据库生成单文件快照，随后执行 `PRAGMA integrity_check`、计算 SHA-256，并用 Controller Ed25519 身份签署版本化 `ControlPlaneBackup`。数据库文件和签名 Envelope 先在同一文件系统暂存、同步，再以目录 rename 提交；失败记录不会冒充 verified。控制面数据库保存密码哈希和业务状态但不保存 GPG、SSH、CA 或 Agent API 私钥，因此这些 secret 仍必须按首次向导要求另行离线备份。
+
+离线恢复命令先核对当前 Controller 公钥、Envelope、固定文件名、大小、摘要和 SQLite 完整性，再复制到目标文件系统复验。替换前把原数据库及 WAL/SHM 一并移动到带 UTC 时间和 Backup ID 的 `recovery` 目录，恢复中途失败时尝试放回原数据库。恢复要求先停止 Controller；在线 API 不提供数据库替换能力。
+
 ## AUR 同步与依赖闭包
 
 Controller 不直接访问 AUR。浏览器请求由 Controller 认证后，经固定 argv 的 OpenSSH forced command 发给在线 Publisher；Publisher Worker 才能调用 AUR RPC 和 AUR Git。Builder 或 Archiver 收到同类命令会以角色错误拒绝。

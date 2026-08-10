@@ -30,6 +30,7 @@ services:
       AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
       AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
       AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
+      AURSMITH_BACKUP_DIR: /var/lib/aursmith/backups
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
       - setup_token

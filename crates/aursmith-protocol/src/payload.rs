@@ -256,6 +256,14 @@ pub struct ArchiveReceipt {
     pub verified_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlPlaneBackup {
+    pub backup_id: Uuid,
+    pub database: ManifestEntry,
+    pub source_git_commit: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

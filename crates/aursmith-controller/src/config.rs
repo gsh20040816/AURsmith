@@ -23,6 +23,7 @@ pub struct Config {
     pub webhook_url: Option<String>,
     pub webhook_hmac_secret_file: String,
     pub ntfy_url: Option<String>,
+    pub backup_dir: String,
 }
 
 impl Config {
@@ -86,6 +87,8 @@ impl Config {
             webhook_hmac_secret_file: env::var("AURSMITH_WEBHOOK_HMAC_SECRET_FILE")
                 .unwrap_or_else(|_| "/run/secrets/webhook_hmac_secret".into()),
             ntfy_url: optional_env("AURSMITH_NTFY_URL"),
+            backup_dir: env::var("AURSMITH_BACKUP_DIR")
+                .unwrap_or_else(|_| "/var/lib/aursmith/backups".into()),
         })
     }
 

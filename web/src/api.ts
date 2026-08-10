@@ -172,6 +172,15 @@ export type Doctor = {
   checked_at: string;
   checks: Array<{ id: string; ok: boolean; message: string }>;
 };
+export type ControlPlaneBackup = {
+  id: string;
+  state: "creating" | "verified" | "failed";
+  database_sha256: string | null;
+  database_size: number | null;
+  last_error: string | null;
+  created_at: string;
+  verified_at: string | null;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -207,6 +216,9 @@ export const api = {
   alerts: () => request<{ items: Alert[] }>("/api/v1/alerts"),
   acknowledgeAlert: (id: string) => request<{ id: string; state: string }>(`/api/v1/alerts/${encodeURIComponent(id)}/acknowledge`, { method: "POST" }),
   doctor: () => request<Doctor>("/api/v1/doctor"),
+  backups: () => request<{ items: ControlPlaneBackup[] }>("/api/v1/backups"),
+  createBackup: () => request<ControlPlaneBackup>("/api/v1/backups", { method: "POST" }),
+  verifyBackup: (id: string) => request<ControlPlaneBackup>(`/api/v1/backups/${encodeURIComponent(id)}/verify`, { method: "POST" }),
   activateProfile: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>

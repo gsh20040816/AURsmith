@@ -93,3 +93,10 @@
 - 回归：首次运行发现旧 Doctor mock 缺少 `checks` 时 Dashboard 崩溃；实现改为让核心 Dashboard 与可选 Doctor 请求独立加载，异常或旧响应不再阻断需求总账和 Worker 概览。
 - 覆盖：SQLite 迁移在空数据库实际执行；测试验证发布背压默认关闭且能读取持久化值，通知 URL 拒绝内嵌凭据和非 HTTP(S) scheme；Compose 检查继续确认无 privileged、Docker/libvirt Socket，Builder 只获得 `/dev/kvm`，Signer 断网且私钥不进入 Publisher。
 - 未覆盖：本条没有把真实磁盘压到 15%/10%，没有制造 20 GiB 未归档数据，也没有向外部 Webhook 或 ntfy 实际投递；因此这里只确认状态机、静态安全边界和 UI 构建，不声称外部通知端到端已经验收。
+
+## 2026-08-10：控制面一致性备份和离线恢复
+
+- 测试在临时文件数据库完成全部 migration，写入 `before` 状态后执行正式备份实现；备份由 `VACUUM INTO` 生成，经过 `integrity_check`、SHA-256 和测试 Controller Ed25519 密钥签名。
+- 随后把在线数据库状态改为 `after`、关闭连接池，并执行正式 `restore-control-plane` 内核逻辑。重新连接后读到签名快照中的 `before`，证明恢复的不是修改后的主数据库。
+- 测试确认被替换数据库进入 `recovery` 目录；另有路径测试拒绝内存数据库和带查询参数的恢复目标，避免把不明确 URL 当成文件覆盖。
+- 未覆盖：本条使用临时目录和测试密钥，没有在 Docker volume 上执行人工停机恢复演练；备份自动传输到独立 Archiver 尚未接入，因此当前只完成本地一致性与可恢复性，不满足独立故障域验收。

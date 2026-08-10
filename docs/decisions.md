@@ -28,6 +28,7 @@
 - ADR-024：仓库公钥可以由 Publisher 公开下载，但私钥仍只存在于断网 Signer。Controller 不自行猜测指纹，而是在固定 Publisher 身份时保存其 GPG 完整指纹；客户端引导必须要求人工核对后才执行 `pacman-key --lsign-key`。
 - ADR-025：动态依赖优化以七天统计周期和迟滞状态实现，不直接修改正在使用的 Guest。优化器只对官方包给出加入/移除计划；每个计划仍经过完整 Profile 重建、签名授权、KVM fixture 和人工激活，避免统计波动把未经验证的环境直接投入构建。
 - ADR-026：Worker 容量和能力复用已有签名身份与 OpenSSH 心跳采集，不部署额外主机 Agent。Publisher 低于 10% 可用空间时使用 SQLite 持久化背压停止新任务和 Release，当前仓库仍可读；告警通知使用 SQLite outbox、HMAC Webhook或 ntfy，不为单用户部署引入消息队列。
+- ADR-027：控制面备份使用 SQLite 原生 `VACUUM INTO`，而不是在 WAL 运行时复制主数据库文件。每份快照必须通过完整性检查并由 Controller Ed25519 签名；恢复只作为停机 CLI 提供，并先保留当前数据库，避免 Web 请求在线覆盖控制面。
 
 ## 已拒绝
 

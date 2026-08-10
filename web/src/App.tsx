@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Alert, ApiError, ArchiveCopy, Audit, AurPackage, BuildProfile, ClientBootstrap, Doctor, Job, ProfileRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
+import { Alert, ApiError, ArchiveCopy, Audit, AurPackage, BuildProfile, ClientBootstrap, ControlPlaneBackup, Doctor, Job, ProfileRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -354,9 +354,13 @@ function ArchivesView() {
 
 function ClientBootstrapView() {
   const [bootstrap, setBootstrap] = useState<ClientBootstrap | null>(null);
+  const [backups, setBackups] = useState<ControlPlaneBackup[]>([]);
   const [error, setError] = useState("");
-  useEffect(() => { void api.clientBootstrap().then(setBootstrap).catch((reason) => setError(messageOf(reason))); }, []);
-  return <><header className="page-header compact"><div><p className="eyebrow">U02</p><h1>客户端接入</h1><p className="lede">先人工核对仓库 GPG 指纹，再把仓库配置加入 1～2 台 Arch 客户端。</p></div></header>{error && <Notice kind="error">{error}</Notice>}{bootstrap && <><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">完整指纹</p><h2><code>{bootstrap.gpg_fingerprint}</code></h2></div></div>{bootstrap.warnings.map((warning) => <p key={warning}>{warning}</p>)}</section><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pacman.conf</p><h2>仓库配置</h2></div></div><pre><code>{bootstrap.repository_config}</code></pre><div className="finding-list">{bootstrap.commands.map((command) => <div key={command}><code>{command}</code></div>)}</div></section></>}</>;
+  const refreshBackups = () => void api.backups().then((response) => setBackups(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(() => { void api.clientBootstrap().then(setBootstrap).catch((reason) => setError(messageOf(reason))); refreshBackups(); }, []);
+  const createBackup = async () => { setError(""); try { await api.createBackup(); refreshBackups(); } catch (reason) { setError(messageOf(reason)); } };
+  const verifyBackup = async (id: string) => { setError(""); try { await api.verifyBackup(id); refreshBackups(); } catch (reason) { setError(messageOf(reason)); } };
+  return <><header className="page-header compact"><div><p className="eyebrow">U02 · R03</p><h1>客户端接入与备份</h1><p className="lede">先人工核对仓库 GPG 指纹；控制面备份使用同一 Controller 身份签署并独立复验。</p></div></header>{error && <Notice kind="error">{error}</Notice>}{bootstrap && <><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">完整指纹</p><h2><code>{bootstrap.gpg_fingerprint}</code></h2></div></div>{bootstrap.warnings.map((warning) => <p key={warning}>{warning}</p>)}</section><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pacman.conf</p><h2>仓库配置</h2></div></div><pre><code>{bootstrap.repository_config}</code></pre><div className="finding-list">{bootstrap.commands.map((command) => <div key={command}><code>{command}</code></div>)}</div></section></>}<section className="work-panel"><div className="section-heading"><div><p className="eyebrow">控制面</p><h2>签名一致性备份</h2></div><button className="secondary-button" onClick={() => void createBackup()}>立即备份</button></div>{backups.length === 0 ? <p className="panel-note">尚无控制面备份。</p> : <div className="finding-list">{backups.map((backup) => <div key={backup.id}><code>{backup.state}</code><strong>{new Date(backup.created_at).toLocaleString("zh-CN")} · {backup.database_size ?? 0} 字节</strong><button className="text-button" onClick={() => void verifyBackup(backup.id)}>复验</button></div>)}</div>}<p className="panel-note">恢复必须停止 Controller 后，在容器中执行 restore-control-plane；系统会保留被替换数据库。</p></section></>;
 }
 
 function AlertsView() {

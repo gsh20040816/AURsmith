@@ -92,6 +92,20 @@ ntfy 使用 `AURSMITH_NTFY_URL=https://<服务器>/<主题>` 配置。第一版�
 
 Doctor 页面显示每个 Worker 的在线状态、数据卷可用百分比和时钟偏差。部署前应确保 Worker 主机启用时间同步；偏差超过 60 秒会告警。Publisher 可用空间低于 10% 时新任务和新 Release 被背压，恢复到 10% 以上后下次心跳自动解除。不要通过修改 SQLite 设置绕过容量保护。
 
+## 控制面备份与恢复
+
+Controller 默认把每日一致性备份写入同一持久卷的 `/var/lib/aursmith/backups/<Backup ID>/`。这能防止进程或误操作损坏，但不能替代独立故障域；在自动传输到 Archiver 完成前，部署者必须定期把整个 Backup ID 目录复制到独立存储，且同时保留 `controller_signing_key` 的离线副本。不要只复制 `controller.db` 而丢失 `backup-envelope.json`。
+
+恢复时先停止 Controller 服务，确认没有其他容器打开数据库卷，然后以只挂载 Controller 数据卷和必要 secret 的一次性容器执行：
+
+```bash
+docker compose -f deploy/controller/compose.yaml stop controller
+docker compose -f deploy/controller/compose.yaml run --rm --no-deps controller restore-control-plane --backup /var/lib/aursmith/backups/<Backup ID>
+docker compose -f deploy/controller/compose.yaml start controller
+```
+
+命令会验证 Controller 签名、SHA-256 和 SQLite `integrity_check`。被替换的数据库、WAL 与 SHM 移入 `/var/lib/aursmith/recovery/<UTC 时间>-<Backup ID>/`，不会自动删除。恢复后必须运行 Doctor，并核对 Worker、当前 Release、ArchiveCopy 和管理员登录；确认无误前不要清理 recovery 目录。
+
 ## Git 与发布
 
 - 日常开发直接进入 `main`，每个独立且验证通过的改动形成一个英文提交。

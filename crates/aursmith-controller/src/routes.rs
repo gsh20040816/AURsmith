@@ -53,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/metrics", get(metrics_status))
         .route("/api/v1/alerts", get(list_alerts))
         .route("/api/v1/alerts/{id}/acknowledge", post(acknowledge_alert))
+        .route("/api/v1/backups", get(list_backups).post(create_backup))
+        .route("/api/v1/backups/{id}/verify", post(verify_backup))
         .route("/api/v1/workers", get(list_workers).post(register_worker))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
@@ -285,6 +287,51 @@ async fn acknowledge_alert(
     )
     .await?;
     Ok(Json(json!({"id": id, "state": "acknowledged"})))
+}
+
+async fn list_backups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    Ok(Json(crate::backups::list(&state.database).await?))
+}
+
+async fn create_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let result = crate::backups::create(&state).await?;
+    append_event(
+        &state.database,
+        "control_plane_backup",
+        result["id"].as_str().unwrap_or("unknown"),
+        "control_plane_backup_created",
+        result.clone(),
+        &actor,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+async fn verify_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let result = crate::backups::verify_record(&state, &id).await?;
+    append_event(
+        &state.database,
+        "control_plane_backup",
+        &id,
+        "control_plane_backup_verified",
+        result.clone(),
+        &actor,
+    )
+    .await?;
+    Ok(Json(result))
 }
 
 async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -944,6 +991,7 @@ mod tests {
             webhook_url: None,
             webhook_hmac_secret_file: "/不存在".into(),
             ntfy_url: None,
+            backup_dir: "/不存在".into(),
         };
         router(AppState::new(
             database,

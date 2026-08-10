@@ -72,6 +72,17 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+    let backup_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(std::time::Duration::from_secs(60 * 60));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = crate::backups::create_if_due(&backup_state).await {
+                tracing::warn!(%error, "控制面自动备份失败");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);

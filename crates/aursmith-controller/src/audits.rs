@@ -444,6 +444,7 @@ mod tests {
             webhook_url: None,
             webhook_hmac_secret_file: "/不存在".into(),
             ntfy_url: None,
+            backup_dir: "/不存在".into(),
         };
         AppState::new(
             database,
