@@ -1,0 +1,59 @@
+name: aursmith-controller
+
+services:
+  controller:
+    build:
+      context: ../..
+      dockerfile: deploy/images/controller.Dockerfile
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_BIND: 0.0.0.0:8080
+      AURSMITH_DATABASE_URL: sqlite:///var/lib/aursmith/controller.db
+      AURSMITH_SETUP_TOKEN_FILE: /run/secrets/setup_token
+      AURSMITH_SECURE_COOKIES: ${AURSMITH_SECURE_COOKIES:-true}
+      RUST_LOG: ${RUST_LOG:-aursmith=info}
+    secrets:
+      - setup_token
+    volumes:
+      - controller-data:/var/lib/aursmith
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks: [control]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/images/web.Dockerfile
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /config:size=16m,mode=0700
+      - /data:size=16m,mode=0700
+      - /tmp:size=16m,mode=1777
+    ports:
+      - ${AURSMITH_WEB_BIND:-127.0.0.1:8080}:8080
+    networks: [control]
+    depends_on:
+      controller:
+        condition: service_healthy
+    restart: unless-stopped
+
+secrets:
+  setup_token:
+    file: ${AURSMITH_SETUP_TOKEN_FILE:-./secrets/setup_token}
+
+volumes:
+  controller-data:
+
+networks:
+  control:
+    internal: true

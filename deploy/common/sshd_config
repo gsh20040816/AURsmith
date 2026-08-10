@@ -1,0 +1,21 @@
+Port 2222
+AddressFamily any
+ListenAddress 0.0.0.0
+HostKey /run/secrets/ssh_host_ed25519_key
+AuthorizedKeysFile /run/secrets/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+X11Forwarding no
+PermitTTY no
+PermitTunnel no
+AllowUsers aursmith
+ForceCommand /usr/local/bin/aursmithctl ssh-gateway --socket /run/aursmith/worker.sock
+PidFile /tmp/sshd.pid
+LogLevel VERBOSE
+StrictModes no

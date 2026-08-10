@@ -1,0 +1,24 @@
+{
+    auto_https off
+    admin off
+}
+:8080 {
+    encode zstd gzip
+    handle /api/* {
+        reverse_proxy controller:8080
+    }
+    handle /healthz {
+        reverse_proxy controller:8080
+    }
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer
+        Content-Security-Policy "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
+    }
+}

@@ -1,0 +1,275 @@
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { ApiError, Requirement, Session, Worker, api } from "./api";
+
+type View =
+  | "dashboard"
+  | "packages"
+  | "audits"
+  | "builds"
+  | "workers"
+  | "profiles"
+  | "releases"
+  | "archives"
+  | "alerts"
+  | "settings";
+
+const navigation: Array<{ id: View; label: string; requirement: string }> = [
+  { id: "dashboard", label: "总览", requirement: "U01" },
+  { id: "packages", label: "软件包", requirement: "P01" },
+  { id: "audits", label: "审计", requirement: "A01" },
+  { id: "builds", label: "构建", requirement: "B01" },
+  { id: "workers", label: "Worker", requirement: "W02" },
+  { id: "profiles", label: "Profile", requirement: "B04" },
+  { id: "releases", label: "Release", requirement: "R02" },
+  { id: "archives", label: "归档", requirement: "R03" },
+  { id: "alerts", label: "告警", requirement: "U03" },
+  { id: "settings", label: "设置", requirement: "U02" }
+];
+
+export function App() {
+  const [boot, setBoot] = useState<"loading" | "setup" | "login" | "ready">("loading");
+  const [session, setSession] = useState<Session | null>(null);
+  const [view, setView] = useState<View>("dashboard");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void api.setupStatus()
+      .then(async ({ initialized }) => {
+        if (!initialized) {
+          setBoot("setup");
+          return;
+        }
+        try {
+          const current = await api.me();
+          setSession(current);
+          setBoot("ready");
+        } catch {
+          setBoot("login");
+        }
+      })
+      .catch((reason) => {
+        setError(messageOf(reason));
+        setBoot("login");
+      });
+  }, []);
+
+  if (boot === "loading") {
+    return <LoadingScreen />;
+  }
+  if (boot === "setup") {
+    return <SetupScreen onComplete={() => setBoot("login")} />;
+  }
+  if (boot === "login") {
+    return (
+      <LoginScreen
+        initialError={error}
+        onLogin={async () => {
+          const current = await api.me();
+          setSession(current);
+          setBoot("ready");
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="shell">
+      <aside className="sidebar">
+        <Brand />
+        <nav aria-label="主导航">
+          {navigation.map((item) => (
+            <button
+              className={view === item.id ? "nav-item active" : "nav-item"}
+              key={item.id}
+              onClick={() => setView(item.id)}
+            >
+              <span>{item.label}</span>
+              <code>{item.requirement}</code>
+            </button>
+          ))}
+        </nav>
+        <div className="operator">
+          <span className="status-dot" aria-hidden="true" />
+          <div>
+            <strong>{session?.username}</strong>
+            <small>本地管理员</small>
+          </div>
+          <button
+            aria-label="退出登录"
+            className="text-button"
+            onClick={() => void api.logout().finally(() => setBoot("login"))}
+          >
+            退出
+          </button>
+        </div>
+      </aside>
+      <main className="workspace">
+        {view === "dashboard" && <Dashboard />}
+        {view === "workers" && <WorkersView />}
+        {view !== "dashboard" && view !== "workers" && <PlannedView view={view} />}
+      </main>
+    </div>
+  );
+}
+
+function Brand() {
+  return (
+    <div className="brand">
+      <div className="brand-mark" aria-hidden="true"><span /></div>
+      <div>
+        <strong>AURsmith</strong>
+        <small>锻造控制台</small>
+      </div>
+    </div>
+  );
+}
+
+function Dashboard() {
+  const [requirements, setRequirements] = useState<Requirement[]>([]);
+  const [workers, setWorkers] = useState<Worker[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void Promise.all([api.requirements(), api.workers()])
+      .then(([requirementResponse, workerResponse]) => {
+        setRequirements(requirementResponse.items);
+        setWorkers(workerResponse.items);
+      })
+      .catch((reason) => setError(messageOf(reason)));
+  }, []);
+
+  const onlineWorkers = workers.filter((worker) => worker.state === "online").length;
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">当前锻造状态</p>
+          <h1>从上游变化到可安装软件包</h1>
+          <p className="lede">每一步都保留输入、决策和产物，失败不会覆盖当前稳定仓库。</p>
+        </div>
+        <div className="header-facts">
+          <span><strong>{onlineWorkers}</strong> 在线 Worker</span>
+          <span><strong>{requirements.length}</strong> 条需求受总账约束</span>
+        </div>
+      </header>
+      {error && <Notice kind="error">{error}</Notice>}
+      <ForgeRail />
+      <section className="dashboard-grid">
+        <div className="work-panel">
+          <div className="section-heading">
+            <div><p className="eyebrow">待处理</p><h2>现在需要你的决定</h2></div>
+            <button className="text-button">查看全部</button>
+          </div>
+          <div className="empty-state">
+            <span className="empty-symbol">✓</span>
+            <div><strong>没有待处理项目</strong><p>出现 Provider 冲突或审计分歧时，会在这里说明原因和下一步。</p></div>
+          </div>
+        </div>
+        <div className="ledger-panel">
+          <p className="eyebrow">需求总账</p>
+          <h2>实现不能悄悄丢项</h2>
+          <div className="ledger-list">
+            {requirements.slice(0, 8).map((requirement) => (
+              <div key={requirement.id}><code>{requirement.id}</code><span>{requirement.title}</span></div>
+            ))}
+          </div>
+          <p className="panel-note">API 直接读取代码中的规范列表；文档和测试将逐项核对。</p>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function ForgeRail() {
+  const stages = [
+    ["同步", "等待订阅"],
+    ["审计", "三 Agent 决策"],
+    ["构建", "KVM 无网"],
+    ["发布", "原子切换"],
+    ["归档", "独立回执"]
+  ];
+  return (
+    <section className="forge-rail" aria-label="软件包锻造流程">
+      {stages.map(([name, detail], index) => (
+        <div className="forge-stage" key={name}>
+          <span className={index === 0 ? "rail-node hot" : "rail-node"} />
+          <div><strong>{name}</strong><small>{detail}</small></div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function WorkersView() {
+  const [workers, setWorkers] = useState<Worker[]>([]);
+  const [error, setError] = useState("");
+  const refresh = () => void api.workers().then((response) => setWorkers(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  return (
+    <>
+      <header className="page-header compact"><div><p className="eyebrow">W02 / W04</p><h1>Worker</h1><p className="lede">角色分离部署，任务在本地 Journal 中保持幂等。</p></div></header>
+      {error && <Notice kind="error">{error}</Notice>}
+      <section className="table-panel">
+        <div className="section-heading"><h2>已注册节点</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>
+        {workers.length === 0 ? (
+          <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未注册 Worker</strong><p>先部署对应 Compose Stack，再固定 SSH host key 并注册端点。</p></div></div>
+        ) : (
+          <div className="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>端点</th><th>标签</th><th /></tr></thead><tbody>
+            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}</td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td><code>{worker.endpoint}</code></td><td>{worker.labels.join(" · ") || "—"}</td><td>{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</td></tr>)}
+          </tbody></table></div>
+        )}
+      </section>
+    </>
+  );
+}
+
+function PlannedView({ view }: { view: View }) {
+  const item = navigation.find((candidate) => candidate.id === view)!;
+  const explanations: Record<View, string> = {
+    dashboard: "",
+    packages: "搜索 AUR、管理直接与隐式订阅，并解释依赖阻塞链。",
+    audits: "查看确定性扫描、三个低成本 Agent 投票和人工处置记录。",
+    builds: "跟踪 ReleaseBatch DAG、KVM 阶段日志和构建 provenance。",
+    workers: "",
+    profiles: "依据真实构建统计管理不可变 Guest Profile。",
+    releases: "检查完整 Manifest、签名和当前仓库的原子切换记录。",
+    archives: "查看 ArchiveCopy、空间背压、巡检和恢复入口。",
+    alerts: "确认、追踪并解决去重后的系统告警。",
+    settings: "管理 Agent、保留期、预算、通知和客户端接入。"
+  };
+  return (
+    <><header className="page-header compact"><div><p className="eyebrow">{item.requirement}</p><h1>{item.label}</h1><p className="lede">{explanations[view]}</p></div></header><section className="work-panel"><div className="empty-state"><span className="empty-symbol">◇</span><div><strong>该纵向切片正在实现</strong><p>当前不会用静态假数据伪装功能完成；对应 API 和状态机落地后再开放操作。</p></div></div></section></>
+  );
+}
+
+function SetupScreen({ onComplete }: { onComplete: () => void }) {
+  const [token, setToken] = useState("");
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault(); setError("");
+    try { await api.setup({ token, username, password }); onComplete(); } catch (reason) { setError(messageOf(reason)); }
+  };
+  return <AuthFrame title="初始化锻造控制台" note="令牌只能通过 Controller 容器内命令读取。完成后它将失效。"><form onSubmit={(event) => void submit(event)}><Field label="初始化令牌" value={token} onChange={setToken} /><Field label="管理员名称" value={username} onChange={setUsername} /><Field label="密码" type="password" value={password} onChange={setPassword} hint="至少 12 个字符" />{error && <Notice kind="error">{error}</Notice>}<button className="primary-button" type="submit">创建管理员</button></form></AuthFrame>;
+}
+
+function LoginScreen({ initialError, onLogin }: { initialError: string; onLogin: () => Promise<void> }) {
+  const [username, setUsername] = useState("admin"); const [password, setPassword] = useState(""); const [error, setError] = useState(initialError);
+  const submit = async (event: FormEvent) => { event.preventDefault(); setError(""); try { await api.login({ username, password }); await onLogin(); } catch (reason) { setError(messageOf(reason)); } };
+  return <AuthFrame title="回到锻造控制台" note="登录只管理仓库控制面，不会远程操作你的 Arch 客户端。"><form onSubmit={(event) => void submit(event)}><Field label="管理员名称" value={username} onChange={setUsername} /><Field label="密码" type="password" value={password} onChange={setPassword} />{error && <Notice kind="error">{error}</Notice>}<button className="primary-button" type="submit">登录</button></form></AuthFrame>;
+}
+
+function AuthFrame({ title, note, children }: { title: string; note: string; children: React.ReactNode }) {
+  return <main className="auth-page"><section className="auth-intro"><Brand /><div><p className="eyebrow">私有 AUR 二进制仓库</p><h1>每一个包，<br />都有来路。</h1><p>{note}</p></div><ForgeRail /></section><section className="auth-form"><div><h2>{title}</h2><p>所有操作都会写入不可变事件记录。</p>{children}</div></section></main>;
+}
+
+function Field({ label, value, onChange, type = "text", hint }: { label: string; value: string; onChange: (value: string) => void; type?: string; hint?: string }) {
+  const id = useMemo(() => `field-${label}`, [label]);
+  return <label className="field" htmlFor={id}><span>{label}</span><input id={id} type={type} value={value} onChange={(event) => onChange(event.target.value)} required />{hint && <small>{hint}</small>}</label>;
+}
+
+function Notice({ children, kind }: { children: React.ReactNode; kind: "error" | "info" }) { return <div className={`notice ${kind}`} role={kind === "error" ? "alert" : "status"}>{children}</div>; }
+function LoadingScreen() { return <main className="loading"><Brand /><span className="loading-line" /><p>正在读取控制面状态…</p></main>; }
+function messageOf(reason: unknown) { return reason instanceof ApiError || reason instanceof Error ? reason.message : "发生未知错误"; }
+function roleLabel(role: Worker["role"]) { return { builder: "Builder", publisher: "Publisher", archiver: "Archiver" }[role]; }

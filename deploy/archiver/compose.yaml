@@ -1,0 +1,66 @@
+name: aursmith-archiver
+
+services:
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/images/worker.Dockerfile
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_WORKER_NAME: ${AURSMITH_WORKER_NAME:-vault-01}
+      AURSMITH_WORKER_ROLE: archiver
+      AURSMITH_WORKER_DATABASE: sqlite:///var/lib/aursmith/runtime/worker.db
+      AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
+      AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
+      RUST_LOG: ${RUST_LOG:-aursmith=info}
+    volumes:
+      - worker-run:/run/aursmith
+      - archiver-state:/var/lib/aursmith
+      - archive-data:/archive
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    networks: [worker]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aursmithctl, worker, --socket, /run/aursmith/worker.sock, status]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  ssh:
+    build:
+      context: ../..
+      dockerfile: deploy/images/worker.Dockerfile
+    entrypoint: [/usr/bin/sshd]
+    command: [-D, -e, -f, /etc/ssh/sshd_config]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - worker-run:/run/aursmith
+      - ../common/sshd_config:/etc/ssh/sshd_config:ro
+    secrets: [ssh_host_ed25519_key, authorized_keys]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    ports:
+      - ${AURSMITH_SSH_BIND:-127.0.0.1:2224}:2222
+    networks: [worker]
+    depends_on:
+      worker:
+        condition: service_healthy
+    restart: unless-stopped
+
+secrets:
+  ssh_host_ed25519_key:
+    file: ${AURSMITH_SSH_HOST_KEY_FILE:-./secrets/ssh_host_ed25519_key}
+  authorized_keys:
+    file: ${AURSMITH_AUTHORIZED_KEYS_FILE:-./secrets/authorized_keys}
+
+volumes:
+  worker-run:
+  archiver-state:
+  archive-data:
+
+networks:
+  worker:
