@@ -143,4 +143,5 @@
 - 新增基于 Arch 官方 squid 包的最小镜像，进程使用包内 `proxy` 用户运行；Compose 固定只读根文件系统、清空 capabilities、启用 no-new-privileges，并只给 PID、日志和临时文件分配 tmpfs。
 - 第一次真实镜像构建发现预想的 `squid` 用户不存在，依据镜像实际创建的 UID/GID 15 `proxy` 用户修正；第二次构建成功。
 - 使用与 Compose 相同的只读和降权参数启动真实容器，通过代理访问 `https://archlinux.org/` 返回 HTTP 200，访问 `127.0.0.1:8080` 返回 HTTP 403；测试容器随后删除。
+- 修复真实上游冒烟脚本，使其生成一次性 GPG 测试公钥并配置 Publisher 的仓库、Signer 和 Journal 临时目录。随后实际通过 AUR RPC 搜索 `visual-studio-code-bin`、固定其 40 位 AUR Git commit、读取 `paru-git` 上游 commit，并从 Arch 官方接口查到 `pacman`；临时密钥和数据库均已清理。
 - 边界：第一版代理执行全局公共网络策略，尚未由 Controller 按 Revision 自动生成精确 source 域名 allowlist，也没有引入 pacoloco 缓存统计。
