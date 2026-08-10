@@ -543,6 +543,7 @@ mod tests {
             database_url: "sqlite::memory:".into(),
             setup_token: "测试初始化令牌-至少二十个字符".into(),
             signing_key_file: "/不存在".into(),
+            ssh_identity_source_file: "/不存在".into(),
             ssh_identity_file: "/不存在".into(),
             ssh_known_hosts_file: "/不存在".into(),
             secure_cookies: false,

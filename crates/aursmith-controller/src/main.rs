@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     let database = db::connect(&config.database_url).await?;
     let signing_key = config.load_signing_key()?;
+    config.materialize_ssh_identity()?;
     let state = routes::AppState::new(database, config.clone(), signing_key);
     scheduler::spawn(state.clone());
     let app = routes::router(state);

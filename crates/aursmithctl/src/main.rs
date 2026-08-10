@@ -2,7 +2,14 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
-use std::{env, io::Read, path::PathBuf};
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -31,6 +38,17 @@ enum Command {
     SshGateway {
         #[arg(long, default_value = "/run/aursmith/worker.sock")]
         socket: PathBuf,
+    },
+    /// 将 Compose 文件型 secret 收敛到私有 tmpfs，然后替换为非 root sshd。
+    RunSshd {
+        #[arg(long, default_value = "/run/secrets/ssh_host_ed25519_key")]
+        host_key_source: PathBuf,
+        #[arg(long, default_value = "/run/secrets/authorized_keys")]
+        authorized_keys_source: PathBuf,
+        #[arg(long, default_value = "/run/private")]
+        private_directory: PathBuf,
+        #[arg(long, default_value = "/etc/ssh/sshd_config")]
+        config: PathBuf,
     },
     /// 生成 Controller Ed25519 密钥；私钥只输出一次，必须写入 secret。
     GenerateControllerKey,
@@ -70,8 +88,81 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Doctor { role } => doctor(&role)?,
         Command::SshGateway { socket } => ssh_gateway(&socket).await?,
+        Command::RunSshd {
+            host_key_source,
+            authorized_keys_source,
+            private_directory,
+            config,
+        } => run_sshd(
+            &host_key_source,
+            &authorized_keys_source,
+            &private_directory,
+            &config,
+        )?,
         Command::GenerateControllerKey => generate_controller_key()?,
     }
+    Ok(())
+}
+
+fn run_sshd(
+    host_key_source: &Path,
+    authorized_keys_source: &Path,
+    private_directory: &Path,
+    config: &Path,
+) -> anyhow::Result<()> {
+    let host_key = private_directory.join("ssh_host_ed25519_key");
+    let authorized_keys = private_directory.join("authorized_keys");
+    materialize_private_file(host_key_source, &host_key, 64 * 1024)?;
+    materialize_private_file(authorized_keys_source, &authorized_keys, 1024 * 1024)?;
+
+    let ownership = ProcessCommand::new("/usr/bin/chown")
+        .arg("10001:10001")
+        .args([&host_key, &authorized_keys])
+        .status()
+        .context("无法设置 SSH 私有文件属主")?;
+    if !ownership.success() {
+        bail!("设置 SSH 私有文件属主失败");
+    }
+
+    let error = ProcessCommand::new("/usr/bin/setpriv")
+        .args([
+            "--reuid",
+            "10001",
+            "--regid",
+            "10001",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--no-new-privs",
+            "/usr/bin/sshd",
+            "-D",
+            "-e",
+            "-f",
+        ])
+        .arg(config)
+        .exec();
+    Err(error).context("无法启动 sshd")
+}
+
+fn materialize_private_file(source: &Path, target: &Path, maximum_size: u64) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("无法检查 secret {}", source.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum_size {
+        bail!("secret {} 类型或大小不合法", source.display());
+    }
+    let bytes =
+        fs::read(source).with_context(|| format!("无法读取 secret {}", source.display()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(target)
+        .with_context(|| format!("无法创建私有文件 {}", target.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("无法写入私有文件 {}", target.display()))?;
+    file.sync_all()
+        .with_context(|| format!("无法同步私有文件 {}", target.display()))?;
     Ok(())
 }
 

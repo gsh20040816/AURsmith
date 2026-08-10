@@ -39,24 +39,22 @@ services:
       dockerfile: deploy/images/worker.Dockerfile
       args:
         AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-    entrypoint: [/usr/bin/sshd]
-    command: [-D, -e, -f, /etc/ssh/sshd_config]
+    entrypoint: [/usr/local/bin/aursmithctl]
+    command: [run-sshd]
+    user: "0:0"
     read_only: true
     cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH, SETGID, SETPCAP, SETUID]
     security_opt: [no-new-privileges:true]
     volumes:
       - worker-run:/run/aursmith
       - ../common/sshd_config:/etc/ssh/sshd_config:ro
     secrets:
-      - source: ssh_host_ed25519_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
-      - source: authorized_keys
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
-    tmpfs: [/tmp:size=16m,mode=1777]
+      - ssh_host_ed25519_key
+      - authorized_keys
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/private:uid=0,gid=0,mode=0755,size=2m
     ports:
       - ${AURSMITH_SSH_BIND:-127.0.0.1:2223}:2222
     networks: [control]

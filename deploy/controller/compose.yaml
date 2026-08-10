@@ -15,31 +15,21 @@ services:
       AURSMITH_DATABASE_URL: sqlite:///var/lib/aursmith/controller.db
       AURSMITH_SETUP_TOKEN_FILE: /run/secrets/setup_token
       AURSMITH_SIGNING_KEY_FILE: /run/secrets/controller_signing_key
-      AURSMITH_SSH_IDENTITY_FILE: /run/secrets/worker_ssh_key
+      AURSMITH_SSH_IDENTITY_SOURCE_FILE: /run/secrets/worker_ssh_key
+      AURSMITH_SSH_IDENTITY_FILE: /run/aursmith-private/worker_ssh_key
       AURSMITH_SSH_KNOWN_HOSTS_FILE: /run/secrets/worker_known_hosts
       AURSMITH_SECURE_COOKIES: ${AURSMITH_SECURE_COOKIES:-true}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
-      - source: setup_token
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
-      - source: controller_signing_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
-      - source: worker_ssh_key
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
-      - source: worker_known_hosts
-        uid: "10001"
-        gid: "10001"
-        mode: 0400
+      - setup_token
+      - controller_signing_key
+      - worker_ssh_key
+      - worker_known_hosts
     volumes:
       - controller-data:/var/lib/aursmith
     tmpfs:
       - /tmp:size=64m,mode=1777
+      - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
     networks: [control]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]

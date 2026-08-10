@@ -11,7 +11,7 @@ ARG AURSMITH_SOURCE_GIT_COMMIT
 RUN pacman -Syu --noconfirm --needed \
       ca-certificates openssh rsync qemu-base qemu-system-x86 qemu-img virtiofsd \
     && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/* \
-    && useradd --uid 10001 --create-home --home-dir /var/lib/aursmith --shell /usr/bin/nologin aursmith \
+    && useradd --uid 10001 --create-home --home-dir /var/lib/aursmith --shell /bin/sh aursmith \
     && install -d -o aursmith -g aursmith \
       /run/aursmith /var/lib/aursmith/runtime /profiles /jobs /cache \
       /landing /staging /repository /archive
