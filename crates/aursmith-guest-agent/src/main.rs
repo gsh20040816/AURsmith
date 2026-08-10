@@ -67,7 +67,7 @@ fn run() -> anyhow::Result<()> {
     if spec.kind == JobKind::ProfileFixture {
         fs::write(
             Path::new(BUILD).join("PKGBUILD"),
-            b"pkgname=aursmith-profile-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { install -Dm644 /etc/os-release \"$pkgdir/usr/share/aursmith-profile-fixture/os-release\"; }\n",
+            b"pkgname=aursmith-profile-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-profile-fixture/os-release\"; }\n",
         )?;
     }
     run_checked("/usr/bin/chown", &["-R", "builder:builder", BUILD], None)?;

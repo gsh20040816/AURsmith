@@ -9,7 +9,10 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
 };
@@ -154,6 +157,7 @@ fn export_profile(source: &Path, output: &Path, name: &str) -> anyhow::Result<()
             bail!("拒绝覆盖已有 Profile 文件 {}", destination.display());
         }
         fs::copy(&source_file, &destination).with_context(|| format!("无法导出 {file_name}"))?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644))?;
         entries.push(profile_entry(&destination, file_name)?);
     }
     let packages: Vec<String> = fs::read_to_string(source.join("installed-packages.txt"))?

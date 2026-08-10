@@ -218,6 +218,7 @@ async fn execute_one(
     .await;
     let _ = fs::remove_dir_all(runtime.jobs_dir.join("staging").join(&attempt_id));
     if result.is_err() {
+        persist_failure_diagnostics(runtime, &attempt_id);
         let _ = fs::remove_dir_all(runtime.jobs_dir.join("runtime").join(&attempt_id));
     }
     match result {
@@ -233,6 +234,24 @@ async fn execute_one(
         }
     }
     Ok(())
+}
+
+fn persist_failure_diagnostics(runtime: &BuilderRuntime, attempt_id: &str) {
+    let work = runtime.jobs_dir.join("runtime").join(attempt_id);
+    let failed = runtime.jobs_dir.join("failed").join(attempt_id);
+    let candidates = [
+        (work.join("qemu.stdout.log"), "qemu.stdout.log"),
+        (work.join("qemu.stderr.log"), "qemu.stderr.log"),
+        (work.join("output/guest-error.json"), "guest-error.json"),
+        (work.join("output/fetch.log"), "fetch.log"),
+        (work.join("output/build.log"), "build.log"),
+    ];
+    for (source, name) in candidates {
+        if source.is_file() {
+            let _ = fs::create_dir_all(&failed);
+            let _ = fs::copy(source, failed.join(name));
+        }
+    }
 }
 
 async fn execute_attempt(
@@ -294,30 +313,34 @@ async fn execute_attempt(
     wait_for_socket(&paths.input_socket).await?;
     wait_for_socket(&paths.output_socket).await?;
     let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.fetch_proxy)?;
-    let mut qemu = Command::new(plan.executable)
+    let qemu = Command::new(plan.executable)
         .args(&plan.arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let status = timeout(
+    let execution = timeout(
         std::time::Duration::from_secs(spec.limits.timeout_seconds),
-        qemu.wait(),
+        qemu.wait_with_output(),
     )
     .await;
-    let vm_ok = match status {
-        Ok(result) => result?.success(),
-        Err(_) => {
-            let _ = qemu.kill().await;
-            bail!("VM_TIMEOUT")
-        }
+    let execution = match execution {
+        Ok(result) => result?,
+        Err(_) => bail!("VM_TIMEOUT"),
     };
+    fs::write(work.join("qemu.stdout.log"), &execution.stdout)?;
+    fs::write(work.join("qemu.stderr.log"), &execution.stderr)?;
     let _ = input_fs.kill().await;
     let _ = output_fs.kill().await;
-    if !vm_ok {
-        fs::remove_dir_all(&work)?;
-        bail!("VM_FAILED")
+    if !execution.status.success() {
+        let failed = runtime.jobs_dir.join("failed").join(attempt_id);
+        fs::create_dir_all(&failed)?;
+        fs::write(failed.join("qemu.stdout.log"), &execution.stdout)?;
+        fs::write(failed.join("qemu.stderr.log"), &execution.stderr)?;
+        let diagnostic = String::from_utf8_lossy(&execution.stderr);
+        let diagnostic = diagnostic.chars().take(512).collect::<String>();
+        bail!("VM_FAILED:{diagnostic}")
     }
     let result_path = work.join("output/build-result.json");
     let result = fs::read(&result_path).context("GUEST_RESULT_MISSING")?;
@@ -631,6 +654,8 @@ impl QemuPlan {
         .collect();
         arguments.push(spec.limits.cpu_count.to_string().into());
         arguments.extend([
+            "-m".into(),
+            format!("{memory}M").into(),
             "-object".into(),
             format!("memory-backend-memfd,id=mem,size={memory}M,share=on").into(),
             "-numa".into(),
@@ -805,6 +830,11 @@ mod tests {
             .map(|value| value.to_string_lossy())
             .collect();
         assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
+        assert!(args.windows(2).any(|pair| pair == ["-m", "1024M"]));
+        assert!(
+            args.iter()
+                .any(|value| value.contains("size=1024M,share=on"))
+        );
         assert!(!args.iter().any(|value| value.contains("guestfwd")));
     }
 
