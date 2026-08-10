@@ -186,6 +186,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aursmith-guest-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aursmith-domain",
+ "aursmith-protocol",
+ "chrono",
+ "hex",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "aursmith-protocol"
 version = "0.1.0"
 dependencies = [
@@ -231,10 +244,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aursmith-protocol",
+ "chrono",
  "clap",
  "ed25519-dalek",
  "hex",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

@@ -1,10 +1,13 @@
 use anyhow::{Context, bail};
+use aursmith_protocol::{BuildProfileSpec, ManifestEntry};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     env,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -52,6 +55,15 @@ enum Command {
     },
     /// 生成 Controller Ed25519 密钥；私钥只输出一次，必须写入 secret。
     GenerateControllerKey,
+    /// 从固定 Profile 构建产物导出待 Controller 授权的候选清单。
+    ExportProfile {
+        #[arg(long, default_value = "/opt/aursmith-profile")]
+        source: PathBuf,
+        #[arg(long, default_value = "/out")]
+        output: PathBuf,
+        #[arg(long, default_value = "base")]
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -120,8 +132,77 @@ async fn main() -> anyhow::Result<()> {
             &config,
         )?,
         Command::GenerateControllerKey => generate_controller_key()?,
+        Command::ExportProfile {
+            source,
+            output,
+            name,
+        } => export_profile(&source, &output, &name)?,
     }
     Ok(())
+}
+
+fn export_profile(source: &Path, output: &Path, name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() || name.len() > 64 {
+        bail!("Profile 名称长度必须为 1 至 64");
+    }
+    fs::create_dir_all(output)?;
+    let mut entries = Vec::new();
+    for file_name in ["root.qcow2", "vmlinuz-linux", "initramfs-linux.img"] {
+        let source_file = source.join(file_name);
+        let destination = output.join(file_name);
+        if destination.exists() {
+            bail!("拒绝覆盖已有 Profile 文件 {}", destination.display());
+        }
+        fs::copy(&source_file, &destination).with_context(|| format!("无法导出 {file_name}"))?;
+        entries.push(profile_entry(&destination, file_name)?);
+    }
+    let packages: Vec<String> = fs::read_to_string(source.join("installed-packages.txt"))?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if packages.is_empty() {
+        bail!("Profile 已安装包清单为空");
+    }
+    let created_at: DateTime<Utc> = fs::read_to_string(source.join("created-at"))?
+        .trim()
+        .parse()
+        .context("Profile 创建时间无效")?;
+    let mut spec = BuildProfileSpec {
+        profile_sha256: String::new(),
+        root_image: entries.remove(0),
+        kernel: entries.remove(0),
+        initramfs: entries.remove(0),
+        installed_packages: packages,
+        created_at,
+    };
+    spec.profile_sha256 = spec.content_sha256()?;
+    let candidate = json!({"name": name, "spec": spec});
+    let candidate_path = output.join("profile-candidate.json");
+    if candidate_path.exists() {
+        bail!("拒绝覆盖已有 Profile candidate");
+    }
+    fs::write(candidate_path, serde_json::to_vec_pretty(&candidate)?)?;
+    Ok(())
+}
+
+fn profile_entry(path: &Path, name: &str) -> anyhow::Result<ManifestEntry> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ManifestEntry {
+        path: name.to_owned(),
+        sha256: hex::encode(hasher.finalize()),
+        size: fs::metadata(path)?.len(),
+    })
 }
 
 fn run_sshd(

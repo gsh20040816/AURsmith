@@ -51,6 +51,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
+        .route(
+            "/api/v1/profiles",
+            get(crate::profiles::list).post(crate::profiles::authorize),
+        )
+        .route(
+            "/api/v1/profiles/{id}/activate",
+            post(crate::profiles::activate),
+        )
         .route("/api/v1/audits", get(crate::audits::list))
         .route(
             "/api/v1/audits/{bundle}/manual-decision",
@@ -524,7 +532,7 @@ fn state_name(state: WorkerState) -> &'static str {
     }
 }
 
-async fn append_event(
+pub(crate) async fn append_event(
     database: &SqlitePool,
     aggregate_type: &str,
     aggregate_id: &str,
@@ -575,7 +583,10 @@ pub(crate) async fn append_event_in_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use tower::ServiceExt;
 
     async fn test_router() -> Router {
@@ -645,10 +656,47 @@ mod tests {
 
         let requirements = Request::builder()
             .uri("/api/v1/requirements")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(requirements).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let profile = Request::builder()
+            .method("POST")
+            .uri("/api/v1/profiles")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "name": "base",
+                "spec": {
+                    "profile_sha256": "untrusted-candidate-value",
+                    "root_image": {"path": "root.qcow2", "sha256": "a".repeat(64), "size": 10},
+                    "kernel": {"path": "vmlinuz-linux", "sha256": "b".repeat(64), "size": 10},
+                    "initramfs": {"path": "initramfs-linux.img", "sha256": "c".repeat(64), "size": 10},
+                    "installed_packages": ["base 3-3"],
+                    "created_at": Utc::now()
+                }
+            }).to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(profile).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["profile_sha256"].as_str().unwrap().len(), 64);
+        assert_ne!(body["profile_sha256"], "untrusted-candidate-value");
+
+        let activate = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/v1/profiles/{}/activate",
+                body["id"].as_str().unwrap()
+            ))
             .header("cookie", cookie)
             .body(Body::empty())
             .unwrap();
-        let response = app.oneshot(requirements).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(activate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }

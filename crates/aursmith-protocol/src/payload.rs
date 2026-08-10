@@ -1,6 +1,7 @@
 use aursmith_domain::{ArchiveState, AttemptRef, WorkerRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -53,6 +54,19 @@ pub struct BuildProfileSpec {
     pub initramfs: ManifestEntry,
     pub installed_packages: Vec<String>,
     pub created_at: DateTime<Utc>,
+}
+
+impl BuildProfileSpec {
+    pub fn content_sha256(&self) -> Result<String, serde_json::Error> {
+        let content = serde_json::json!({
+            "root_image": self.root_image,
+            "kernel": self.kernel,
+            "initramfs": self.initramfs,
+            "installed_packages": self.installed_packages,
+            "created_at": self.created_at,
+        });
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&content)?)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

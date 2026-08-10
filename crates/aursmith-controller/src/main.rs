@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod error;
 mod packages;
+mod profiles;
 mod routes;
 mod scheduler;
 mod transport;

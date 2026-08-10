@@ -94,6 +94,18 @@ export type Audit = {
   };
   created_at: string;
 };
+export type BuildProfile = {
+  id: string;
+  name: string;
+  architecture: string;
+  profile_sha256: string;
+  state: string;
+  packages: string[];
+  created_at: string;
+  activated_at: string | null;
+  last_verified_at: string | null;
+  failure_reason: string | null;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -115,6 +127,9 @@ export const api = {
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
+  profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
+  activateProfile: (id: string) =>
+    request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>
     request<{ bundle_sha256: string; decision: string }>(
       `/api/v1/audits/${encodeURIComponent(bundle)}/manual-decision`,

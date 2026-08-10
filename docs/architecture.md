@@ -47,6 +47,10 @@ Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`�
 
 Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，才把 runtime 原子移动到 completed 区。超时、QEMU/virtiofsd 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
 
+Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
+
+Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段安装完整且同步的 Arch 根文件系统、嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 virtiofs 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate。
+
 ## 审计流水线与 Agent 边界
 
 每个 Revision 首先形成包含全部 AUR Git 跟踪文件、相对差异、文件摘要、source 声明和覆盖说明的不可变 `AuditBundle`。确定性扫描会阻断路径逃逸、摘要不一致、私网 source URL 等确定性违规，并将动态下载、混淆、安装钩子、权限修改等不确定信号交给 Agent 判断。当前 Fetch VM 尚未补入完整上游源码前，覆盖说明必须明确写为“完整 AUR 包装层、上游仅清单”，不能将其描述成完整源码审计。

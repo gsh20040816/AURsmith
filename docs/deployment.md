@@ -73,9 +73,16 @@ Builder Stack 必须设置 `KVM_GID` 和 `AURSMITH_FETCH_PROXY`。后者只能�
 - `initramfs-linux.img`；
 - `profile-envelope.json`。
 
-`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。Guest Agent 与 Profile 自动构建器仍在本阶段后续实现中；在它们完成并通过 fixture build 前，不能把手工准备的 Profile 标记为生产可用，也不能宣称已完成端到端 KVM 构建。
+`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。执行以下命令构建和导出 base candidate：
 
-已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`，并能在外部终止信号下退出。该检查只证明 KVM 设备和 QEMU 可用，不等同于 Guest 构建验收。
+```bash
+docker compose -f deploy/builder/compose.yaml --profile profile-build build profile-builder
+docker compose -f deploy/builder/compose.yaml --profile profile-build run --rm profile-builder --name base
+```
+
+导出卷包含 `profile-candidate.json` 以及三个固定二进制文件。管理员把 candidate 提交到 `POST /api/v1/profiles` 后，Controller 会忽略候选中自报的摘要、重新计算内容摘要并返回签名 Envelope。Envelope 和三个文件必须放入 `/profiles/<profile_sha256>/`。Profile 未通过启动、无网和固定 fixture build 前，激活 API 会返回 `PROFILE_NOT_VERIFIED`；不能用人工改数据库绕过。
+
+已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`。实际生成的 base Profile 已冷启动到嵌入的 Guest Agent；在未提供 virtiofs 的负向测试中，Guest 在 0.8 秒左右明确报告输入挂载失败、执行 poweroff，QEMU 正常退出。这证明 direct-kernel、initramfs、根文件系统和 PID 1 链路可用，但不替代后续带输入的完整 fixture build 验收。
 
 ## Git 与发布
 

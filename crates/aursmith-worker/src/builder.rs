@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
     ffi::OsString,
-    fs,
+    fs::{self, File},
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -107,12 +108,17 @@ async fn execute_attempt(
     }
     let staging = runtime.jobs_dir.join("staging").join(attempt_id);
     verify_inputs(&staging.join("input"), &spec.inputs)?;
+    let control_input = staging.join("input/.aursmith");
+    fs::create_dir_all(&control_input)?;
+    fs::write(
+        control_input.join("job-envelope.json"),
+        envelope_json.as_bytes(),
+    )?;
     let work = runtime.jobs_dir.join("runtime").join(attempt_id);
     if work.exists() {
         fs::remove_dir_all(&work)?;
     }
     fs::create_dir_all(work.join("output"))?;
-    fs::write(work.join("job-envelope.json"), envelope_json.as_bytes())?;
     let overlay = work.join("overlay.qcow2");
     run_checked(
         "/usr/bin/qemu-img",
@@ -226,12 +232,15 @@ fn validate_result_identity(
 fn validate_output_entries(output: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
     for entry in entries {
         aursmith_protocol::validate_relative_path(&entry.path)?;
+        if entry.path == ".aursmith" || entry.path.starts_with(".aursmith/") {
+            bail!("INPUT_RESERVED_PATH:{}", entry.path);
+        }
         let path = output.join(&entry.path);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("GUEST_ARTIFACT_MISSING:{}", entry.path))?;
         if !metadata.file_type().is_file()
             || metadata.len() != entry.size
-            || hex::encode(Sha256::digest(fs::read(path)?)) != entry.sha256
+            || digest_file(&path)? != entry.sha256
         {
             bail!("GUEST_ARTIFACT_MISMATCH:{}", entry.path);
         }
@@ -248,7 +257,7 @@ fn verify_inputs(root: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
         if !metadata.file_type().is_file() || metadata.len() != entry.size {
             bail!("INPUT_METADATA_MISMATCH:{}", entry.path)
         }
-        if hex::encode(Sha256::digest(fs::read(path)?)) != entry.sha256 {
+        if digest_file(&path)? != entry.sha256 {
             bail!("INPUT_DIGEST_MISMATCH:{}", entry.path)
         }
     }
@@ -330,6 +339,7 @@ pub struct VerifiedProfile {
     pub root_image: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
+    pub controller_key_hex: String,
 }
 
 pub struct VmPaths {
@@ -360,7 +370,7 @@ impl VerifiedProfile {
         let root_image = verify_entry(directory, &spec.root_image, "root.qcow2")?;
         let kernel = verify_entry(directory, &spec.kernel, "vmlinuz-linux")?;
         let initramfs = verify_entry(directory, &spec.initramfs, "initramfs-linux.img")?;
-        let manifest_sha = profile_content_digest(&spec)?;
+        let manifest_sha = spec.content_sha256()?;
         if manifest_sha != spec.profile_sha256 {
             bail!("Profile 摘要与签名 payload 不一致");
         }
@@ -369,19 +379,9 @@ impl VerifiedProfile {
             root_image,
             kernel,
             initramfs,
+            controller_key_hex: hex::encode(controller_key),
         })
     }
-}
-
-fn profile_content_digest(spec: &BuildProfileSpec) -> anyhow::Result<String> {
-    let content = serde_json::json!({
-        "root_image": spec.root_image,
-        "kernel": spec.kernel,
-        "initramfs": spec.initramfs,
-        "installed_packages": spec.installed_packages,
-        "created_at": spec.created_at,
-    });
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&content)?)))
 }
 
 fn verify_entry(
@@ -398,11 +398,25 @@ fn verify_entry(
     if !metadata.file_type().is_file() || metadata.len() != entry.size {
         bail!("Profile 文件类型或大小不匹配：{expected}");
     }
-    let digest = hex::encode(Sha256::digest(fs::read(&path)?));
+    let digest = digest_file(&path)?;
     if digest != entry.sha256 {
         bail!("Profile 文件摘要不匹配：{expected}");
     }
     Ok(path)
+}
+
+fn digest_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 impl QemuPlan {
@@ -441,14 +455,19 @@ impl QemuPlan {
             "-numa".into(),
             "node,memdev=mem".into(),
             "-nographic".into(),
+            "-serial".into(),
+            "stdio".into(),
             "-no-reboot".into(),
             "-kernel".into(),
             profile.kernel.as_os_str().into(),
             "-initrd".into(),
             profile.initramfs.as_os_str().into(),
             "-append".into(),
-            "root=/dev/vda rw console=ttyS0 panic=1 init=/usr/local/bin/aursmith-guest-agent"
-                .into(),
+            format!(
+                "root=/dev/vda rw console=ttyS0 panic=1 init=/usr/local/bin/aursmith-guest-agent aursmith.controller_key={}",
+                profile.controller_key_hex
+            )
+            .into(),
             "-drive".into(),
             format!(
                 "file={},if=virtio,format=qcow2,cache=none,discard=unmap",
@@ -552,6 +571,7 @@ mod tests {
             root_image: root.join("root.qcow2"),
             kernel: root.join("vmlinuz-linux"),
             initramfs: root.join("initramfs-linux.img"),
+            controller_key_hex: "00".repeat(32),
         }
     }
 
@@ -639,7 +659,7 @@ mod tests {
             installed_packages: vec!["base-devel=1".into()],
             created_at: Utc::now(),
         };
-        spec.profile_sha256 = profile_content_digest(&spec).unwrap();
+        spec.profile_sha256 = spec.content_sha256().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let envelope = SignedEnvelope::sign("aursmith.build_profile", &spec, &signing_key).unwrap();
         fs::write(

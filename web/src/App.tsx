@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiError, Audit, AurPackage, Job, Requirement, Session, Subscription, Worker, api } from "./api";
+import { ApiError, Audit, AurPackage, BuildProfile, Job, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -109,7 +109,8 @@ export function App() {
         {view === "builds" && <BuildsView />}
         {view === "packages" && <PackagesView />}
         {view === "audits" && <AuditsView />}
-        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && <PlannedView view={view} />}
+        {view === "profiles" && <ProfilesView />}
+        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && view !== "profiles" && <PlannedView view={view} />}
       </main>
     </div>
   );
@@ -305,6 +306,19 @@ function AuditsView() {
     }
   };
   return <><header className="page-header compact"><div><p className="eyebrow">A01 / A02 / A04</p><h1>审计</h1><p className="lede">确定性阻断、三低成本 Agent 投票和高成本复核均绑定不可变 AuditBundle。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{audits.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>没有审计任务</strong><p>订阅固定 Revision 后会自动生成覆盖范围明确的 AuditBundle。</p></div></div> : audits.map((audit) => <article className="audit-card" key={audit.sha256}><div className="audit-title"><div><p className="eyebrow">{audit.policy_version} · {audit.aur_commit.slice(0, 12)}</p><h2>{audit.package_base}</h2></div><span className={`state ${audit.state}`}>{audit.state}</span></div><p className="coverage-note">{audit.coverage.upstream_source?.statement}</p><div className="finding-list">{audit.findings.length === 0 ? <p>确定性扫描未发现阻断或可疑项。</p> : audit.findings.map((finding, index) => <div key={`${finding.rule_id}-${index}`}><code>{finding.rule_id}</code><span>{finding.path}</span><strong>{finding.summary}</strong></div>)}</div>{audit.state === "manual_review" && <div className="manual-decision"><label>人工判断理由<input value={rationale[audit.sha256] ?? ""} onChange={(event) => setRationale((current) => ({ ...current, [audit.sha256]: event.target.value }))} placeholder="至少 8 个字符，只对当前 Revision 有效" /></label><div><button className="secondary-button" onClick={() => void decide(audit, true)}>批准当前 Revision</button><button className="secondary-button danger" onClick={() => void decide(audit, false)}>拒绝当前 Revision</button></div></div>}</article>)}</section></>;
+}
+
+function ProfilesView() {
+  const [profiles, setProfiles] = useState<BuildProfile[]>([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const refresh = () => void api.profiles().then((response) => setProfiles(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  const activate = async (profile: BuildProfile) => {
+    setBusy(profile.id); setError("");
+    try { await api.activateProfile(profile.id); refresh(); } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
+  };
+  return <><header className="page-header compact"><div><p className="eyebrow">B04</p><h1>构建 Profile</h1><p className="lede">Profile 是签名且不可变的 KVM 根文件系统；候选通过 fixture 验证后才能参与任务选择。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="table-panel"><div className="section-heading"><div><p className="eyebrow">最多四个活跃版本</p><h2>Profile 清单</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>{profiles.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>尚无已授权 Profile</strong><p>运行一次性 profile-builder，随后把 candidate 提交给 Controller 授权。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>名称</th><th>状态</th><th>摘要</th><th>包数量</th><th>验证</th><th /></tr></thead><tbody>{profiles.map((profile) => <tr key={profile.id}><td><strong>{profile.name}</strong><small className="cell-note">{profile.architecture}</small></td><td><span className={`state ${profile.state}`}>{profile.state}</span></td><td><code>{profile.profile_sha256.slice(0, 16)}</code></td><td>{profile.packages.length}</td><td>{profile.failure_reason ?? (profile.last_verified_at ? new Date(profile.last_verified_at).toLocaleString("zh-CN") : "等待 fixture")}</td><td>{profile.state !== "active" && <button className="text-button" disabled={busy === profile.id} onClick={() => void activate(profile)}>激活</button>}</td></tr>)}</tbody></table></div>}</section></>;
 }
 
 function PlannedView({ view }: { view: View }) {

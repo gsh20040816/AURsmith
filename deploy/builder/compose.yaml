@@ -70,6 +70,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  profile-builder:
+    profiles: [profile-build]
+    build:
+      context: ../..
+      dockerfile: deploy/images/profile-builder.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    volumes:
+      - profile-output:/out
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
 secrets:
   ssh_host_ed25519_key:
     file: ${AURSMITH_SSH_HOST_KEY_FILE:-./secrets/ssh_host_ed25519_key}
@@ -82,6 +98,7 @@ volumes:
   builder-profiles:
   builder-jobs:
   builder-cache:
+  profile-output:
 
 networks:
   worker:
