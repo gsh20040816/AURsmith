@@ -370,6 +370,10 @@ async fn execute_attempt(
         fs::create_dir_all(&failed)?;
         fs::write(failed.join("qemu.stdout.log"), &execution.stdout)?;
         fs::write(failed.join("qemu.stderr.log"), &execution.stderr)?;
+        if work.join("output/guest-error.json").is_file() {
+            let code = classify_guest_failure(&spec, &work.join("output"));
+            bail!("{code}")
+        }
         let diagnostic = String::from_utf8_lossy(&execution.stderr);
         let diagnostic = diagnostic.chars().take(512).collect::<String>();
         bail!("VM_FAILED:{diagnostic}")
@@ -530,6 +534,9 @@ fn classify_failure(error: &anyhow::Error) -> &'static str {
         "GUEST_RESULT_INVALID",
         "GUEST_RESULT_IDENTITY_MISMATCH",
         "GUEST_RESULT_KIND_MISMATCH",
+        "GUEST_BUILD_FAILED",
+        "GUEST_FETCH_FAILED",
+        "NETWORK_DURING_BUILD",
     ] {
         if message.contains(code) {
             return code;
@@ -540,6 +547,34 @@ fn classify_failure(error: &anyhow::Error) -> &'static str {
     } else {
         "BUILDER_INFRASTRUCTURE"
     }
+}
+
+fn classify_guest_failure(spec: &JobSpec, output: &Path) -> &'static str {
+    if spec.kind == JobKind::Build
+        && fs::read(output.join("build.log"))
+            .ok()
+            .filter(|bytes| bytes.len() <= 16 * 1024 * 1024)
+            .is_some_and(|bytes| network_failure_in_log(&bytes))
+    {
+        "NETWORK_DURING_BUILD"
+    } else if spec.kind == JobKind::Fetch {
+        "GUEST_FETCH_FAILED"
+    } else {
+        "GUEST_BUILD_FAILED"
+    }
+}
+
+fn network_failure_in_log(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    [
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "failed to connect",
+        "connection timed out",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 pub struct VerifiedProfile {
@@ -1087,5 +1122,18 @@ mod tests {
             VerifiedProfile::load(directory.path(), signing_key.verifying_key().as_bytes())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn guest_build_failure_is_deterministic_and_network_attempt_is_named() {
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("GUEST_BUILD_FAILED")),
+            "GUEST_BUILD_FAILED"
+        );
+        assert!(network_failure_in_log(
+            b"curl: (6) Could not resolve host: example.org"
+        ));
+        assert!(network_failure_in_log(b"connect: Network is unreachable"));
+        assert!(!network_failure_in_log(b"compiler error: missing header"));
     }
 }

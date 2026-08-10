@@ -219,3 +219,12 @@
 - capability：Publisher 不需要 root 或 `CAP_SETFCAP`。检查器让 bsdtar 针对可执行归档项重建有限的 pax 头流，只读取前 128 KiB，并识别 `LIBARCHIVE.xattr.security.capability`；随后终止子进程，不把整个大文件读入内存。命中只记录路径，不自动判为恶意。
 - 测试：真实 tar fixture 加入宿主 `/usr/bin/true` 的副本，正式检查入口识别 ELF 并生成依赖映射；另有 pax 头识别回归。修改后的 Worker 镜像实际构建为 `aursmith-worker:inspection-test`，镜像内非 root 用户执行 `/usr/bin/readelf --version` 返回 GNU Binutils 2.47；验证后该临时镜像标签及其独占层已删除，可由 Dockerfile 重新构建。
 - 边界：测试用纯函数覆盖 capability pax 头识别，且已在独立 Arch 容器中确认 bsdtar 重建会保留真实 `security.capability` 头；尚未通过完整 Publisher Release API 提交一个带 capability 的 pacman 包。Controller 当前保存的是构建时官方依赖快照，签名检查报告中的 ELF 映射已归档但还没有单独进入 ABI 建议查询表。
+
+## 2026-08-10：Attempt 基础设施重试与 uncertain
+
+- 分类：新增严格基础设施白名单；VM/Worker/结果传输类错误可重试，`INPUT_INVALID`、`PROFILE_DIGEST_MISMATCH` 和审计拒绝等确定性错误测试确认不会重试。随后修正 QEMU 外层分类：Guest 已写出错误时归为确定性 `GUEST_BUILD_FAILED`/`GUEST_FETCH_FAILED`；Build 日志出现典型 DNS、路由或连接错误时为 `NETWORK_DURING_BUILD`，两者均不进入白名单。只有没有 Guest 错误证据的 QEMU 异常才保留为 `VM_FAILED`。
+- 次数：初始 generation 0 失败后等待 5 秒，generation 1 失败后等待 10 秒，generation 2 失败后终止。每次仍由正常调度生成新 Attempt ID、签名 JobSpec 和 token；旧 Attempt 保持 failed，迟到结果继续因 ID/generation 不匹配被拒绝。
+- uncertain：提交或运行中 SSH 查询失败只把 Job 标为 uncertain；查询选择器在三十分钟内跳过它。三十分钟后仍不可达才把当前 Attempt 记为失败并进入上述重试；第三次打开 `job-uncertain:<job-id>` 告警并终止批次。
+- 界面：任务 API 和构建页新增阶段、Attempt 数量和下次重试时间，用户可以区分排队、退避、状态不确定和确定性失败。
+- 测试：真实 SQLite migration 上连续模拟 generation 0、1、2 三次不可达，前两次回到 queued 且具有退避时间，第三次进入 failed 并只创建一个去重告警。全量测试还覆盖 migration、旧 Journal 幂等和迟到 Attempt。
+- 边界：同一 ReleaseBatch 的 Build 因 Fetch 产物亲和性仍不能任意切换到其他 Builder；原 Worker 永久丢失时会在重试耗尽后告警，而不是绕过签名传输规则到其他节点重新联网构建。

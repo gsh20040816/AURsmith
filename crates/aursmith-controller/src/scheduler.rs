@@ -1289,8 +1289,9 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
     let job = sqlx::query(
-        "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') ORDER BY priority DESC, created_at LIMIT 1",
+        "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
     )
+    .bind(Utc::now())
     .fetch_optional(&state.database)
     .await
     .map_err(ApiError::internal)?;
@@ -1408,7 +1409,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("UPDATE jobs SET worker_id = ?, status = 'dispatched', failure_code = NULL, signed_spec_json = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE jobs SET worker_id = ?, status = 'dispatched', failure_code = NULL, next_attempt_at = NULL, signed_spec_json = ?, updated_at = ? WHERE id = ?")
         .bind(&worker_id)
         .bind(&signed_spec)
         .bind(now)
@@ -1445,15 +1446,34 @@ async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, A
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.profile_sha256, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.profile_sha256, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
     )
+    .bind(Utc::now() - Duration::minutes(30))
     .fetch_optional(&state.database)
     .await
     .map_err(ApiError::internal)?;
     let Some(row) = row else { return Ok(()) };
     let job_id: String = row.get("id");
     let endpoint: String = row.get("endpoint");
-    let reply = transport::query(&state.config, &endpoint, &job_id).await?;
+    let reply = match transport::query(&state.config, &endpoint, &job_id).await {
+        Ok(reply) => reply,
+        Err(error) if row.get::<String, _>("controller_status") == "uncertain" => {
+            handle_uncertain_timeout(
+                state,
+                &job_id,
+                &row.get::<String, _>("kind"),
+                row.get::<Option<String>, _>("batch_id"),
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(error) => {
+            sqlx::query("UPDATE jobs SET status = 'uncertain', failure_code = 'DISPATCH_UNCERTAIN', updated_at = ? WHERE id = ? AND status IN ('dispatched', 'running')")
+                .bind(Utc::now()).bind(&job_id).execute(&state.database).await.map_err(ApiError::internal)?;
+            return Err(error);
+        }
+    };
     let remote_status = reply.data["status"].as_str().unwrap_or("unknown");
     let (status, failure) = match remote_status {
         "queued" => ("dispatched", None),
@@ -1506,6 +1526,8 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         None
     };
     let mut advance_build_batch = false;
+    let retry_scheduled =
+        status == "failed" && generation < 2 && failure.is_some_and(infrastructure_failure);
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("UPDATE attempts SET status = ?, result_sha256 = ? WHERE id = ?")
         .bind(status)
@@ -1514,9 +1536,12 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
-    sqlx::query("UPDATE jobs SET status = ?, failure_code = ?, updated_at = ? WHERE id = ?")
-        .bind(status)
+    let next_attempt_at = retry_scheduled
+        .then(|| Utc::now() + Duration::seconds(if generation == 0 { 5 } else { 10 }));
+    sqlx::query("UPDATE jobs SET status = ?, failure_code = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?")
+        .bind(if retry_scheduled { "queued" } else { status })
         .bind(failure)
+        .bind(next_attempt_at)
         .bind(Utc::now())
         .bind(&job_id)
         .execute(&mut *transaction)
@@ -1528,7 +1553,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             if status == "succeeded" {
                 sqlx::query("UPDATE build_profiles SET last_verified_at = ?, failure_reason = NULL WHERE manifest_sha256 = ?")
                     .bind(Utc::now()).bind(profile_sha).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-            } else if status == "failed" {
+            } else if status == "failed" && !retry_scheduled {
                 sqlx::query("UPDATE build_profiles SET state = 'failed', failure_reason = ? WHERE manifest_sha256 = ?")
                     .bind(failure).bind(profile_sha).execute(&mut *transaction).await.map_err(ApiError::internal)?;
             }
@@ -1566,6 +1591,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         }
     } else if row.get::<String, _>("kind") == "fetch"
         && status == "failed"
+        && !retry_scheduled
         && let Some(batch_id) = row.get::<Option<String>, _>("batch_id")
     {
         sqlx::query("UPDATE release_batches SET state = 'fetch_failed', failure_reason = ?, updated_at = ? WHERE id = ?")
@@ -1650,6 +1676,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         advance_build_batch = true;
     } else if row.get::<String, _>("kind") == "build"
         && status == "failed"
+        && !retry_scheduled
         && let Some(batch_id) = row.get::<Option<String>, _>("batch_id")
     {
         sqlx::query("UPDATE release_batches SET state = 'build_failed', failure_reason = ?, updated_at = ? WHERE id = ?")
@@ -1659,6 +1686,63 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     if advance_build_batch {
         crate::packages::schedule_ready_builds(&state.database).await?;
     }
+    Ok(())
+}
+
+fn infrastructure_failure(code: &str) -> bool {
+    matches!(
+        code,
+        "BUILDER_INFRASTRUCTURE"
+            | "VM_TIMEOUT"
+            | "VM_FAILED"
+            | "GUEST_RESULT_MISSING"
+            | "RESULT_UNAVAILABLE"
+            | "WORKER_UNREACHABLE"
+    )
+}
+
+async fn handle_uncertain_timeout(
+    state: &AppState,
+    job_id: &str,
+    kind: &str,
+    batch_id: Option<String>,
+    error: &str,
+) -> Result<(), ApiError> {
+    let attempt = sqlx::query(
+        "SELECT id, generation FROM attempts WHERE job_id = ? ORDER BY generation DESC LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let generation: i64 = attempt.get("generation");
+    let retry = generation < 2;
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("UPDATE attempts SET status = 'failed' WHERE id = ?")
+        .bind(attempt.get::<String, _>("id"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE jobs SET status = ?, failure_code = 'WORKER_UNREACHABLE', next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'uncertain'")
+        .bind(if retry { "queued" } else { "failed" })
+        .bind(retry.then(|| Utc::now() + Duration::seconds(if generation == 0 { 5 } else { 10 })))
+        .bind(Utc::now()).bind(job_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    if !retry && let Some(batch_id) = batch_id {
+        let state_name = if kind == "fetch" {
+            "fetch_failed"
+        } else {
+            "build_failed"
+        };
+        sqlx::query("UPDATE release_batches SET state = ?, failure_reason = 'WORKER_UNREACHABLE', updated_at = ? WHERE id = ?")
+            .bind(state_name).bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
+    if !retry {
+        sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', 'Worker 任务状态无法确认', ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
+            .bind(Uuid::new_v4().to_string()).bind(format!("job-uncertain:{job_id}"))
+            .bind(json!({"job_id": job_id, "attempt_generation": generation, "error": error}).to_string())
+            .bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
+    transaction.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -1927,6 +2011,60 @@ mod release_tests {
             authorization.removed_package_names,
             ["demo-cli", "demo-lib"]
         );
+    }
+
+    #[tokio::test]
+    async fn uncertain_job_retries_twice_then_alerts() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let state = state(database.clone());
+        let job_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO jobs(id, required_role, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', 'uncertain', 1, 'build', '[]', '[]', '[]', ?, ?)")
+            .bind(&job_id).bind(now).bind(now).execute(&database).await.unwrap();
+        for generation in 0..=2 {
+            sqlx::query("INSERT INTO attempts(id, job_id, generation, token_sha256, status) VALUES (?, ?, ?, ?, 'dispatched')")
+                .bind(Uuid::new_v4().to_string()).bind(&job_id).bind(generation)
+                .bind(hex::encode(Sha256::digest(format!("token-{generation}"))))
+                .execute(&database).await.unwrap();
+            sqlx::query(
+                "UPDATE jobs SET status = 'uncertain', next_attempt_at = NULL WHERE id = ?",
+            )
+            .bind(&job_id)
+            .execute(&database)
+            .await
+            .unwrap();
+            handle_uncertain_timeout(&state, &job_id, "build", None, "ssh timeout")
+                .await
+                .unwrap();
+            let row = sqlx::query("SELECT status, next_attempt_at FROM jobs WHERE id = ?")
+                .bind(&job_id)
+                .fetch_one(&database)
+                .await
+                .unwrap();
+            if generation < 2 {
+                assert_eq!(row.get::<String, _>("status"), "queued");
+                assert!(row.get::<Option<String>, _>("next_attempt_at").is_some());
+            } else {
+                assert_eq!(row.get::<String, _>("status"), "failed");
+            }
+        }
+        let alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE fingerprint = ?")
+            .bind(format!("job-uncertain:{job_id}"))
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(alerts, 1);
+    }
+
+    #[test]
+    fn only_infrastructure_failures_are_automatically_retried() {
+        assert!(infrastructure_failure("VM_TIMEOUT"));
+        assert!(infrastructure_failure("BUILDER_INFRASTRUCTURE"));
+        assert!(!infrastructure_failure("INPUT_INVALID"));
+        assert!(!infrastructure_failure("PROFILE_DIGEST_MISMATCH"));
+        assert!(!infrastructure_failure("AUDIT_REJECTED"));
+        assert!(!infrastructure_failure("GUEST_BUILD_FAILED"));
+        assert!(!infrastructure_failure("NETWORK_DURING_BUILD"));
     }
 
     #[test]

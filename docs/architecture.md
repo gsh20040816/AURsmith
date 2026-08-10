@@ -93,6 +93,8 @@ Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`�
 
 Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，删除 overlay 与控制 Socket 后，才把日志和输出原子移动到 completed 区。超时、QEMU 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
 
+Controller 只对基础设施错误自动创建新 Attempt：`BUILDER_INFRASTRUCTURE`、VM 超时/异常、Guest 结果缺失、结果暂不可读或 Worker 不可达。Builder 在 QEMU 非零退出时先检查 Guest 是否已经写出结构化错误；存在错误就归为确定性的 `GUEST_BUILD_FAILED`/`GUEST_FETCH_FAILED`，只有没有 Guest 错误证据的异常退出才是可重试 `VM_FAILED`。无网 Build 日志出现 DNS、路由或连接失败时单独标记 `NETWORK_DURING_BUILD`，同样不重试。generation 0 和 1 分别在 5 秒、10 秒后重试；generation 2 再失败即终止，因此总计最多一个初始 Attempt 加两个重试。输入摘要、Profile、身份、确定性 Guest 结果或审计类错误不会自动循环。SSH 提交或对账状态不明确时，Job 先进入 `uncertain`，三十分钟内不重新派发；届时再次查询 Journal，仍不可达才按同一 generation 上限重试，耗尽后打开稳定 fingerprint 告警。
+
 Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日志、Guest 结构化错误和 makepkg 日志复制到小型 `failed/<attempt>` 诊断目录，再删除 overlay、控制 Socket和临时输入；成功时日志随 completed 结果保存，overlay 同样先删除。这样不会为排错长期保留大型写时复制磁盘，也不会把 Guest 错误压缩成无法定位的 `VM_FAILED`。
 
 在 Builder 间 `TransferCapability` 传输尚未完成前，一个 ReleaseBatch 固定到第一个接单的 Builder。审计批准后的 Build Job 必须引用该节点上已经完成的 Fetch Attempt；Builder 再次验证 FetchResult、Source Manifest 和 completed 文件树后，才将 prepared source 复制进新的只读输入目录。这是显式的安全亲和策略：缺少原 Fetch Attempt 时任务保持不可调度，不允许 Build VM 重新联网获取源码。后续跨 Builder 调度只能通过同一摘要约束的 rsync Capability 扩展，不能绕过这条不变量。

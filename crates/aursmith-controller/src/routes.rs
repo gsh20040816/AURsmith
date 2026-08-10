@@ -1108,7 +1108,7 @@ async fn list_jobs(
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT jobs.id, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.created_at, jobs.updated_at, workers.name AS worker_name FROM jobs LEFT JOIN workers ON workers.id = jobs.worker_id ORDER BY jobs.created_at DESC LIMIT 200",
+        "SELECT jobs.id, jobs.kind, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, workers.name AS worker_name, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count FROM jobs LEFT JOIN workers ON workers.id = jobs.worker_id ORDER BY jobs.created_at DESC LIMIT 200",
     )
     .fetch_all(&state.database)
     .await
@@ -1118,12 +1118,15 @@ async fn list_jobs(
         .map(|row| {
             json!({
                 "id": row.get::<String, _>("id"),
+                "kind": row.get::<String, _>("kind"),
                 "required_role": row.get::<String, _>("required_role"),
                 "status": row.get::<String, _>("status"),
                 "priority": row.get::<i64, _>("priority"),
                 "failure_code": row.get::<Option<String>, _>("failure_code"),
                 "revision_sha256": row.get::<Option<String>, _>("revision_sha256"),
                 "worker_name": row.get::<Option<String>, _>("worker_name"),
+                "attempt_count": row.get::<i64, _>("attempt_count"),
+                "next_attempt_at": row.get::<Option<String>, _>("next_attempt_at"),
                 "created_at": row.get::<String, _>("created_at"),
                 "updated_at": row.get::<String, _>("updated_at"),
             })

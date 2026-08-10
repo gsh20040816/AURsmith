@@ -46,12 +46,15 @@ export type Worker = {
 };
 export type Job = {
   id: string;
+  kind: "fetch" | "build" | "profile_fixture";
   required_role: Worker["role"];
   status: string;
   priority: number;
   failure_code: string | null;
   revision_sha256: string | null;
   worker_name: string | null;
+  attempt_count: number;
+  next_attempt_at: string | null;
   created_at: string;
   updated_at: string;
 };
