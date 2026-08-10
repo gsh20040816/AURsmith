@@ -710,10 +710,15 @@ pub(crate) async fn complete_fetch(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
+    let dependency_download_milliseconds = result
+        .dependency_download_milliseconds
+        .checked_div(u64::try_from(result.resolved_dependencies.len()).unwrap_or_default())
+        .unwrap_or_default();
     for dependency in &result.resolved_dependencies {
-        sqlx::query("INSERT INTO dependency_observations(id, job_id, package_name, official_repository, download_bytes, download_milliseconds, install_milliseconds, cache_hit, observed_at) VALUES (?, ?, ?, 1, ?, 0, 0, 0, ?)")
+        sqlx::query("INSERT INTO dependency_observations(id, job_id, package_name, official_repository, download_bytes, download_milliseconds, install_milliseconds, cache_hit, observed_at) VALUES (?, ?, ?, 1, ?, ?, 0, 0, ?)")
             .bind(Uuid::new_v4().to_string()).bind(result.job_id.to_string()).bind(&dependency.name)
             .bind(i64::try_from(dependency.package.size).map_err(ApiError::internal)?)
+            .bind(i64::try_from(dependency_download_milliseconds).map_err(ApiError::internal)?)
             .bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
     }
     Ok(())
@@ -1976,6 +1981,7 @@ mod tests {
                 }],
                 audit_files: vec![],
                 resolved_dependencies: vec![],
+                dependency_download_milliseconds: 0,
                 resolved_pkgver: None,
                 dependency_snapshot_sha256: "c".repeat(64),
                 log_sha256: "d".repeat(64),

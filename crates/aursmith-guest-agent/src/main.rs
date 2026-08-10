@@ -134,7 +134,10 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     let prepared = Path::new(OUTPUT).join("prepared");
     fs::create_dir_all(&prepared)?;
     copy_tree(Path::new(BUILD), &prepared, false)?;
+    let dependency_download_started = std::time::Instant::now();
     let resolved_dependencies = download_official_dependencies(spec, &prepared)?;
+    let dependency_download_milliseconds =
+        u64::try_from(dependency_download_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let sources = manifest(&prepared, Path::new(OUTPUT))?;
     let source_manifest_sha256 = manifest_digest(&sources)?;
     let audit_files = select_audit_files(&prepared, &sources)?;
@@ -146,6 +149,7 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
         sources,
         audit_files,
         resolved_dependencies: resolved_dependencies.clone(),
+        dependency_download_milliseconds,
         resolved_pkgver: None,
         dependency_snapshot_sha256: hex::encode(Sha256::digest(serde_json::to_vec(
             &serde_json::json!({"requested": spec.dependencies, "resolved": resolved_dependencies}),

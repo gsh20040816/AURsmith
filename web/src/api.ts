@@ -106,6 +106,23 @@ export type BuildProfile = {
   last_verified_at: string | null;
   failure_reason: string | null;
 };
+export type ProfileRecommendation = {
+  package_name: string;
+  action: string;
+  stats: {
+    successful_builds: number;
+    uses_recent: number;
+    uses_this_month: number;
+    download_bytes: number;
+    average_saved_seconds: number;
+    cache_hits: number;
+    days_since_last_use: number;
+    currently_baked: boolean;
+  };
+  consecutive_hot_periods: number;
+  consecutive_low_periods: number;
+  evaluated_at: string;
+};
 export type Release = {
   id: string;
   batch_id: string;
@@ -159,6 +176,7 @@ export const api = {
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
   profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
+  profileRecommendations: () => request<{ items: ProfileRecommendation[] }>("/api/v1/profile-recommendations"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
   rollbackRelease: (id: string) => request<{
     release_id: string;

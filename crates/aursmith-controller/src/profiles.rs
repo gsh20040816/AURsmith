@@ -1,14 +1,16 @@
 use crate::{auth, error::ApiError, routes::AppState};
+use aursmith_domain::{DependencyAction, DependencyStats, ProfilePolicy};
 use aursmith_protocol::{BuildProfileSpec, SignedEnvelope};
 use axum::{
     Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +142,143 @@ pub async fn activate(
     Ok(Json(json!({"id": id, "state": "active"})))
 }
 
+pub async fn recommendations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    evaluate_dependencies(&state.database).await?;
+    let rows = sqlx::query("SELECT package_name, action, stats_json, consecutive_hot_periods, consecutive_low_periods, evaluated_at FROM profile_dependency_evaluations ORDER BY action, package_name")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "policy": ProfilePolicy::default(),
+        "items": rows.into_iter().map(|row| json!({
+            "package_name": row.get::<String,_>("package_name"),
+            "action": row.get::<String,_>("action"),
+            "stats": serde_json::from_str::<Value>(row.get("stats_json")).unwrap_or(Value::Null),
+            "consecutive_hot_periods": row.get::<i64,_>("consecutive_hot_periods"),
+            "consecutive_low_periods": row.get::<i64,_>("consecutive_low_periods"),
+            "evaluated_at": row.get::<String,_>("evaluated_at"),
+        })).collect::<Vec<_>>()
+    })))
+}
+
+pub(crate) async fn evaluate_dependencies(database: &sqlx::SqlitePool) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let last: Option<String> =
+        sqlx::query_scalar("SELECT MAX(evaluated_at) FROM profile_evaluation_runs")
+            .fetch_one(database)
+            .await
+            .map_err(ApiError::internal)?;
+    if last
+        .and_then(|value| value.parse::<chrono::DateTime<Utc>>().ok())
+        .is_some_and(|value| value > now - Duration::days(7))
+    {
+        return Ok(());
+    }
+    let successful_builds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'build' AND status = 'succeeded'",
+    )
+    .fetch_one(database)
+    .await
+    .map_err(ApiError::internal)?;
+    let active_profiles = sqlx::query_scalar::<_, String>(
+        "SELECT package_manifest_json FROM build_profiles WHERE state = 'active'",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(ApiError::internal)?;
+    let mut baked = BTreeSet::new();
+    for manifest in active_profiles {
+        if let Ok(packages) = serde_json::from_str::<Vec<String>>(&manifest) {
+            baked.extend(packages);
+        }
+    }
+    let observations = sqlx::query("SELECT package_name, COUNT(*) AS uses_total, SUM(CASE WHEN observed_at >= ? THEN 1 ELSE 0 END) AS uses_month, SUM(CASE WHEN job_id IN (SELECT job_id FROM dependency_observations GROUP BY job_id ORDER BY MAX(observed_at) DESC LIMIT 20) THEN 1 ELSE 0 END) AS uses_recent, COALESCE(SUM(download_bytes), 0) AS download_bytes, COALESCE(SUM(download_milliseconds + install_milliseconds), 0) AS elapsed_milliseconds, COALESCE(SUM(cache_hit), 0) AS cache_hits, MAX(observed_at) AS last_used_at FROM dependency_observations WHERE official_repository = 1 GROUP BY package_name ORDER BY package_name")
+        .bind(now - Duration::days(30)).fetch_all(database).await.map_err(ApiError::internal)?;
+    let policy = ProfilePolicy::default();
+    let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+    for row in observations {
+        let package_name: String = row.get("package_name");
+        let uses_total = u32::try_from(row.get::<i64, _>("uses_total")).unwrap_or(u32::MAX);
+        let elapsed = u64::try_from(row.get::<i64, _>("elapsed_milliseconds")).unwrap_or_default();
+        let previous = sqlx::query("SELECT consecutive_hot_periods, consecutive_low_periods FROM profile_dependency_evaluations WHERE package_name = ?")
+            .bind(&package_name).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?;
+        let last_used_at = row
+            .get::<String, _>("last_used_at")
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap_or(now);
+        let mut stats = DependencyStats {
+            total_observations: u32::try_from(successful_builds).unwrap_or(u32::MAX),
+            uses_in_recent_window: u32::try_from(row.get::<i64, _>("uses_recent"))
+                .unwrap_or(u32::MAX),
+            uses_this_month: u32::try_from(row.get::<i64, _>("uses_month")).unwrap_or(u32::MAX),
+            estimated_saved_seconds: elapsed
+                .checked_div(u64::from(uses_total))
+                .unwrap_or_default()
+                / 1000,
+            consecutive_add_periods: 0,
+            consecutive_low_periods: 0,
+            days_since_last_use: u32::try_from((now - last_used_at).num_days().max(0))
+                .unwrap_or(u32::MAX),
+            currently_baked: baked.contains(&package_name),
+            official_repository_package: true,
+        };
+        let provisional = policy.evaluate(stats);
+        let hot = matches!(
+            provisional,
+            DependencyAction::SuggestAdd | DependencyAction::Add | DependencyAction::Keep
+        );
+        let previous_hot = previous
+            .as_ref()
+            .map(|row| row.get::<i64, _>("consecutive_hot_periods"))
+            .unwrap_or_default();
+        let previous_low = previous
+            .as_ref()
+            .map(|row| row.get::<i64, _>("consecutive_low_periods"))
+            .unwrap_or_default();
+        stats.consecutive_add_periods = if hot {
+            u8::try_from(previous_hot + 1).unwrap_or(u8::MAX)
+        } else {
+            0
+        };
+        stats.consecutive_low_periods = if hot {
+            0
+        } else {
+            u8::try_from(previous_low + 1).unwrap_or(u8::MAX)
+        };
+        let action = policy.evaluate(stats);
+        let action_name = serde_json::to_value(action)
+            .map_err(ApiError::internal)?
+            .as_str()
+            .unwrap_or("observe_only")
+            .to_owned();
+        let stats_json = json!({
+            "successful_builds": successful_builds,
+            "uses_total": uses_total,
+            "uses_recent": stats.uses_in_recent_window,
+            "uses_this_month": stats.uses_this_month,
+            "download_bytes": row.get::<i64,_>("download_bytes"),
+            "average_saved_seconds": stats.estimated_saved_seconds,
+            "cache_hits": row.get::<i64,_>("cache_hits"),
+            "days_since_last_use": stats.days_since_last_use,
+            "currently_baked": stats.currently_baked,
+        })
+        .to_string();
+        sqlx::query("INSERT INTO profile_dependency_evaluations(package_name, consecutive_hot_periods, consecutive_low_periods, action, stats_json, evaluated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(package_name) DO UPDATE SET consecutive_hot_periods = excluded.consecutive_hot_periods, consecutive_low_periods = excluded.consecutive_low_periods, action = excluded.action, stats_json = excluded.stats_json, evaluated_at = excluded.evaluated_at")
+            .bind(package_name).bind(i64::from(stats.consecutive_add_periods)).bind(i64::from(stats.consecutive_low_periods))
+            .bind(action_name).bind(stats_json).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
+    sqlx::query("INSERT INTO profile_evaluation_runs(id, evaluated_at) VALUES (?, ?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(())
+}
+
 fn validate_spec(spec: &BuildProfileSpec) -> Result<(), ApiError> {
     for (entry, expected) in [
         (&spec.root_image, "root.qcow2"),
@@ -164,4 +303,45 @@ fn validate_spec(spec: &BuildProfileSpec) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hot_dependency_requires_two_weekly_evaluations() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        for index in 0..20 {
+            let job_id = Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO jobs(id, required_role, status, priority, kind, inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, 'builder', 'succeeded', 0, 'build', '[]', '[]', '{}', ?, ?)")
+                .bind(&job_id).bind(now).bind(now).execute(&database).await.unwrap();
+            if index < 6 {
+                sqlx::query("INSERT INTO dependency_observations(id, job_id, package_name, official_repository, download_bytes, download_milliseconds, install_milliseconds, cache_hit, observed_at) VALUES (?, ?, 'cmake', 1, 1000, 60000, 0, 0, ?)")
+                    .bind(Uuid::new_v4().to_string()).bind(job_id).bind(now).execute(&database).await.unwrap();
+            }
+        }
+        evaluate_dependencies(&database).await.unwrap();
+        let first: String = sqlx::query_scalar(
+            "SELECT action FROM profile_dependency_evaluations WHERE package_name = 'cmake'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(first, "suggest_add");
+        sqlx::query("UPDATE profile_evaluation_runs SET evaluated_at = ?")
+            .bind(now - Duration::days(8))
+            .execute(&database)
+            .await
+            .unwrap();
+        evaluate_dependencies(&database).await.unwrap();
+        let second: String = sqlx::query_scalar(
+            "SELECT action FROM profile_dependency_evaluations WHERE package_name = 'cmake'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(second, "add");
+    }
 }

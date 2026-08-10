@@ -183,6 +183,7 @@ pub struct FetchResult {
     pub sources: Vec<SourceManifestEntry>,
     pub audit_files: Vec<AuditSourceFile>,
     pub resolved_dependencies: Vec<ResolvedDependency>,
+    pub dependency_download_milliseconds: u64,
     pub resolved_pkgver: Option<String>,
     pub dependency_snapshot_sha256: String,
     pub log_sha256: String,

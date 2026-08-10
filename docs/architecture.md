@@ -27,6 +27,8 @@ Release 提交后，Controller 从 Publisher 读取只含路径、大小和摘�
 
 Publisher 启动时从只读 secret 导入仓库 GPG 公钥，计算完整指纹并通过 Worker 身份响应交给 Controller 固定，同时把公钥作为普通只读下载文件发布到仓库。客户端引导 API 只在 Publisher 指纹已经注册后提供 pacman 配置和导入命令，页面始终要求用户在本地签名前人工核对完整指纹；AURsmith 仓库配置明确放在官方仓库之后。
 
+Fetch Guest 实测官方依赖下载耗时并随 FetchResult 返回，Controller 按依赖记录下载字节、耗时、月使用次数和最近二十次构建出现率。优化器每七天最多评估一次：前二十次成功构建只观察；满足出现率或月使用次数且预计节省至少六十秒的官方依赖，连续两个周期后进入加入建议；已固化依赖连续三个低使用周期或三十天未使用后进入移除建议。AUR 依赖从不进入 Profile。UI 只生成可解释建议，实际不可变 Profile 仍必须由完整同步的 profile-builder 重建并通过 KVM fixture 后人工激活，失败时继续使用上一 Profile。
+
 ## 状态模型
 
 `Revision`、`Job`、`Attempt`、`Artifact`、`Release` 和 `ArchiveCopy` 是相互独立的聚合。已提交的 Release 不会因为 ArchiveCopy 等待或失败而退回未发布状态。任务采用至少一次投递，Attempt token 用于保证结果接收幂等并拒绝迟到结果。

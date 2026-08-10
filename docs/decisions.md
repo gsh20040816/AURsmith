@@ -26,6 +26,7 @@
 - ADR-022：ArchiveCopy 复用 TransferCapability 与 forced-command rsync，但使用 `release_id` 而不是 Build Attempt 绑定聚合。Archiver 主动拉取并用 `--link-dest` 建立快照；Receipt 由 Archiver Journal 中持久化的 Ed25519 身份密钥签署，Controller 在 Worker 注册和每次心跳时固定并核对身份公钥。源端 export 只在目标导入或 ArchiveReceipt 验证后由 Controller 触发幂等清理。
 - ADR-023：服务端回滚只激活既有签名 Release，不复制数据库、不重新签名且不改变历史 Release。Controller 将服务端当前指针和客户端降级分开建模，后者始终以显式 `pacman -U` 命令交给用户执行。
 - ADR-024：仓库公钥可以由 Publisher 公开下载，但私钥仍只存在于断网 Signer。Controller 不自行猜测指纹，而是在固定 Publisher 身份时保存其 GPG 完整指纹；客户端引导必须要求人工核对后才执行 `pacman-key --lsign-key`。
+- ADR-025：动态依赖优化以七天统计周期和迟滞状态实现，不直接修改正在使用的 Guest。优化器只对官方包给出加入/移除计划；每个计划仍经过完整 Profile 重建、签名授权、KVM fixture 和人工激活，避免统计波动把未经验证的环境直接投入构建。
 
 ## 已拒绝
 

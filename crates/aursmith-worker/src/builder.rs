@@ -986,6 +986,7 @@ mod tests {
             ],
             audit_files: vec![],
             resolved_dependencies: vec![],
+            dependency_download_milliseconds: 0,
             resolved_pkgver: None,
             dependency_snapshot_sha256: "c".repeat(64),
             log_sha256: "d".repeat(64),

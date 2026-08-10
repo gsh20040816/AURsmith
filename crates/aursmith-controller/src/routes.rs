@@ -61,6 +61,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/profiles/{id}/activate",
             post(crate::profiles::activate),
         )
+        .route(
+            "/api/v1/profile-recommendations",
+            get(crate::profiles::recommendations),
+        )
         .route("/api/v1/audits", get(crate::audits::list))
         .route(
             "/api/v1/audits/{bundle}/manual-decision",

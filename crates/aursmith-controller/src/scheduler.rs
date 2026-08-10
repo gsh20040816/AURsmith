@@ -48,6 +48,19 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+    let profile_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) =
+                crate::profiles::evaluate_dependencies(&profile_state.database).await
+            {
+                tracing::warn!(%error, "依赖 Profile 统计评估失败");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
