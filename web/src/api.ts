@@ -181,6 +181,16 @@ export type ControlPlaneBackup = {
   created_at: string;
   verified_at: string | null;
 };
+export type ArchiveInventory = {
+  id: string;
+  archiver_name: string;
+  full_digest: boolean;
+  release_count: number;
+  file_count: number;
+  byte_count: number;
+  failure_count: number;
+  checked_at: string;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -212,6 +222,7 @@ export const api = {
     pacman_commands: string[];
   }>(`/api/v1/releases/${encodeURIComponent(id)}/rollback`, { method: "POST" }),
   archives: () => request<{ items: ArchiveCopy[] }>("/api/v1/archives"),
+  archiveInventories: () => request<{ items: ArchiveInventory[] }>("/api/v1/archive-inventories"),
   clientBootstrap: () => request<ClientBootstrap>("/api/v1/client-bootstrap"),
   alerts: () => request<{ items: Alert[] }>("/api/v1/alerts"),
   acknowledgeAlert: (id: string) => request<{ id: string; state: string }>(`/api/v1/alerts/${encodeURIComponent(id)}/acknowledge`, { method: "POST" }),

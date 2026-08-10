@@ -4,8 +4,8 @@ mod builder;
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
-    ArchiveReceipt, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest,
-    ReleaseRollbackAuthorization, SignedEnvelope, TransferCapability,
+    ArchiveInventory, ArchiveReceipt, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization,
+    ReleaseManifest, ReleaseRollbackAuthorization, SignedEnvelope, TransferCapability,
 };
 use chrono::Utc;
 use clap::Parser;
@@ -153,6 +153,7 @@ enum WorkerCommand {
     QueryRelease { release_id: String },
     ReleaseFiles { release_id: String },
     AuthorizeRollback { envelope: SignedEnvelope },
+    Inventory { full_digest: bool },
 }
 
 #[derive(Debug, Serialize)]
@@ -410,6 +411,7 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         WorkerCommand::QueryRelease { release_id } => query_release(worker, &release_id).await,
         WorkerCommand::ReleaseFiles { release_id } => release_files(worker, &release_id).await,
         WorkerCommand::AuthorizeRollback { envelope } => authorize_rollback(worker, envelope).await,
+        WorkerCommand::Inventory { full_digest } => inventory(worker, full_digest).await,
     }
 }
 
@@ -924,6 +926,91 @@ async fn archive_release(
         .bind(Utc::now()).execute(&worker.database).await?;
     let _ = std::fs::remove_dir_all(imported);
     Ok(envelope)
+}
+
+async fn inventory(worker: &Worker, full_digest: bool) -> WorkerResponse {
+    if worker.role != WorkerRole::Archiver {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Archiver 可以执行库存巡检");
+    }
+    let rows = match sqlx::query(
+        "SELECT envelope_json, directory FROM archive_receipts ORDER BY release_id",
+    )
+    .fetch_all(&worker.database)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    };
+    let instance_id: String =
+        match sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
+            .fetch_one(&worker.database)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+        };
+    let mut release_count = 0_u64;
+    let mut file_count = 0_u64;
+    let mut byte_count = 0_u64;
+    let mut failures = Vec::new();
+    for row in rows {
+        let envelope = serde_json::from_str::<SignedEnvelope>(row.get("envelope_json"));
+        let receipt = envelope.and_then(|value| {
+            if value.verifying_key != worker.identity_signing_key.verifying_key().as_bytes() {
+                return Err(serde_json::Error::io(std::io::Error::other(
+                    "Receipt 身份公钥不匹配",
+                )));
+            }
+            value
+                .verify::<ArchiveReceipt>("aursmith.archive_receipt")
+                .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+        });
+        let receipt = match receipt {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(format!("Receipt 无效：{error}"));
+                continue;
+            }
+        };
+        release_count += 1;
+        file_count = file_count.saturating_add(receipt.files.len() as u64);
+        byte_count =
+            byte_count.saturating_add(receipt.files.iter().map(|entry| entry.size).sum::<u64>());
+        let directory = PathBuf::from(row.get::<String, _>("directory"));
+        let result = if full_digest {
+            verify_manifest_directory(&directory, &receipt.files)
+        } else {
+            verify_manifest_directory_shallow(&directory, &receipt.files)
+        };
+        if let Err(error) = result {
+            failures.push(format!("Release {}：{error}", receipt.release_id));
+        }
+        if failures.len() >= 100 {
+            break;
+        }
+    }
+    let report = ArchiveInventory {
+        archive_worker: match uuid::Uuid::parse_str(&instance_id) {
+            Ok(value) => value,
+            Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+        },
+        full_digest,
+        release_count,
+        file_count,
+        byte_count,
+        failures,
+        checked_at: Utc::now(),
+    };
+    match SignedEnvelope::sign(
+        "aursmith.archive_inventory",
+        &report,
+        &worker.identity_signing_key,
+    ) {
+        Ok(envelope) => {
+            WorkerResponse::ok("ARCHIVE_INVENTORY", serde_json::json!({"report": envelope}))
+        }
+        Err(error) => WorkerResponse::error("INVENTORY_ERROR", error.to_string()),
+    }
 }
 
 async fn authorize_release(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
@@ -1572,6 +1659,29 @@ fn verify_manifest_directory(
     Ok(())
 }
 
+fn verify_manifest_directory_shallow(
+    directory: &Path,
+    files: &[aursmith_protocol::ManifestEntry],
+) -> anyhow::Result<()> {
+    let mut expected = std::collections::BTreeSet::new();
+    for entry in files {
+        aursmith_protocol::validate_relative_path(&entry.path)?;
+        if !expected.insert(entry.path.clone()) {
+            bail!("Manifest 包含重复路径：{}", entry.path);
+        }
+        let metadata = std::fs::symlink_metadata(directory.join(&entry.path))?;
+        if !metadata.file_type().is_file() || metadata.len() != entry.size {
+            bail!("接收文件类型或大小与 Manifest 不匹配：{}", entry.path);
+        }
+    }
+    let mut actual = std::collections::BTreeSet::new();
+    collect_regular_files(directory, directory, &mut actual)?;
+    if actual != expected {
+        bail!("接收目录文件集合与 Manifest 不一致");
+    }
+    Ok(())
+}
+
 fn collect_regular_files(
     root: &Path,
     directory: &Path,
@@ -2032,5 +2142,25 @@ mod transfer_tests {
         assert!(validate_release_authorization_for_publisher(&authorization).is_ok());
         authorization.artifacts[0].path = "nested/fixture-1-1-any.pkg.tar.zst".into();
         assert!(validate_release_authorization_for_publisher(&authorization).is_err());
+    }
+
+    #[test]
+    fn archive_inventory_distinguishes_shallow_and_full_digest_checks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("release-manifest.json"), b"good").unwrap();
+        let entry = aursmith_protocol::ManifestEntry {
+            path: "release-manifest.json".into(),
+            sha256: hex::encode(Sha256::digest(b"good")),
+            size: 4,
+        };
+        assert!(
+            verify_manifest_directory_shallow(root.path(), std::slice::from_ref(&entry)).is_ok()
+        );
+        assert!(verify_manifest_directory(root.path(), std::slice::from_ref(&entry)).is_ok());
+        std::fs::write(root.path().join("release-manifest.json"), b"evil").unwrap();
+        assert!(
+            verify_manifest_directory_shallow(root.path(), std::slice::from_ref(&entry)).is_ok()
+        );
+        assert!(verify_manifest_directory(root.path(), &[entry]).is_err());
     }
 }

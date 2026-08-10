@@ -83,6 +83,17 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+    let inventory_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = run_archive_inventory_if_due(&inventory_state).await {
+                tracing::warn!(%error, "Archiver 库存巡检失败");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -105,6 +116,66 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+}
+
+async fn run_archive_inventory_if_due(state: &AppState) -> Result<(), ApiError> {
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT checked_at FROM archive_inventories ORDER BY checked_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    if latest
+        .and_then(|value| value.parse::<chrono::DateTime<Utc>>().ok())
+        .is_some_and(|value| value > Utc::now() - Duration::days(7))
+    {
+        return Ok(());
+    }
+    let latest_full: Option<String> = sqlx::query_scalar("SELECT checked_at FROM archive_inventories WHERE full_digest = 1 ORDER BY checked_at DESC LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let full_digest = latest_full
+        .and_then(|value| value.parse::<chrono::DateTime<Utc>>().ok())
+        .is_none_or(|value| value <= Utc::now() - Duration::days(90));
+    let worker = sqlx::query("SELECT id, endpoint, identity_signing_key_hex FROM workers WHERE role = 'archiver' AND state = 'online' ORDER BY name LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let Some(worker) = worker else { return Ok(()) };
+    let worker_id: String = worker.get("id");
+    let expected_key: String = worker
+        .get::<Option<String>, _>("identity_signing_key_hex")
+        .ok_or_else(|| ApiError::internal("Archiver 缺少身份公钥"))?;
+    let reply =
+        transport::archive_inventory(&state.config, worker.get("endpoint"), full_digest).await?;
+    let envelope: SignedEnvelope =
+        serde_json::from_value(reply.data["report"].clone()).map_err(ApiError::internal)?;
+    if envelope.verifying_key != hex::decode(expected_key).map_err(ApiError::internal)? {
+        return Err(ApiError::conflict(
+            "ARCHIVE_INVENTORY_UNTRUSTED",
+            "库存报告身份签名不匹配",
+        ));
+    }
+    let report: aursmith_protocol::ArchiveInventory = envelope
+        .verify("aursmith.archive_inventory")
+        .map_err(ApiError::internal)?;
+    if report.archive_worker.to_string() != worker_id || report.full_digest != full_digest {
+        return Err(ApiError::conflict(
+            "ARCHIVE_INVENTORY_MISMATCH",
+            "库存报告与请求不一致",
+        ));
+    }
+    sqlx::query("INSERT INTO archive_inventories(id, archiver_worker_id, full_digest, release_count, file_count, byte_count, failure_count, envelope_json, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(&worker_id).bind(full_digest)
+        .bind(i64::try_from(report.release_count).map_err(ApiError::internal)?)
+        .bind(i64::try_from(report.file_count).map_err(ApiError::internal)?)
+        .bind(i64::try_from(report.byte_count).map_err(ApiError::internal)?)
+        .bind(i64::try_from(report.failures.len()).map_err(ApiError::internal)?)
+        .bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+        .bind(report.checked_at).execute(&state.database).await.map_err(ApiError::internal)?;
+    if report.failures.is_empty() {
+        resolve_alert(state, &format!("archive-inventory:{worker_id}")).await?;
+    } else {
+        upsert_operational_alert(state, &format!("archive-inventory:{worker_id}"), "critical", "Archiver 库存巡检发现损坏", json!({"worker_id": worker_id, "full_digest": full_digest, "failures": report.failures})).await?;
+    }
+    Ok(())
 }
 
 async fn dispatch_archive_one(state: &AppState) -> Result<(), ApiError> {

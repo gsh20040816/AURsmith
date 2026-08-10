@@ -55,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/alerts/{id}/acknowledge", post(acknowledge_alert))
         .route("/api/v1/backups", get(list_backups).post(create_backup))
         .route("/api/v1/backups/{id}/verify", post(verify_backup))
+        .route("/api/v1/archive-inventories", get(list_archive_inventories))
         .route("/api/v1/workers", get(list_workers).post(register_worker))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
@@ -332,6 +333,21 @@ async fn verify_backup(
     )
     .await?;
     Ok(Json(result))
+}
+
+async fn list_archive_inventories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let rows = sqlx::query("SELECT archive_inventories.id, archive_inventories.full_digest, archive_inventories.release_count, archive_inventories.file_count, archive_inventories.byte_count, archive_inventories.failure_count, archive_inventories.checked_at, workers.name FROM archive_inventories JOIN workers ON workers.id = archive_inventories.archiver_worker_id ORDER BY checked_at DESC LIMIT 100")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
+        "id": row.get::<String,_>("id"), "archiver_name": row.get::<String,_>("name"),
+        "full_digest": row.get::<bool,_>("full_digest"), "release_count": row.get::<i64,_>("release_count"),
+        "file_count": row.get::<i64,_>("file_count"), "byte_count": row.get::<i64,_>("byte_count"),
+        "failure_count": row.get::<i64,_>("failure_count"), "checked_at": row.get::<String,_>("checked_at"),
+    })).collect::<Vec<_>>() })))
 }
 
 async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

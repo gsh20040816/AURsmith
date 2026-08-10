@@ -80,20 +80,52 @@ enum Command {
 enum WorkerCommand {
     Status,
     Drain,
-    Query { job_id: String },
-    Submit { envelope_file: PathBuf },
-    AurSearch { query: String },
-    AurInfo { names: Vec<String> },
-    AurProviders { names: Vec<String> },
-    OfficialInfo { names: Vec<String> },
-    AurSnapshot { package_base: String },
-    AuthorizeExport { envelope_file: PathBuf },
-    AuthorizeImport { envelope_file: PathBuf },
-    CompleteExport { envelope_file: PathBuf },
-    AuthorizeRelease { envelope_file: PathBuf },
-    AuthorizeRollback { envelope_file: PathBuf },
-    QueryRelease { release_id: String },
-    ReleaseFiles { release_id: String },
+    Query {
+        job_id: String,
+    },
+    Submit {
+        envelope_file: PathBuf,
+    },
+    AurSearch {
+        query: String,
+    },
+    AurInfo {
+        names: Vec<String>,
+    },
+    AurProviders {
+        names: Vec<String>,
+    },
+    OfficialInfo {
+        names: Vec<String>,
+    },
+    AurSnapshot {
+        package_base: String,
+    },
+    AuthorizeExport {
+        envelope_file: PathBuf,
+    },
+    AuthorizeImport {
+        envelope_file: PathBuf,
+    },
+    CompleteExport {
+        envelope_file: PathBuf,
+    },
+    AuthorizeRelease {
+        envelope_file: PathBuf,
+    },
+    AuthorizeRollback {
+        envelope_file: PathBuf,
+    },
+    QueryRelease {
+        release_id: String,
+    },
+    ReleaseFiles {
+        release_id: String,
+    },
+    Inventory {
+        #[arg(long)]
+        full_digest: bool,
+    },
 }
 
 #[tokio::main]
@@ -158,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 WorkerCommand::ReleaseFiles { release_id } => {
                     json!({"command": "release_files", "release_id": release_id})
+                }
+                WorkerCommand::Inventory { full_digest } => {
+                    json!({"command": "inventory", "full_digest": full_digest})
                 }
             };
             let response = worker_request(&socket, request).await?;
@@ -491,6 +526,8 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
                 "release_id": release_id
             })
         }
+        ["inventory"] => json!({"command": "inventory", "full_digest": false}),
+        ["inventory", "--full-digest"] => json!({"command": "inventory", "full_digest": true}),
         _ => bail!("SSH 命令未被允许"),
     };
     let response = worker_request(socket, request).await?;

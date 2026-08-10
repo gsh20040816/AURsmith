@@ -264,6 +264,17 @@ pub struct ControlPlaneBackup {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveInventory {
+    pub archive_worker: Uuid,
+    pub full_digest: bool,
+    pub release_count: u64,
+    pub file_count: u64,
+    pub byte_count: u64,
+    pub failures: Vec<String>,
+    pub checked_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

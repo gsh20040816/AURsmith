@@ -104,6 +104,24 @@ pub async fn release_files(
     .await
 }
 
+pub async fn archive_inventory(
+    config: &Config,
+    endpoint: &str,
+    full_digest: bool,
+) -> Result<WorkerReply, ApiError> {
+    invoke(
+        config,
+        endpoint,
+        if full_digest {
+            "inventory --full-digest"
+        } else {
+            "inventory"
+        },
+        None,
+    )
+    .await
+}
+
 pub async fn aur_search(
     config: &Config,
     endpoint: &str,

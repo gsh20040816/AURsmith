@@ -47,6 +47,8 @@ Controller 每 24 小时或按管理员请求执行一次控制面一致性备�
 
 离线恢复命令先核对当前 Controller 公钥、Envelope、固定文件名、大小、摘要和 SQLite 完整性，再复制到目标文件系统复验。替换前把原数据库及 WAL/SHM 一并移动到带 UTC 时间和 Backup ID 的 `recovery` 目录，恢复中途失败时尝试放回原数据库。恢复要求先停止 Controller；在线 API 不提供数据库替换能力。
 
+Archiver 每周对所有 ArchiveReceipt 执行一次集合巡检：复验 Receipt 自身签名，确认每个 Release 的文件集合、普通文件类型和大小完全一致。每九十天执行完整摘要巡检，在相同检查上重新计算所有文件 SHA-256。Archiver 用自身持久化 Ed25519 身份签署 `ArchiveInventory`；Controller 固定核对 Worker UUID、身份公钥和请求的巡检级别后才保存报告。发现任一损坏会产生 critical 告警，不能以更新 Receipt 或忽略多余文件来制造通过。
+
 ## AUR 同步与依赖闭包
 
 Controller 不直接访问 AUR。浏览器请求由 Controller 认证后，经固定 argv 的 OpenSSH forced command 发给在线 Publisher；Publisher Worker 才能调用 AUR RPC 和 AUR Git。Builder 或 Archiver 收到同类命令会以角色错误拒绝。

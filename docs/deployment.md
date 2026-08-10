@@ -106,6 +106,8 @@ docker compose -f deploy/controller/compose.yaml start controller
 
 命令会验证 Controller 签名、SHA-256 和 SQLite `integrity_check`。被替换的数据库、WAL 与 SHM 移入 `/var/lib/aursmith/recovery/<UTC 时间>-<Backup ID>/`，不会自动删除。恢复后必须运行 Doctor，并核对 Worker、当前 Release、ArchiveCopy 和管理员登录；确认无误前不要清理 recovery 目录。
 
+Archiver 库存巡检由 Controller 自动调度：七天没有成功报告时执行文件集合与大小检查，九十天没有完整报告时重新计算全部摘要。巡检通过现有 forced-command SSH 发起，结果由 Archiver 身份密钥签名。归档页面显示最近报告的级别、Release/文件数量和失败数；任何失败都应先隔离存储故障并从其他已验证副本恢复，不要直接修改 Receipt 或控制面状态。
+
 ## Git 与发布
 
 - 日常开发直接进入 `main`，每个独立且验证通过的改动形成一个英文提交。
