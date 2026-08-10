@@ -711,6 +711,68 @@ pub(crate) async fn complete_fetch(
     Ok(())
 }
 
+pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), ApiError> {
+    let batch_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM release_batches WHERE state IN ('awaiting_audit', 'building') ORDER BY created_at",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(ApiError::internal)?;
+    for batch_id in batch_ids {
+        let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+        let unapproved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_batch_revisions AS member WHERE member.batch_id = ? AND NOT EXISTS (SELECT 1 FROM audit_bundles WHERE audit_bundles.revision_id = member.revision_id AND audit_bundles.state = 'approved')")
+            .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
+        if unapproved > 0 {
+            transaction.commit().await.map_err(ApiError::internal)?;
+            continue;
+        }
+        let active_job: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE batch_id = ? AND kind = 'build' AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
+            .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
+        if active_job > 0 {
+            transaction.commit().await.map_err(ApiError::internal)?;
+            continue;
+        }
+        let next = sqlx::query("SELECT member.revision_id, revisions.input_sha256 FROM release_batch_revisions AS member JOIN revisions ON revisions.id = member.revision_id WHERE member.batch_id = ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = member.batch_id AND jobs.revision_id = member.revision_id AND jobs.kind = 'build' AND jobs.status = 'succeeded') ORDER BY member.build_order LIMIT 1")
+            .bind(&batch_id).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?;
+        let Some(next) = next else {
+            sqlx::query("UPDATE release_batches SET state = 'ready_to_publish', failure_reason = NULL, updated_at = ? WHERE id = ?")
+                .bind(Utc::now()).bind(&batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+            transaction.commit().await.map_err(ApiError::internal)?;
+            continue;
+        };
+        let revision_id: String = next.get("revision_id");
+        let fetch = sqlx::query("SELECT jobs.worker_id, jobs.profile_sha256, jobs.source_manifest_sha256, jobs.dependency_snapshot_sha256, attempts.id AS attempt_id FROM jobs JOIN attempts ON attempts.job_id = jobs.id AND attempts.status = 'succeeded' WHERE jobs.batch_id = ? AND jobs.revision_id = ? AND jobs.kind = 'fetch' AND jobs.status = 'succeeded' ORDER BY attempts.generation DESC LIMIT 1")
+            .bind(&batch_id).bind(&revision_id).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::conflict("FETCH_RESULT_MISSING", "审计已批准，但找不到可供 Build 使用的 Fetch Attempt"))?;
+        let worker_id: String = fetch.get("worker_id");
+        let profile_sha256: String = fetch.get("profile_sha256");
+        let source_manifest_sha256: String =
+            sqlx::query_scalar("SELECT source_manifest_sha256 FROM revisions WHERE id = ?")
+                .bind(&revision_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(ApiError::internal)?;
+        let dependency_snapshot_sha256: String = fetch.get("dependency_snapshot_sha256");
+        let source_attempt_id: String = fetch.get("attempt_id");
+        let now = Utc::now();
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(&batch_id).bind(&revision_id)
+            .bind(next.get::<String,_>("input_sha256")).bind(profile_sha256).bind(source_manifest_sha256)
+            .bind(dependency_snapshot_sha256).bind(worker_id).bind(source_attempt_id)
+            .bind(r#"{"cpu_count":2,"memory_mib":4096,"disk_mib":16384,"timeout_seconds":3600}"#)
+            .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE revisions SET state = 'build_pending' WHERE id = ?")
+            .bind(&revision_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        sqlx::query("UPDATE release_batches SET state = 'building', failure_reason = NULL, updated_at = ? WHERE id = ?")
+            .bind(now).bind(&batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        transaction.commit().await.map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
 pub async fn list_subscriptions(
     State(state): State<AppState>,
     headers: HeaderMap,

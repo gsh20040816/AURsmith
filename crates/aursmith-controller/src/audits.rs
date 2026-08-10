@@ -270,6 +270,12 @@ async fn finalize(state: &AppState, bundle: &str, decision: AuditDecision) -> Re
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
     }
     transaction.commit().await.map_err(ApiError::internal)?;
+    if matches!(
+        decision,
+        AuditDecision::ApprovedByLowCost | AuditDecision::ApprovedByHighCost
+    ) {
+        crate::packages::schedule_ready_builds(&state.database).await?;
+    }
     Ok(())
 }
 
@@ -367,6 +373,9 @@ pub async fn manual_decision(
         .execute(&mut *transaction).await.map_err(ApiError::internal)?;
     sqlx::query("UPDATE manual_actions SET state = 'completed', completed_at = ? WHERE aggregate_id = ? AND state = 'pending'").bind(Utc::now()).bind(&revision_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     transaction.commit().await.map_err(ApiError::internal)?;
+    if request.approve {
+        crate::packages::schedule_ready_builds(&state.database).await?;
+    }
     Ok(Json(json!({"bundle_sha256": bundle, "decision": decision})))
 }
 

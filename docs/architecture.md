@@ -47,6 +47,8 @@ Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`�
 
 Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，才把 runtime 原子移动到 completed 区。超时、QEMU/virtiofsd 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
 
+在 Builder 间 `TransferCapability` 传输尚未完成前，一个 ReleaseBatch 固定到第一个接单的 Builder。审计批准后的 Build Job 必须引用该节点上已经完成的 Fetch Attempt；Builder 再次验证 FetchResult、Source Manifest 和 completed 文件树后，才将 prepared source 复制进新的只读输入目录。这是显式的安全亲和策略：缺少原 Fetch Attempt 时任务保持不可调度，不允许 Build VM 重新联网获取源码。后续跨 Builder 调度只能通过同一摘要约束的 rsync Capability 扩展，不能绕过这条不变量。
+
 Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
 
 Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段安装完整且同步的 Arch 根文件系统、嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 virtiofs 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate。

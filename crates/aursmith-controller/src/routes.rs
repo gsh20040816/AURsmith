@@ -419,6 +419,8 @@ struct CreateJobRequest {
     profile_sha256: Option<String>,
     source_manifest_sha256: Option<String>,
     dependency_snapshot_sha256: Option<String>,
+    preferred_worker_id: Option<Uuid>,
+    source_attempt_id: Option<Uuid>,
     #[serde(default)]
     inputs: Vec<ManifestEntry>,
     #[serde(default)]
@@ -542,7 +544,7 @@ async fn create_job(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(role_name(request.required_role))
@@ -552,6 +554,8 @@ async fn create_job(
     .bind(request.profile_sha256)
     .bind(request.source_manifest_sha256)
     .bind(request.dependency_snapshot_sha256)
+    .bind(request.preferred_worker_id.map(|value| value.to_string()))
+    .bind(request.source_attempt_id.map(|value| value.to_string()))
     .bind(serde_json::to_string(&request.inputs).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&request.inline_inputs).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&request.required_labels).map_err(ApiError::internal)?)

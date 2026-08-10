@@ -421,7 +421,14 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
         }
     }
 
-    let initial_status = if spec.inline_inputs.is_empty() {
+    if !spec.inline_inputs.is_empty() && spec.source_attempt_id.is_some() {
+        return WorkerResponse::error(
+            "AMBIGUOUS_JOB_INPUT",
+            "Job 不能同时携带内联输入和已准备源码引用",
+        );
+    }
+    let needs_materialization = !spec.inline_inputs.is_empty() || spec.source_attempt_id.is_some();
+    let initial_status = if !needs_materialization {
         "queued"
     } else {
         "preparing"
@@ -440,7 +447,7 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
     .await;
     match inserted {
         Ok(_) => {
-            if !spec.inline_inputs.is_empty() {
+            if needs_materialization {
                 let Some(builder) = &worker.builder else {
                     let _ = sqlx::query("DELETE FROM attempts WHERE attempt_id = ?")
                         .bind(spec.attempt.attempt_id.to_string())
@@ -451,7 +458,12 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
                         "只有 Builder 可以接收内联构建输入",
                     );
                 };
-                if let Err(error) = builder.materialize_inline_inputs(&spec) {
+                let materialized = if spec.source_attempt_id.is_some() {
+                    builder.materialize_prepared_source(&spec)
+                } else {
+                    builder.materialize_inline_inputs(&spec)
+                };
+                if let Err(error) = materialized {
                     let _ = sqlx::query("DELETE FROM attempts WHERE attempt_id = ?")
                         .bind(spec.attempt.attempt_id.to_string())
                         .execute(&worker.database)

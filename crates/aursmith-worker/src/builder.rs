@@ -115,6 +115,67 @@ impl BuilderRuntime {
         }
         materialized
     }
+
+    pub fn materialize_prepared_source(&self, spec: &JobSpec) -> anyhow::Result<()> {
+        let source_attempt = spec.source_attempt_id.context("SOURCE_ATTEMPT_MISSING")?;
+        let completed = self
+            .jobs_dir
+            .join("completed")
+            .join(source_attempt.to_string());
+        let raw_result = fs::read(completed.join("output/build-result.json"))?;
+        let GuestResult::Fetch(fetch) = serde_json::from_slice(&raw_result)? else {
+            bail!("SOURCE_ATTEMPT_NOT_FETCH");
+        };
+        if Some(fetch.source_manifest_sha256.as_str()) != spec.source_manifest_sha256.as_deref() {
+            bail!("SOURCE_MANIFEST_MISMATCH");
+        }
+        validate_source_entries(&completed.join("output"), &fetch.sources)?;
+        let staging = self
+            .jobs_dir
+            .join("staging")
+            .join(spec.attempt.attempt_id.to_string());
+        fs::create_dir_all(self.jobs_dir.join("staging"))?;
+        fs::create_dir(&staging).context("STAGING_ALREADY_EXISTS")?;
+        let input_root = staging.join("input");
+        fs::create_dir(&input_root)?;
+        let copied = copy_prepared_tree(&completed.join("output/prepared"), &input_root);
+        if copied.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        copied
+    }
+}
+
+fn copy_prepared_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    for item in fs::read_dir(source)? {
+        let item = item?;
+        let target = destination.join(item.file_name());
+        let metadata = fs::symlink_metadata(item.path())?;
+        if metadata.file_type().is_dir() {
+            fs::create_dir(&target)?;
+            copy_prepared_tree(&item.path(), &target)?;
+        } else if metadata.file_type().is_file() {
+            fs::copy(item.path(), target)?;
+        } else if metadata.file_type().is_symlink() {
+            let link = fs::read_link(item.path())?;
+            if link.is_absolute()
+                || link.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                bail!("SOURCE_LINK_ESCAPE");
+            }
+            std::os::unix::fs::symlink(link, target)?;
+        } else {
+            bail!("SOURCE_SPECIAL_FILE");
+        }
+    }
+    Ok(())
 }
 
 pub fn spawn(database: SqlitePool, controller_key: Vec<u8>, runtime: BuilderRuntime) {
@@ -710,6 +771,7 @@ mod tests {
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
             profile_sha256: Some("a".repeat(64)),
+            source_attempt_id: None,
             inputs: vec![],
             inline_inputs: vec![],
             limits: ResourceLimits {
@@ -810,6 +872,70 @@ mod tests {
                 .join(spec.attempt.attempt_id.to_string())
                 .exists()
         );
+    }
+
+    #[test]
+    fn build_source_is_bound_to_a_completed_fetch_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime =
+            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let source_attempt = Uuid::new_v4();
+        let output = runtime
+            .jobs_dir
+            .join("completed")
+            .join(source_attempt.to_string())
+            .join("output");
+        fs::create_dir_all(output.join("prepared")).unwrap();
+        fs::write(output.join("prepared/PKGBUILD"), b"pkgname=fixture\n").unwrap();
+        let source_manifest = "a".repeat(64);
+        let source_job = Uuid::new_v4();
+        let result = GuestResult::Fetch(aursmith_protocol::FetchResult {
+            job_id: source_job,
+            attempt: AttemptRef {
+                job_id: source_job,
+                attempt_id: source_attempt,
+                generation: 0,
+            },
+            revision_sha256: "b".repeat(64),
+            source_manifest_sha256: source_manifest.clone(),
+            sources: vec![
+                SourceManifestEntry {
+                    path: "prepared".into(),
+                    kind: SourceEntryKind::Directory,
+                    sha256: None,
+                    size: 0,
+                    link_target: None,
+                },
+                SourceManifestEntry {
+                    path: "prepared/PKGBUILD".into(),
+                    kind: SourceEntryKind::File,
+                    sha256: Some(hex::encode(Sha256::digest(b"pkgname=fixture\n"))),
+                    size: 16,
+                    link_target: None,
+                },
+            ],
+            audit_files: vec![],
+            resolved_pkgver: None,
+            dependency_snapshot_sha256: "c".repeat(64),
+            log_sha256: "d".repeat(64),
+            finished_at: Utc::now(),
+        });
+        fs::write(
+            output.join("build-result.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+        let mut spec = job(JobKind::Build);
+        spec.source_attempt_id = Some(source_attempt);
+        spec.source_manifest_sha256 = Some(source_manifest);
+
+        runtime.materialize_prepared_source(&spec).unwrap();
+        let copied = runtime
+            .jobs_dir
+            .join("staging")
+            .join(spec.attempt.attempt_id.to_string())
+            .join("input/PKGBUILD");
+        assert_eq!(fs::read(copied).unwrap(), b"pkgname=fixture\n");
     }
 
     #[test]

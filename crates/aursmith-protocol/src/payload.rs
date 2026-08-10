@@ -72,6 +72,8 @@ pub struct JobSpec {
     pub source_manifest_sha256: Option<String>,
     pub dependency_snapshot_sha256: Option<String>,
     pub profile_sha256: Option<String>,
+    #[serde(default)]
+    pub source_attempt_id: Option<Uuid>,
     pub inputs: Vec<ManifestEntry>,
     #[serde(default)]
     pub inline_inputs: Vec<InlineInput>,
@@ -235,6 +237,7 @@ mod tests {
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
             profile_sha256: None,
+            source_attempt_id: None,
             inputs: Vec::new(),
             inline_inputs: Vec::new(),
             limits: ResourceLimits {

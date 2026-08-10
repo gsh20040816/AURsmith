@@ -18,6 +18,7 @@
 - ADR-014：KVM Profile 身份采用“文件 Manifest、已安装包清单和创建时间”的确定性内容摘要，Envelope 再对该声明签名。拒绝让 payload 包含自身哈希的循环定义。Fetch VM 只用 `restrict=on` 的单一 guestfwd 到固定 source proxy，Build VM 固定 `-nic none`。
 - ADR-015：Profile 使用一次性 Compose 构建镜像生成，不给常驻 Builder 增加 root 或联网能力。Guest Agent 固定为 PID 1 并再次验证 Controller JobSpec；任何 Guest 失败都关闭 VM，不回退到宿主 makepkg。
 - ADR-016：AUR 包装层扫描结果建模为 `AuditPreScan`，它不是 Agent 的最终审计输入。只有 Fetch VM 产生完整 Source Manifest、Builder 与 Controller 双重验证结果后，系统才创建内容寻址的 `AuditBundle` 和三路低成本 Agent 任务，避免把“尚未取得上游源码”误报成已完成审计。
+- ADR-017：首个可运行的 Fetch/Build 接力以 ReleaseBatch 为单位固定 Builder 亲和性。Build Job 引用已验证的 Fetch Attempt 和 Source Manifest，不允许重新下载。跨 Builder 接力必须等待受签名 `TransferCapability` 约束的 rsync 路径完成，不能用共享可写卷或临时联网代替。
 
 ## 已拒绝
 

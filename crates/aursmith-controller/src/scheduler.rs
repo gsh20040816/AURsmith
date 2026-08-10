@@ -121,7 +121,7 @@ async fn probe_all_workers(state: &AppState) -> Result<(), ApiError> {
 
 async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     let job = sqlx::query(
-        "SELECT id, required_role, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') ORDER BY priority DESC, created_at LIMIT 1",
+        "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') ORDER BY priority DESC, created_at LIMIT 1",
     )
     .fetch_optional(&state.database)
     .await
@@ -140,12 +140,22 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     .await
     .map_err(ApiError::internal)?;
     let required_profile: Option<String> = job.get("profile_sha256");
+    let mut preferred_worker_id: Option<String> = job.get("preferred_worker_id");
+    if preferred_worker_id.is_none()
+        && let Some(batch_id) = job.get::<Option<String>, _>("batch_id")
+    {
+        preferred_worker_id = sqlx::query_scalar("SELECT worker_id FROM jobs WHERE batch_id = ? AND worker_id IS NOT NULL ORDER BY created_at LIMIT 1")
+            .bind(batch_id).fetch_optional(&state.database).await.map_err(ApiError::internal)?.flatten();
+    }
     let selected = workers.into_iter().find(|worker| {
         let labels: BTreeSet<String> =
             serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
         let profiles: BTreeSet<String> =
             serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
         required_labels.is_subset(&labels)
+            && preferred_worker_id
+                .as_ref()
+                .is_none_or(|preferred| worker.get::<String, _>("id") == *preferred)
             && required_profile
                 .as_ref()
                 .is_none_or(|profile| profiles.contains(profile))
@@ -197,6 +207,11 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         source_manifest_sha256: job.get("source_manifest_sha256"),
         dependency_snapshot_sha256: job.get("dependency_snapshot_sha256"),
         profile_sha256: job.get("profile_sha256"),
+        source_attempt_id: job
+            .get::<Option<String>, _>("source_attempt_id")
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(ApiError::internal)?,
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
         inline_inputs: serde_json::from_str(job.get("inline_inputs_json"))
             .map_err(ApiError::internal)?,
@@ -303,6 +318,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     } else {
         None
     };
+    let mut advance_build_batch = false;
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("UPDATE attempts SET status = ?, result_sha256 = ? WHERE id = ?")
         .bind(status)
@@ -336,7 +352,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         let Some(revision_id) = revision_id else {
             return Err(ApiError::internal("Fetch Job 缺少 revision_id"));
         };
-        let Some(GuestResult::Fetch(fetch_result)) = guest_result else {
+        let Some(GuestResult::Fetch(fetch_result)) = guest_result.as_ref() else {
             return Err(ApiError::conflict(
                 "RESULT_KIND_MISMATCH",
                 "Fetch Job 返回了其他类型的 GuestResult",
@@ -352,7 +368,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
                 "GuestResult 身份与 Controller 的 Job/Attempt/Revision 不一致",
             ));
         }
-        crate::packages::complete_fetch(&mut transaction, &revision_id, &fetch_result).await?;
+        crate::packages::complete_fetch(&mut transaction, &revision_id, fetch_result).await?;
         if let Some(batch_id) = row.get::<Option<String>, _>("batch_id") {
             let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE batch_id = ? AND kind = 'fetch' AND status != 'succeeded'")
                 .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
@@ -368,7 +384,50 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         sqlx::query("UPDATE release_batches SET state = 'fetch_failed', failure_reason = ?, updated_at = ? WHERE id = ?")
             .bind(failure).bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     }
+    if row.get::<String, _>("kind") == "build" && status == "succeeded" {
+        let Some(GuestResult::Build(build_result)) = guest_result.as_ref() else {
+            return Err(ApiError::conflict(
+                "RESULT_KIND_MISMATCH",
+                "Build Job 返回了其他类型的 GuestResult",
+            ));
+        };
+        let expected_revision: Option<String> = row.get("revision_sha256");
+        if build_result.job_id.to_string() != job_id
+            || build_result.attempt.attempt_id.to_string() != attempt_id
+            || expected_revision.as_deref() != Some(build_result.revision_sha256.as_str())
+        {
+            return Err(ApiError::conflict(
+                "RESULT_IDENTITY_MISMATCH",
+                "BuildResult 身份与 Controller 的 Job/Attempt/Revision 不一致",
+            ));
+        }
+        for artifact in &build_result.artifacts {
+            sqlx::query("INSERT INTO artifacts(sha256, job_id, path, size, package_name, package_version, architecture, provenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sha256) DO NOTHING")
+                .bind(&artifact.sha256).bind(&job_id).bind(&artifact.path)
+                .bind(i64::try_from(artifact.size).map_err(ApiError::internal)?)
+                .bind(&artifact.package_name).bind(&artifact.package_version).bind(&artifact.architecture)
+                .bind(serde_json::to_string(&build_result.provenance).map_err(ApiError::internal)?)
+                .bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        }
+        if let Some(revision_id) = row.get::<Option<String>, _>("revision_id") {
+            sqlx::query("UPDATE revisions SET state = 'built' WHERE id = ?")
+                .bind(revision_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+        advance_build_batch = true;
+    } else if row.get::<String, _>("kind") == "build"
+        && status == "failed"
+        && let Some(batch_id) = row.get::<Option<String>, _>("batch_id")
+    {
+        sqlx::query("UPDATE release_batches SET state = 'build_failed', failure_reason = ?, updated_at = ? WHERE id = ?")
+            .bind(failure).bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
     transaction.commit().await.map_err(ApiError::internal)?;
+    if advance_build_batch {
+        crate::packages::schedule_ready_builds(&state.database).await?;
+    }
     Ok(())
 }
 
