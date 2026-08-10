@@ -54,6 +54,7 @@ export type Job = {
   revision_sha256: string | null;
   worker_name: string | null;
   attempt_count: number;
+  has_evidence: boolean;
   next_attempt_at: string | null;
   created_at: string;
   updated_at: string;
@@ -289,6 +290,7 @@ export const api = {
     body: JSON.stringify(worker)
   }),
   jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
+  jobEvidence: (id: string) => request<{ job_id: string; kind: string; sha256: string; document: unknown; created_at: string }>(`/api/v1/jobs/${encodeURIComponent(id)}/evidence`),
   searchAur: (query: string) =>
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),

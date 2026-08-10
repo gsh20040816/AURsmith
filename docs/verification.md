@@ -261,3 +261,11 @@
 - 实际构建 Agent Runner 镜像，并以只读、零 capability 容器分别启动 Codex 与 Claude Code adapter；两者 `/healthz` 均返回 200，且模拟凭据网关 TCP 可达。第一次用 `nc` 模拟网关没有得到 JSON，脚本又缺少最终失败判定，因此不计为通过；改用明确 HTTP 监听和失败关闭后分别复验成功。排查期间一个前台测试容器未随非 TTY 中断退出，随后按精确 ID 删除；测试镜像及独占层也已删除，可由 Dockerfile 重建。
 - 最终执行 `bash scripts/test-all.sh`：全仓库 104 个 Rust 测试、前端类型检查、7 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。此前直接运行 `docker compose config` 未提供 Stack 强制要求的 Controller 公钥和传输映射，因此在变量插值阶段按设计拒绝；该次不计为配置验证，最终结论采用统一脚本注入测试值后的通过结果。
 - 边界：Doctor 证明配置、CLI、内部凭据网关、AUR 和 source proxy 路径可用，不证明 provider API key 有效，也不产生任何审计结论。真实 provider 审计和 Fetch VM 内下载仍保留为部署验收的未验证范围。
+
+## 2026-08-10：有界 Job 日志与证据详情
+
+- Builder 成功目录中的 QEMU stdout/stderr、fetch、build 和 namcap 日志，以及失败诊断目录中的 QEMU、Guest 错误和 makepkg 日志，会形成路径白名单内的结构化证据。普通文件保存完整大小、SHA-256、截断标记、最多前 128 KiB 的 Base64 和可用的 UTF-8；超过 64 MiB 时不重新读取，并明确写入省略原因。
+- Controller 拒绝未知或重复路径、无效摘要、超过 1 MiB 的日志响应、Base64/UTF-8 不一致和完整小日志摘要不匹配。成功和失败 Job 都写入 `job_evidence`；ReleaseEvidence 额外收集本批次实际 Profile 的 Controller 签名 Envelope 和包清单。
+- 新增管理员 Job evidence API，构建页可以查看成功或失败的日志/provenance；Release 页面从证据摘要继续展开完整结构化文档。日志内容仍按不可信文本展示，不作为 HTML 执行。
+- 单元测试覆盖日志摘要、128 KiB 截断、路径逃逸和完整内容摘要校验；前端 8 个用例中分别覆盖失败 Job 日志查看和 Release 证据展开。最终执行 `bash scripts/test-all.sh`：全仓库 106 个 Rust 测试、前端类型检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
+- 边界：当前归档保存有界日志内容和完整日志摘要，不保存超过上限的全部字节；Profile qcow2、完整 source tree 和 License bundle 尚未进入 Archiver，B03/R03 因此仍为部分验证。

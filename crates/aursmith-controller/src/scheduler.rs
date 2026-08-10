@@ -4,6 +4,7 @@ use aursmith_protocol::{
     ArtifactRecord, DependencyInput, DependencySource, GuestResult, JobKind, JobSpec,
     ReleaseAuthorization, ReleaseEvidence, ReleaseEvidenceRecord, ResourceLimits, SignedEnvelope,
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1036,6 +1037,29 @@ async fn build_release_evidence(
             }),
         )?;
     }
+    let profiles = sqlx::query("SELECT DISTINCT build_profiles.id, build_profiles.name, build_profiles.architecture, build_profiles.runner, build_profiles.manifest_sha256, build_profiles.state, build_profiles.package_manifest_json, build_profiles.envelope_json, build_profiles.created_at, build_profiles.activated_at, build_profiles.last_verified_at FROM build_profiles JOIN jobs ON jobs.profile_sha256 = build_profiles.manifest_sha256 WHERE jobs.batch_id = ? ORDER BY build_profiles.manifest_sha256")
+        .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
+    for row in profiles {
+        let identity: String = row.get("manifest_sha256");
+        push_evidence(
+            &mut records,
+            "build_profile",
+            &identity,
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "architecture": row.get::<String, _>("architecture"),
+                "runner": row.get::<String, _>("runner"),
+                "manifest_sha256": &identity,
+                "state": row.get::<String, _>("state"),
+                "package_manifest": serde_json::from_str::<serde_json::Value>(row.get("package_manifest_json")).map_err(ApiError::internal)?,
+                "profile_envelope": row.get::<Option<String>, _>("envelope_json").map(|value| serde_json::from_str::<serde_json::Value>(&value)).transpose().map_err(ApiError::internal)?,
+                "created_at": row.get::<String, _>("created_at"),
+                "activated_at": row.get::<Option<String>, _>("activated_at"),
+                "last_verified_at": row.get::<Option<String>, _>("last_verified_at")
+            }),
+        )?;
+    }
     let jobs = sqlx::query("SELECT job_evidence.job_id, job_evidence.kind, job_evidence.document_json, job_evidence.sha256, jobs.profile_sha256 FROM job_evidence JOIN jobs ON jobs.id = job_evidence.job_id WHERE jobs.batch_id = ? ORDER BY jobs.created_at")
         .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
     for row in jobs {
@@ -1666,6 +1690,11 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     } else {
         None
     };
+    let evidence_logs = if matches!(status, "succeeded" | "failed") {
+        validate_evidence_logs(&reply.data["evidence_logs"])?
+    } else {
+        json!([])
+    };
     let mut advance_build_batch = false;
     let retry_scheduled =
         status == "failed" && generation < 2 && failure.is_some_and(infrastructure_failure);
@@ -1689,9 +1718,17 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         .await
         .map_err(ApiError::internal)?;
     if status == "succeeded"
-        && let Some(guest_result) = guest_result.as_ref()
+        || evidence_logs
+            .as_array()
+            .is_some_and(|logs| !logs.is_empty())
     {
-        let document = serde_json::to_value(guest_result).map_err(ApiError::internal)?;
+        let document = json!({
+            "schema_version": 1,
+            "status": status,
+            "failure_code": failure,
+            "guest_result": guest_result,
+            "logs": evidence_logs
+        });
         let bytes = serde_json::to_vec(&document).map_err(ApiError::internal)?;
         sqlx::query("INSERT OR REPLACE INTO job_evidence(job_id, kind, document_json, sha256, created_at) VALUES (?, ?, ?, ?, ?)")
             .bind(&job_id).bind(row.get::<String, _>("kind")).bind(document.to_string())
@@ -1850,6 +1887,103 @@ fn infrastructure_failure(code: &str) -> bool {
             | "RESULT_UNAVAILABLE"
             | "WORKER_UNREACHABLE"
     )
+}
+
+fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    const ALLOWED_PATHS: [&str; 6] = [
+        "qemu.stdout.log",
+        "qemu.stderr.log",
+        "output/fetch.log",
+        "output/build.log",
+        "output/namcap.log",
+        "output/guest-error.json",
+    ];
+    let logs = value
+        .as_array()
+        .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志证据不是数组"))?;
+    if logs.len() > ALLOWED_PATHS.len()
+        || serde_json::to_vec(value).map_err(ApiError::internal)?.len() > 1024 * 1024
+    {
+        return Err(ApiError::conflict(
+            "INVALID_EVIDENCE_LOGS",
+            "Worker 日志证据超过数量或 1 MiB 上限",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for log in logs {
+        let path = log["path"]
+            .as_str()
+            .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少路径"))?;
+        if !ALLOWED_PATHS.contains(&path) || !seen.insert(path) {
+            return Err(ApiError::conflict(
+                "INVALID_EVIDENCE_LOGS",
+                "Worker 日志路径不允许或重复",
+            ));
+        }
+        let size = log["size"]
+            .as_u64()
+            .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志大小无效"))?;
+        if size > 64 * 1024 * 1024 {
+            if !log["sha256"].is_null()
+                || log["omitted_reason"].as_str().is_none()
+                || log["truncated"].as_bool() != Some(true)
+            {
+                return Err(ApiError::conflict(
+                    "INVALID_EVIDENCE_LOGS",
+                    "超大日志必须明确省略原因",
+                ));
+            }
+            continue;
+        }
+        let sha256 = log["sha256"]
+            .as_str()
+            .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少摘要"))?;
+        if sha256.len() != 64
+            || !sha256
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(ApiError::conflict(
+                "INVALID_EVIDENCE_LOGS",
+                "Worker 日志摘要无效",
+            ));
+        }
+        let content = log["content_base64"].as_str().ok_or_else(|| {
+            ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少有界内容")
+        })?;
+        let decoded = BASE64.decode(content).map_err(|_| {
+            ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志内容不是 Base64")
+        })?;
+        let truncated = log["truncated"].as_bool().ok_or_else(|| {
+            ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少截断标记")
+        })?;
+        let content_shape_valid = if size <= 128 * 1024 {
+            decoded.len() as u64 == size && !truncated
+        } else {
+            decoded.len() == 128 * 1024 && truncated
+        };
+        if !content_shape_valid {
+            return Err(ApiError::conflict(
+                "INVALID_EVIDENCE_LOGS",
+                "Worker 日志内容长度与截断标记不一致",
+            ));
+        }
+        if let Some(text) = log["content_utf8"].as_str()
+            && text.as_bytes() != decoded
+        {
+            return Err(ApiError::conflict(
+                "INVALID_EVIDENCE_LOGS",
+                "Worker 日志文本与 Base64 内容不一致",
+            ));
+        }
+        if size <= 128 * 1024 && hex::encode(Sha256::digest(&decoded)) != sha256 {
+            return Err(ApiError::conflict(
+                "INVALID_EVIDENCE_LOGS",
+                "完整 Worker 日志内容与摘要不一致",
+            ));
+        }
+    }
+    Ok(value.clone())
 }
 
 async fn handle_uncertain_timeout(
@@ -2265,5 +2399,21 @@ mod release_tests {
             resolved_rebuild_packages(&observations, &current, &changes),
             BTreeSet::from(["alpha".into()])
         );
+    }
+
+    #[test]
+    fn evidence_logs_require_allowed_paths_and_matching_complete_digest() {
+        let content = b"build output";
+        let valid = json!([{
+            "path": "output/build.log",
+            "size": content.len(),
+            "sha256": hex::encode(Sha256::digest(content)),
+            "truncated": false,
+            "content_base64": BASE64.encode(content)
+        }]);
+        assert!(validate_evidence_logs(&valid).is_ok());
+        let mut invalid = valid;
+        invalid[0]["path"] = json!("../controller-secret");
+        assert!(validate_evidence_logs(&invalid).is_err());
     }
 }

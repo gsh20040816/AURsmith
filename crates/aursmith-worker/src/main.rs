@@ -2343,7 +2343,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
         Ok(Some(row)) => {
             let attempt_id = row.get::<String, _>("attempt_id");
             let status = row.get::<String, _>("status");
-            let guest_result_json = if status == "succeeded" {
+            let (guest_result_json, evidence_logs) = if status == "succeeded" {
                 let Some(builder) = &worker.builder else {
                     return WorkerResponse::error(
                         "RESULT_UNAVAILABLE",
@@ -2351,13 +2351,31 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     );
                 };
                 match builder.completed_result_json(&attempt_id) {
-                    Ok(result) => Some(result),
+                    Ok(result) => match builder.attempt_logs(&attempt_id, true) {
+                        Ok(logs) => (Some(result), logs),
+                        Err(error) => {
+                            return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
+                        }
+                    },
+                    Err(error) => {
+                        return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
+                    }
+                }
+            } else if status == "failed" {
+                let Some(builder) = &worker.builder else {
+                    return WorkerResponse::error(
+                        "RESULT_UNAVAILABLE",
+                        "该 Worker 角色没有 Builder 诊断目录",
+                    );
+                };
+                match builder.attempt_logs(&attempt_id, false) {
+                    Ok(logs) => (None, logs),
                     Err(error) => {
                         return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
                     }
                 }
             } else {
-                None
+                (None, Vec::new())
             };
             WorkerResponse::ok(
                 "JOB_STATUS",
@@ -2370,6 +2388,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     "result_sha256": row.get::<Option<String>, _>("result_sha256"),
                     "failure_code": row.get::<Option<String>, _>("failure_code"),
                     "guest_result_json": guest_result_json,
+                    "evidence_logs": evidence_logs,
                 }),
             )
         }

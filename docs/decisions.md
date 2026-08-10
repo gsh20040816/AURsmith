@@ -48,6 +48,7 @@
 - ADR-044：Release 证据索引直接进入 Controller 签名的 ReleaseAuthorization，不新建独立证据服务或对象存储。Signer 把原始授权纳入 GPG 签名的 Release Manifest，Publisher 逐字节复验，Archiver 因而自动保存相同证据。内嵌内容限制为 10000 条和 16 MiB，适合结构化审计与 provenance；大型源码、License bundle 和原始日志以后使用单独的受限文件传输，未完成前 B03/R03 不能标记为全部完成。
 - ADR-045：Git VCS 历史重写以真实 commit 祖先关系判定，不能用版本字符串倒退或“commit 只要变化就可疑”的近似规则。网络检查只在 Publisher 上运行，固定已验证公共 IP 并禁用危险 Git 协议和重定向。重写审批绑定 previous/current commit 对，批准一次不会形成永久信任。
 - ADR-046：Agent Doctor 禁止通过真实审计请求探测，以免健康检查产生模型费用或把空 fixture 当安全结论。Runner 只检查 CLI、非秘密配置和凭据网关 TCP；Publisher Doctor 负责 AUR 与 source proxy 的实际网络路径。Doctor 失败必须展示具体子检查，不静默降级成“已配置”。
+- ADR-047：第一版日志证据直接进入现有 `job_evidence` 与签名 ReleaseAuthorization，不为日志再引入对象存储。每文件内嵌内容限制 128 KiB、控制响应限制 1 MiB、ReleaseEvidence 限制 16 MiB，同时保存完整大小和摘要；超大日志明确省略而不是截断后冒充完整。失败 Job 证据保留在控制面，成功 Job 证据随 Release 归档。
 
 ## 已拒绝
 

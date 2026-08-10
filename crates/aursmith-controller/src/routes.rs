@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
+        .route("/api/v1/jobs/{id}/evidence", get(job_evidence))
         .route(
             "/api/v1/profiles",
             get(crate::profiles::list).post(crate::profiles::authorize),
@@ -1270,7 +1271,7 @@ async fn list_jobs(
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, workers.name AS worker_name, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count FROM jobs LEFT JOIN workers ON workers.id = jobs.worker_id ORDER BY jobs.created_at DESC LIMIT 200",
+        "SELECT jobs.id, jobs.kind, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, workers.name AS worker_name, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count, EXISTS(SELECT 1 FROM job_evidence WHERE job_evidence.job_id = jobs.id) AS has_evidence FROM jobs LEFT JOIN workers ON workers.id = jobs.worker_id ORDER BY jobs.created_at DESC LIMIT 200",
     )
     .fetch_all(&state.database)
     .await
@@ -1288,6 +1289,7 @@ async fn list_jobs(
                 "revision_sha256": row.get::<Option<String>, _>("revision_sha256"),
                 "worker_name": row.get::<Option<String>, _>("worker_name"),
                 "attempt_count": row.get::<i64, _>("attempt_count"),
+                "has_evidence": row.get::<bool, _>("has_evidence"),
                 "next_attempt_at": row.get::<Option<String>, _>("next_attempt_at"),
                 "created_at": row.get::<String, _>("created_at"),
                 "updated_at": row.get::<String, _>("updated_at"),
@@ -1295,6 +1297,30 @@ async fn list_jobs(
         })
         .collect();
     Ok(Json(json!({"items": items})))
+}
+
+async fn job_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("INVALID_JOB_ID", "Job ID 无效"))?;
+    let row = sqlx::query(
+        "SELECT kind, document_json, sha256, created_at FROM job_evidence WHERE job_id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("Job 尚无可用证据"))?;
+    Ok(Json(json!({
+        "job_id": id,
+        "kind": row.get::<String, _>("kind"),
+        "sha256": row.get::<String, _>("sha256"),
+        "document": serde_json::from_str::<Value>(row.get("document_json")).map_err(ApiError::internal)?,
+        "created_at": row.get::<String, _>("created_at")
+    })))
 }
 
 fn role_name(role: WorkerRole) -> &'static str {

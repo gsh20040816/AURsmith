@@ -62,6 +62,71 @@ impl BuilderRuntime {
         .context("COMPLETED_RESULT_MISSING")
     }
 
+    pub fn attempt_logs(
+        &self,
+        attempt_id: &str,
+        succeeded: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        const MAX_CONTENT_PER_FILE: u64 = 128 * 1024;
+        const MAX_HASH_FILE_SIZE: u64 = 64 * 1024 * 1024;
+        if uuid::Uuid::parse_str(attempt_id).is_err() {
+            bail!("INVALID_ATTEMPT_ID");
+        }
+        let root = self
+            .jobs_dir
+            .join(if succeeded { "completed" } else { "failed" })
+            .join(attempt_id);
+        let mut logs = Vec::new();
+        let candidates: &[(&str, &str)] = if succeeded {
+            &[
+                ("qemu.stdout.log", "qemu.stdout.log"),
+                ("qemu.stderr.log", "qemu.stderr.log"),
+                ("output/fetch.log", "output/fetch.log"),
+                ("output/build.log", "output/build.log"),
+                ("output/namcap.log", "output/namcap.log"),
+            ]
+        } else {
+            &[
+                ("qemu.stdout.log", "qemu.stdout.log"),
+                ("qemu.stderr.log", "qemu.stderr.log"),
+                ("fetch.log", "output/fetch.log"),
+                ("build.log", "output/build.log"),
+                ("guest-error.json", "output/guest-error.json"),
+            ]
+        };
+        for (source_path, evidence_path) in candidates {
+            let file = root.join(source_path);
+            let Ok(metadata) = fs::symlink_metadata(&file) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                bail!("ATTEMPT_LOG_NOT_REGULAR:{evidence_path}");
+            }
+            if metadata.len() > MAX_HASH_FILE_SIZE {
+                logs.push(serde_json::json!({
+                    "path": evidence_path,
+                    "size": metadata.len(),
+                    "sha256": null,
+                    "truncated": true,
+                    "omitted_reason": "日志超过 64 MiB，未重新读取"
+                }));
+                continue;
+            }
+            let bytes = fs::read(&file)?;
+            let content_length = bytes.len().min(MAX_CONTENT_PER_FILE as usize);
+            let bounded_content = &bytes[..content_length];
+            logs.push(serde_json::json!({
+                "path": evidence_path,
+                "size": metadata.len(),
+                "sha256": hex::encode(Sha256::digest(&bytes)),
+                "truncated": metadata.len() > MAX_CONTENT_PER_FILE,
+                "content_base64": STANDARD.encode(bounded_content),
+                "content_utf8": std::str::from_utf8(bounded_content).ok()
+            }));
+        }
+        Ok(logs)
+    }
+
     pub fn materialize_inline_inputs(&self, spec: &JobSpec) -> anyhow::Result<()> {
         const MAX_FILE_COUNT: usize = 256;
         const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024;
@@ -1135,5 +1200,39 @@ mod tests {
         ));
         assert!(network_failure_in_log(b"connect: Network is unreachable"));
         assert!(!network_failure_in_log(b"compiler error: missing header"));
+    }
+
+    #[test]
+    fn completed_logs_are_hashed_and_content_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let completed = root.path().join("completed").join(&attempt);
+        fs::create_dir_all(completed.join("output")).unwrap();
+        fs::write(completed.join("qemu.stdout.log"), b"qemu log").unwrap();
+        fs::write(
+            completed.join("output/build.log"),
+            vec![b'x'; 128 * 1024 + 1],
+        )
+        .unwrap();
+        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().into(), None);
+        let logs = runtime.attempt_logs(&attempt, true).unwrap();
+        let qemu = logs
+            .iter()
+            .find(|log| log["path"] == "qemu.stdout.log")
+            .unwrap();
+        assert_eq!(qemu["sha256"], hex::encode(Sha256::digest(b"qemu log")));
+        assert_eq!(qemu["truncated"], false);
+        let build = logs
+            .iter()
+            .find(|log| log["path"] == "output/build.log")
+            .unwrap();
+        assert_eq!(build["truncated"], true);
+        assert_eq!(
+            STANDARD
+                .decode(build["content_base64"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            128 * 1024
+        );
     }
 }

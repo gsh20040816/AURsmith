@@ -101,6 +101,8 @@ describe("AURsmith 控制台", () => {
     expect(await screen.findByText("1 条证据记录")).toBeInTheDocument();
     expect(screen.getByText("job_result")).toBeInTheDocument();
     expect(screen.getByText("build-job")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "build-job" }));
+    expect(await screen.findByText(/"check_enabled": true/)).toBeInTheDocument();
   });
 
   it("软件包详情可以审批 Git VCS 历史重写", async () => {
@@ -129,5 +131,22 @@ describe("AURsmith 控制台", () => {
     fireEvent.click(screen.getByRole("button", { name: "批准本次重写" }));
     await waitFor(() => expect(submitted).toEqual({ approve: true, rationale: "确认上游公告可信" }));
     await waitFor(() => expect(screen.queryByText("Git VCS 历史重写待确认")).not.toBeInTheDocument());
+  });
+
+  it("构建页可以查看失败任务的有界日志", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/setup/status") ? { initialized: true }
+        : url.endsWith("/auth/me") ? { id: "admin-id", username: "admin" }
+          : url.endsWith("/requirements") ? { items: [] }
+            : url.endsWith("/jobs") ? { items: [{ id: "11111111-1111-4111-8111-111111111111", kind: "build", required_role: "builder", status: "failed", priority: 40, failure_code: "GUEST_BUILD_FAILED", revision_sha256: "a".repeat(64), worker_name: "compute-01", attempt_count: 1, has_evidence: true, next_attempt_at: null, created_at: "2026-08-10T00:00:00Z", updated_at: "2026-08-10T00:01:00Z" }] }
+              : url.includes("/jobs/11111111-1111-4111-8111-111111111111/evidence") ? { job_id: "11111111-1111-4111-8111-111111111111", kind: "build", sha256: "b".repeat(64), created_at: "2026-08-10T00:01:00Z", document: { status: "failed", logs: [{ path: "output/build.log", content_utf8: "compiler error" }] } }
+                : { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /构建/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "查看日志与证据" }));
+    expect(await screen.findByText(/compiler error/)).toBeInTheDocument();
   });
 });
