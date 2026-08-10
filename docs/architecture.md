@@ -15,6 +15,8 @@
 
 Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docker Socket、libvirt Socket、TUN 或 privileged 权限。受限联网的 Fetch Guest 通过 Publisher 代理获取源码；全新的 Build Guest 不带网卡，只接收不可变且已经审计的输入。
 
+第一版 Publisher 提供独立的无特权 Squid source-proxy 容器。QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。它不与 Publisher Worker 或仓库共享可写卷，也不承担 pacoloco 的性能缓存职责。
+
 控制流使用固定 host key 和 forced command 的 OpenSSH。大文件使用 rsync 在 Builder 与 Publisher、Publisher 与 Archiver 之间直接传输，并由短期有效的 Controller 签名 `TransferCapability` 授权。
 
 每个 Worker 首次启动时在 SQLite Journal 中生成持久化实例 UUID，Controller 注册前必须通过固定 host key 探测并采用该 UUID；名称、角色、协议、Publisher writer epoch 或后续心跳 UUID 不一致时标记为 incompatible。TransferCapability 绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限，Publisher 必须核对本地配置的 writer epoch。Builder 把清单中逐个复验的文件复制到只读 export 目录；SSH forced command 只接受固定 rsync sender 参数和 `/jobs/transfers/<capability UUID>`。Publisher 通过静态 UUID→SSH 端点映射和独立只读拉取密钥直接 rsync，落入 partial 目录，全部摘要复验后才 rename 为 landing。Controller 不转发包字节。

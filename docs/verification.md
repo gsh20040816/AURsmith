@@ -137,3 +137,10 @@
 - `artifact-inspections.json` 被复制进 Signer 输出，其大小和报告数量由断网 Signer 复验，文件摘要进入 GPG 签名的 Release Manifest。Publisher 激活或回滚 Release 时重新核对该摘要，归档的完整 Release 文件清单自然包含检查报告。
 - 执行 `bash scripts/test-all.sh` 后，全仓库 86 个 Rust 测试、前端类型检查、Vitest、生产构建和 Compose 安全策略检查全部通过；修改后的 Worker 与 Signer 镜像分别实际构建为 `aursmith-worker:test` 和 `aursmith-signer:test`。
 - 未覆盖：当前检查尚未解析 ELF `DT_NEEDED`、文件 capabilities 或实际执行 namcap；这些仍是 R01/B03 后续实现项。也尚未用含上述风险内容的真实 pacman 包完成 Publisher→Signer→Archiver 端到端演练。
+
+## 2026-08-10：Fetch source-proxy 容器
+
+- 新增基于 Arch 官方 squid 包的最小镜像，进程使用包内 `proxy` 用户运行；Compose 固定只读根文件系统、清空 capabilities、启用 no-new-privileges，并只给 PID、日志和临时文件分配 tmpfs。
+- 第一次真实镜像构建发现预想的 `squid` 用户不存在，依据镜像实际创建的 UID/GID 15 `proxy` 用户修正；第二次构建成功。
+- 使用与 Compose 相同的只读和降权参数启动真实容器，通过代理访问 `https://archlinux.org/` 返回 HTTP 200，访问 `127.0.0.1:8080` 返回 HTTP 403；测试容器随后删除。
+- 边界：第一版代理执行全局公共网络策略，尚未由 Controller 按 Revision 自动生成精确 source 域名 allowlist，也没有引入 pacoloco 缓存统计。
