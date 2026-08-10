@@ -21,10 +21,10 @@
 | P08 | 已验证 | 新批次失败不改变当前 Release；发布故障与回滚实际验证 | 无 |
 | A01 | 已验证 | 包装层扫描、Fetch 后 AuditBundle、三 Runner 调度 | 真实外部模型调用未验证 |
 | A02 | 已验证 | 3/2/≤1、单次重试和高成本批准规则自动测试 | 随机复查率保持默认 0%，尚无 UI 配置 |
-| A03 | 部分验证 | Codex/Claude Code 固定 argv、凭据网关、Compose secret、预算 | 缺真实 provider key E2E 和 Runner Doctor 探测 |
+| A03 | 部分验证 | Codex/Claude Code 固定 argv、凭据网关、Compose secret、预算；四 Runner 无付费 Doctor 已实现并做容器冒烟 | 缺真实 provider key 审计 E2E，发布前必须保留为未验证范围 |
 | A04 | 已验证 | 覆盖范围、选读文件和“不证明全部源码安全”写入报告 | 无 |
 | B01 | 已验证 | 非 privileged Builder 容器内真实 KVM Fetch→Build | 无 |
-| B02 | 部分验证 | Build VM `-nic none` 实际验证；source proxy 外部冒烟 | Fetch Guest 内真实 source/官方依赖下载尚未在同一 KVM 用例验证 |
+| B02 | 部分验证 | Build VM `-nic none` 实际验证；Publisher Doctor 经 source proxy 转发 Arch HTTPS 冒烟 | Fetch Guest 内真实 source/官方依赖下载尚未在同一 KVM 用例验证 |
 | B03 | 部分验证 | JobSpec、Profile、source/dependency/artifact 摘要、完整 GuestResult、审计和 Agent 报告已进入签名 ReleaseEvidence | 完整 build/fetch/QEMU 日志字节及 Profile/Source/License 文件包尚未随 Release 归档 |
 | B04 | 部分验证 | 统计、迟滞、建议、Profile 授权/激活/回滚代码与测试 | 尚未跑“真实统计→重建 Profile→KVM fixture→命中”的完整闭环；pacoloco 命中率未接入 |
 | B05 | 已验证 | HTTPS 镜像进入 Profile 摘要；清华镜像实际构建 Profile | Fetch Guest 命中该镜像下载真实依赖仍属于 B02 缺口 |
@@ -39,7 +39,7 @@
 | R04 | 已验证 | 服务端签名 Release 回滚和真实客户端 `pacman -U` 降级 | 自动客户端降级明确延期 |
 | U01 | 部分验证 | 搜索、包、审计、构建、Worker、Profile、Release、归档、告警、设置页面；Release 可查看签名证据摘要 | 构建阶段原始日志和证据文档详情仍受 B03/R03 缺口阻塞 |
 | U02 | 部分验证 | 单管理员认证、一次性初始化、GPG/pacman 引导和稳定 URL | 内部 CA 证书导出/轮换仍主要依赖部署配置 |
-| U03 | 已验证 | Worker/磁盘/时钟、Doctor、告警、Webhook/ntfy、备份与库存页面 | 外部 Webhook/ntfy 未使用真实服务冒烟 |
+| U03 | 已验证 | Worker/磁盘/时钟、Agent/Fetch Doctor、告警、Webhook/ntfy、备份与库存页面 | 外部 Webhook/ntfy 未使用真实服务冒烟 |
 | O01 | 已验证 | 包装 makepkg、repo-add、pacman、QEMU、OpenSSH、rsync、GnuPG、Caddy | 无 |
 | O02 | 部分验证 | 全过程直接在 main 使用独立英文提交；Release 记录源码 commit | 第一版未完成，因此尚未创建正式版本号和签名 Git tag |
 
@@ -49,6 +49,4 @@
 
 1. B03/R03：现有签名证据已包含 Revision、AuditBundle、Agent 报告、构建 provenance 和日志摘要；继续通过受限传输加入可取得的原始日志、Profile、Source Manifest 文件及 License bundle。暂时不能取得的内容必须列为缺失，不能伪装已归档。
 2. U01：在现有 Release 证据摘要基础上，为构建 Job 提供原始日志读取，并允许展开证据文档；第一版不要求复杂日志搜索。
-3. A03/B02：提供可在没有真实付费调用时执行的 Agent/Fetch Doctor；真实 provider 与真实 source E2E 仍需部署者凭据和网络，若发布前无法执行必须保留为未验证范围。
-
 B04 的性能闭环、跨设备恢复演练和外部通知冒烟很重要，但第一版可以在代码主路径、风险边界和手工操作说明完整时作为部署验收项，不继续扩展为高可用或复杂观测系统。

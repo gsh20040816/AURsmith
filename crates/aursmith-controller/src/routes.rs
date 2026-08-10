@@ -409,7 +409,7 @@ async fn doctor_status(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let workers = sqlx::query("SELECT id, name, role, state, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY role, name")
+    let workers = sqlx::query("SELECT id, name, role, state, endpoint, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY role, name")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let mut checks = Vec::new();
     for role in ["builder", "publisher", "archiver"] {
@@ -446,12 +446,96 @@ async fn doctor_status(
     .await
     .map_err(ApiError::internal)?;
     checks.push(json!({"id": "repository-gpg", "ok": fingerprint_ready == 1, "message": "仓库 GPG 指纹已由 Publisher 固定"}));
-    checks.push(json!({"id": "agent-low", "ok": state.config.low_agent_endpoints.len() == 3, "message": format!("低成本 Agent Runner：{}", state.config.low_agent_endpoints.len())}));
-    checks.push(json!({"id": "agent-high", "ok": !state.config.high_agent_endpoint.is_empty(), "message": "高成本 Agent Runner 已配置"}));
+    let agent_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(ApiError::internal)?;
+    for (index, endpoint) in state.config.low_agent_endpoints.iter().enumerate() {
+        checks.push(
+            agent_doctor_check(&agent_client, &format!("agent-low-{}", index + 1), endpoint).await,
+        );
+    }
+    if state.config.low_agent_endpoints.len() != 3 {
+        checks.push(json!({"id": "agent-low-count", "ok": false, "message": format!("需要 3 个低成本 Agent Runner，当前配置 {} 个", state.config.low_agent_endpoints.len())}));
+    }
+    if state.config.high_agent_endpoint.is_empty() {
+        checks.push(
+            json!({"id": "agent-high", "ok": false, "message": "高成本 Agent Runner 未配置"}),
+        );
+    } else {
+        checks.push(
+            agent_doctor_check(
+                &agent_client,
+                "agent-high",
+                &state.config.high_agent_endpoint,
+            )
+            .await,
+        );
+    }
+    let publisher_endpoint = workers
+        .iter()
+        .find(|row| {
+            row.get::<String, _>("role") == "publisher" && row.get::<String, _>("state") == "online"
+        })
+        .map(|row| row.get::<String, _>("endpoint"));
+    if let Some(endpoint) = publisher_endpoint {
+        match crate::transport::publisher_doctor(&state.config, &endpoint).await {
+            Ok(reply) if reply.ok => {
+                for name in ["aur", "source_proxy"] {
+                    let check = &reply.data["checks"][name];
+                    checks.push(json!({
+                        "id": format!("publisher-{name}"),
+                        "ok": check["ok"].as_bool().unwrap_or(false),
+                        "message": check["message"].as_str().unwrap_or("Publisher Doctor 返回字段无效")
+                    }));
+                }
+            }
+            Ok(reply) => checks
+                .push(json!({"id": "publisher-upstream", "ok": false, "message": reply.message})),
+            Err(error) => checks.push(
+                json!({"id": "publisher-upstream", "ok": false, "message": error.to_string()}),
+            ),
+        }
+    }
     let ready = checks.iter().all(|check| check["ok"] == true);
     Ok(Json(
         json!({"ready": ready, "checked_at": Utc::now(), "checks": checks}),
     ))
+}
+
+async fn agent_doctor_check(client: &reqwest::Client, id: &str, endpoint: &str) -> Value {
+    let result = async {
+        let mut url = url::Url::parse(endpoint)?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            anyhow::bail!("Runner endpoint 不是 HTTP(S) URL");
+        }
+        url.set_path("/healthz");
+        url.set_query(None);
+        url.set_fragment(None);
+        let response = client.get(url).send().await?.error_for_status()?;
+        let payload: Value = response.json().await?;
+        if payload["ok"] != true || payload["credential_gateway_reachable"] != true {
+            anyhow::bail!("Runner 健康响应不完整");
+        }
+        Ok::<Value, anyhow::Error>(payload)
+    }
+    .await;
+    match result {
+        Ok(payload) => json!({
+            "id": id,
+            "ok": true,
+            "message": format!("{} / {}：CLI 与凭据网关可用", payload["adapter"].as_str().unwrap_or("unknown"), payload["model"].as_str().unwrap_or("unknown"))
+        }),
+        Err(error) => {
+            json!({"id": id, "ok": false, "message": format!("Agent Runner 探测失败：{error}")})
+        }
+    }
 }
 
 async fn metrics_status(
@@ -1451,5 +1535,34 @@ mod tests {
         assert!(before["jobs_updated_at"].is_null());
         assert!(after["jobs_updated_at"].is_string());
         assert_eq!(after["open_alerts"], 1);
+    }
+
+    #[tokio::test]
+    async fn agent_doctor_probes_cli_and_credential_gateway_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/healthz",
+                    get(|| async {
+                        Json(json!({
+                            "ok": true,
+                            "adapter": "codex",
+                            "model": "fixture",
+                            "credential_gateway_reachable": true
+                        }))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let check = agent_doctor_check(&client, "agent-low-1", &format!("http://{address}")).await;
+        assert_eq!(check["ok"], true);
+        assert!(check["message"].as_str().unwrap().contains("codex"));
+        server.abort();
     }
 }

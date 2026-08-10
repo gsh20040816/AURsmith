@@ -68,6 +68,8 @@ Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自�
 
 Publisher Stack 自带最小 `source-proxy` 服务。跨设备部署时设置 `AURSMITH_SOURCE_PROXY_BIND=<Publisher 管理网 IP>:3128`，并在宿主防火墙上只允许 Builder 地址访问；默认 `127.0.0.1:3128` 只适合角色同机。代理只允许 80/443，拒绝 loopback、私网、link-local、运营商 NAT、文档网段、组播和其他保留地址，不提供磁盘缓存。
 
+Publisher Worker 在 Compose 内固定使用 `AURSMITH_SOURCE_PROXY_URL=http://source-proxy:3128` 执行 Doctor。该地址只用于 Publisher 自检，不替代 Builder 的 `AURSMITH_FETCH_PROXY=<Publisher 管理网 IP>:3128`；跨设备时仍需显式配置 Builder 看到的地址并由宿主防火墙限制来源。
+
 Builder Stack 必须设置 `KVM_GID` 和 `AURSMITH_FETCH_PROXY`，后者填写上述 Publisher 代理的固定 `IP:端口`。不能填写域名、URL 或一组候选地址；这样 QEMU 参数不会在运行时进行不受控解析。容器只映射 `/dev/kvm`，不需要 privileged、TUN、Docker Socket 或 libvirt Socket。
 
 每个可用 Profile 放在 `/profiles/<profile_sha256>/`，包含：

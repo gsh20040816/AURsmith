@@ -176,6 +176,10 @@ pub async fn official_info(
     invoke(config, endpoint, "official-info", Some(body)).await
 }
 
+pub async fn publisher_doctor(config: &Config, endpoint: &str) -> Result<WorkerReply, ApiError> {
+    invoke(config, endpoint, "publisher-doctor", None).await
+}
+
 async fn invoke(
     config: &Config,
     endpoint: &str,

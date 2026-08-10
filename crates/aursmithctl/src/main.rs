@@ -98,6 +98,7 @@ enum WorkerCommand {
     OfficialInfo {
         names: Vec<String>,
     },
+    PublisherDoctor,
     AurSnapshot {
         package_base: String,
         #[arg(long)]
@@ -159,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
                 WorkerCommand::OfficialInfo { names } => {
                     json!({"command": "official_info", "names": names})
                 }
+                WorkerCommand::PublisherDoctor => json!({"command": "publisher_doctor"}),
                 WorkerCommand::AurSnapshot {
                     package_base,
                     previous_vcs_commit,
@@ -494,6 +496,7 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         ["aur-info"] => read_limited_json_command("aur_info").await?,
         ["aur-providers"] => read_limited_json_command("aur_providers").await?,
         ["official-info"] => read_limited_json_command("official_info").await?,
+        ["publisher-doctor"] => json!({"command": "publisher_doctor"}),
         ["aur-snapshot"] => read_limited_json_command("aur_snapshot").await?,
         ["authorize-export"]
         | ["authorize-import"]

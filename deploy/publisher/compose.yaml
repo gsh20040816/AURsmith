@@ -17,6 +17,7 @@ services:
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
       AURSMITH_AUR_BASE_URL: ${AURSMITH_AUR_BASE_URL:-https://aur.archlinux.org/}
+      AURSMITH_SOURCE_PROXY_URL: http://source-proxy:3128
       AURSMITH_TRANSFER_ENDPOINTS_JSON: ${AURSMITH_TRANSFER_ENDPOINTS_JSON:?必须配置 Builder ID 到 SSH 端点的静态映射}
       AURSMITH_TRANSFER_SSH_IDENTITY_FILE: /run/secrets/builder_pull_key
       AURSMITH_TRANSFER_SSH_KNOWN_HOSTS_FILE: /run/secrets/builder_known_hosts

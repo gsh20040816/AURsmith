@@ -252,3 +252,12 @@
 - `scripts/smoke-upstream.sh` 扩展后，从真实 `paru-git` source 克隆深度 2 的当前历史，取父 commit 交给正式 Worker；Worker 返回 `vcs_ancestor_of_current=true`，AUR 搜索、普通快照和官方 `pacman` 查询也通过。第一次执行在上游请求阶段只返回汇总的“Worker 返回失败”，未作为通过证据；随后的 `bash -x` 复跑完整通过并由 trap 清理临时 Worker、GPG home、数据库和 Git clone。
 - 最终执行 `bash scripts/test-all.sh`：全仓库 102 个 Rust 测试、前端类型检查、7 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。额外回归确认同步期 ancestry 观察值不会进入不可变 Revision 摘要。
 - 边界：真实上游冒烟验证了网络 fetch 的快进路径；历史重写分支由本地 Git 与控制面测试验证，没有要求公共项目实际 force-push 来制造破坏性测试。
+
+## 2026-08-10：无付费 Agent 与 Fetch Doctor
+
+- Agent Runner 新增 `/healthz`，只读取 adapter/provider/model 配置、检查选定的 `/usr/local/bin/codex` 或 `/usr/local/bin/claude` 文件，并在三秒内连接凭据网关；不会构造 AuditBundle、调用 CLI 或访问模型 provider。Controller 对三个低成本和一个高成本 endpoint 分别探测并保留各自失败原因。
+- Publisher Worker 新增 `publisher-doctor` forced command。它验证 AUR RPC，并通过无内嵌凭据、查询参数或片段的 `AURSMITH_SOURCE_PROXY_URL` 请求 `https://archlinux.org/robots.txt`；Controller 将 AUR 与代理拆成两个 Doctor 结果。
+- 单元测试覆盖 Agent 健康响应探测和 source proxy URL 拒绝规则。实际以只读、`cap_drop: ALL`、`no-new-privileges` 的 Squid 容器运行扩展后的 `scripts/smoke-upstream.sh`，AUR 与 source proxy 两项均通过；测试容器由 trap 删除，临时镜像标签移除。
+- 实际构建 Agent Runner 镜像，并以只读、零 capability 容器分别启动 Codex 与 Claude Code adapter；两者 `/healthz` 均返回 200，且模拟凭据网关 TCP 可达。第一次用 `nc` 模拟网关没有得到 JSON，脚本又缺少最终失败判定，因此不计为通过；改用明确 HTTP 监听和失败关闭后分别复验成功。排查期间一个前台测试容器未随非 TTY 中断退出，随后按精确 ID 删除；测试镜像及独占层也已删除，可由 Dockerfile 重建。
+- 最终执行 `bash scripts/test-all.sh`：全仓库 104 个 Rust 测试、前端类型检查、7 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。此前直接运行 `docker compose config` 未提供 Stack 强制要求的 Controller 公钥和传输映射，因此在变量插值阶段按设计拒绝；该次不计为配置验证，最终结论采用统一脚本注入测试值后的通过结果。
+- 边界：Doctor 证明配置、CLI、内部凭据网关、AUR 和 source proxy 路径可用，不证明 provider API key 有效，也不产生任何审计结论。真实 provider 审计和 Fetch VM 内下载仍保留为部署验收的未验证范围。

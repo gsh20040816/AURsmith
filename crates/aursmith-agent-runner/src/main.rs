@@ -1,5 +1,9 @@
 use anyhow::{Context, bail};
-use axum::{Json, Router, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,11 +76,52 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
     let cli = Cli::parse();
-    let app = Router::new().route("/v1/audit", post(audit));
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/v1/audit", post(audit));
     let listener = TcpListener::bind(&cli.bind).await?;
     axum::serve(listener, app)
         .await
         .context("Agent Runner 异常退出")
+}
+
+async fn health() -> Result<Json<Value>, (StatusCode, String)> {
+    let config = AdapterConfig::from_env().map_err(internal)?;
+    let executable = match config.kind {
+        AdapterKind::Codex => "/usr/local/bin/codex",
+        AdapterKind::ClaudeCode => "/usr/local/bin/claude",
+    };
+    let metadata = fs::metadata(executable).await.map_err(internal)?;
+    if !metadata.is_file() {
+        return Err(internal("Agent CLI 不是普通文件"));
+    }
+    let base = url::Url::parse(&config.base_url).map_err(internal)?;
+    let host = base
+        .host_str()
+        .ok_or_else(|| internal("Agent base URL 缺少主机"))?;
+    let port = base
+        .port_or_known_default()
+        .ok_or_else(|| internal("Agent base URL 缺少端口"))?;
+    let mut addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(internal)?;
+    let address = addresses
+        .next()
+        .ok_or_else(|| internal("Agent 凭据网关没有可用地址"))?;
+    timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .map_err(|_| internal("连接 Agent 凭据网关超时"))?
+    .map_err(internal)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "adapter": match config.kind { AdapterKind::Codex => "codex", AdapterKind::ClaudeCode => "claude_code" },
+        "provider": config.provider,
+        "model": config.model,
+        "credential_gateway_reachable": true
+    })))
 }
 
 async fn audit(
@@ -125,8 +170,14 @@ impl AdapterConfig {
         }
         let base_url = required_env("AURSMITH_AGENT_BASE_URL")?;
         let parsed = url::Url::parse(&base_url).context("Agent base URL 无效")?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            bail!("Agent base URL 必须是绝对 HTTP(S) URL");
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!("Agent base URL 必须是无内嵌凭据、查询参数和片段的绝对 HTTP(S) URL");
         }
         Ok(Self {
             kind,
