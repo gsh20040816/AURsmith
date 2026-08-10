@@ -1211,7 +1211,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
     let job = sqlx::query(
-        "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') ORDER BY priority DESC, created_at LIMIT 1",
+        "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') ORDER BY priority DESC, created_at LIMIT 1",
     )
     .fetch_optional(&state.database)
     .await
@@ -1309,6 +1309,9 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
         inline_inputs: serde_json::from_str(job.get("inline_inputs_json"))
             .map_err(ApiError::internal)?,
+        expected_outputs: serde_json::from_str(job.get("expected_outputs_json"))
+            .map_err(ApiError::internal)?,
+        allow_check: job.get::<i64, _>("allow_check") != 0,
         limits,
         issued_at: now,
         expires_at: now + Duration::minutes(10),

@@ -60,6 +60,8 @@ fn main() -> anyhow::Result<()> {
         dependencies: vec![],
         inputs: vec![],
         inline_inputs: vec![],
+        expected_outputs: vec!["aursmith-fetch-fixture".into()],
+        allow_check: true,
         limits: ResourceLimits {
             cpu_count: 1,
             memory_mib: 1024,

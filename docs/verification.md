@@ -187,3 +187,12 @@
 - 容器缺陷：首次按 Compose 安全策略运行仓库 Caddy 时，因官方二进制携带 `cap_net_bind_service` 而在 exec 阶段得到 `operation not permitted`；派生镜像移除文件 capability、使用 UID/GID 10001 并监听非特权端口后，真实仓库请求成功。Controller 首次运行也因空命名卷把 `/run/aursmith` 变为 root 属主而失败；在镜像内预创建并交给 UID 10001 后，`/healthz` 返回正常。Web Caddy 在相同限制下返回 HTTP 200 和预期 CSP、DENY frame、nosniff 响应头。
 - 清理：验证结束后已停止并删除前缀为 `aursmith-release-e2e` 的 10 个临时容器、16 个临时卷和独立 Docker 网络；卷不可恢复，包含测试密钥和 fixture 的临时目录已移动到桌面环境回收站，可恢复。
 - 边界：本条把真实 Artifact 传输到 pacman 升级/降级串成一个闭环，但软件包在该临时拓扑中由 Arch 容器生成；KVM Fetch→Build 已在上一条独立真实验证。Controller 尚未自动调度这次完整链路，真实 Codex/Claude provider 也因没有可用 API key 未调用，因此不能把两条相邻验证合并宣称为订阅到发布的无人值守端到端验收。
+
+## 2026-08-10：split outputs、check 策略与 namcap
+
+- 协议：JobSpec 新增向后可读取的 `expected_outputs` 和默认启用的 `allow_check`。Controller 在 Build Job 创建时从不可变 Revision 快照固定完整 split outputs，并读取按包策略；不会使用用户仅关注的输出子集。
+- Guest：`allow_check=true` 使用 makepkg 默认检查流程，显式 false 才增加 `--nocheck`。构建后核对 `.PKGINFO` 包名集合与授权集合完全相等，再以固定 argv 对全部软件包运行 namcap；check 状态和 namcap 日志摘要进入 provenance。
+- Web：软件包详情显示当前策略，可显式禁用或重新启用 `check()`，并提示禁用会降低验证覆盖且只影响后续 Job。每次变更写入 append-only 事件日志。
+- 自动测试：Controller 测试在真实 SQLite migration 后创建含两个 split outputs 的 Revision，把策略设为禁用并完成 Fetch/Audit 前置状态，确认生成的 Build Job 固定两个输出且 `allow_check=0`；Guest 测试确认 `--nocheck` 只在禁用时出现，缺失 split output 会失败。前端测试还实际打开详情并提交禁用操作。全仓库 90 个 Rust 测试、TypeScript 检查、4 个前端测试、生产构建和 Compose 安全检查通过。
+- 纠正记录：前端命令第一次从仓库根目录运行，因那里没有 `package.json` 而得到 ENOENT；随后在 `web/` 目录重新执行并通过。该失败不是前端代码测试通过的证据，最终结论只采用纠正后的运行结果。
+- 边界：本轮没有重新制作 KVM Profile 并实际启动 Guest，因此 namcap 的固定调用、协议和结果处理已通过静态编译与单元测试，但真实 VM 中的 namcap 输出仍由下一次完整 KVM 构建复验。Publisher 对 ELF `DT_NEEDED` 与文件 capability 的独立解析仍未实现。

@@ -107,6 +107,11 @@ pub struct SelectProviderRequest {
     selected_package_base: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BuildPolicyRequest {
+    allow_check: bool,
+}
+
 pub async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -804,7 +809,7 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
             transaction.commit().await.map_err(ApiError::internal)?;
             continue;
         }
-        let next = sqlx::query("SELECT member.revision_id, revisions.input_sha256 FROM release_batch_revisions AS member JOIN revisions ON revisions.id = member.revision_id WHERE member.batch_id = ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = member.batch_id AND jobs.revision_id = member.revision_id AND jobs.kind = 'build' AND jobs.status = 'succeeded') ORDER BY member.build_order LIMIT 1")
+        let next = sqlx::query("SELECT member.revision_id, revisions.input_sha256, revisions.package_base, revisions.metadata_json FROM release_batch_revisions AS member JOIN revisions ON revisions.id = member.revision_id WHERE member.batch_id = ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = member.batch_id AND jobs.revision_id = member.revision_id AND jobs.kind = 'build' AND jobs.status = 'succeeded') ORDER BY member.build_order LIMIT 1")
             .bind(&batch_id).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?;
         let Some(next) = next else {
             sqlx::query("UPDATE release_batches SET state = 'ready_to_publish', failure_reason = NULL, updated_at = ? WHERE id = ?")
@@ -835,11 +840,22 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         )
         .await?;
         let source_attempt_id: String = fetch.get("attempt_id");
+        let snapshot: UpstreamSnapshot =
+            serde_json::from_str(next.get("metadata_json")).map_err(ApiError::internal)?;
+        let allow_check: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT allow_check FROM package_build_policies WHERE package_base = ?), 1)",
+        )
+        .bind(next.get::<String, _>("package_base"))
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, ?, '[]', ?, ?, ?)")
             .bind(Uuid::new_v4().to_string()).bind(&batch_id).bind(&revision_id)
             .bind(next.get::<String,_>("input_sha256")).bind(profile_sha256).bind(&published_version.upstream_pkgrel).bind(published_version.published_pkgrel()).bind(source_manifest_sha256)
             .bind(dependency_snapshot_sha256).bind(worker_id).bind(source_attempt_id)
+            .bind(serde_json::to_string(&snapshot.outputs).map_err(ApiError::internal)?)
+            .bind(allow_check)
             .bind(r#"{"cpu_count":2,"memory_mib":4096,"disk_mib":16384,"timeout_seconds":3600}"#)
             .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE revisions SET state = 'build_pending' WHERE id = ?")
@@ -1013,6 +1029,13 @@ pub async fn package_detail(
         .map_err(ApiError::internal)?;
     let events = sqlx::query("SELECT event_type, payload_json, actor, created_at FROM events WHERE aggregate_type = 'package_base' AND aggregate_id = ? ORDER BY sequence DESC LIMIT 100")
         .bind(&package_base).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let allow_check: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT allow_check FROM package_build_policies WHERE package_base = ?), 1)",
+    )
+    .bind(&package_base)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
     Ok(Json(json!({
         "package_base": package.get::<String, _>("name"),
         "version": package.get::<String, _>("version"),
@@ -1023,6 +1046,7 @@ pub async fn package_detail(
         "optional_dependencies": parse_json::<Value>(package.get("optional_dependencies_json"))?,
         "provides": parse_json::<Value>(package.get("provides_json"))?,
         "architectures": parse_json::<Value>(package.get("architectures_json"))?,
+        "build_policy": {"allow_check": allow_check != 0},
         "revisions": revisions.into_iter().map(|row| json!({
             "id": row.get::<String, _>("id"), "aur_commit": row.get::<String, _>("aur_commit"),
             "vcs_commit": row.get::<Option<String>, _>("vcs_commit"), "upstream_version": row.get::<String, _>("upstream_version"),
@@ -1039,6 +1063,46 @@ pub async fn package_detail(
             "payload": serde_json::from_str::<Value>(row.get("payload_json")).unwrap_or(Value::Null),
             "actor": row.get::<String,_>("actor"), "created_at": row.get::<String,_>("created_at")
         })).collect::<Vec<_>>()
+    })))
+}
+
+pub async fn set_build_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(package_base): Path<String>,
+    Json(request): Json<BuildPolicyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    validate_name(&package_base)?;
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM package_bases WHERE name = ?")
+        .bind(&package_base)
+        .fetch_one(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    if exists == 0 {
+        return Err(ApiError::not_found("软件包尚未同步"));
+    }
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO package_build_policies(package_base, allow_check, updated_at) VALUES (?, ?, ?) ON CONFLICT(package_base) DO UPDATE SET allow_check = excluded.allow_check, updated_at = excluded.updated_at")
+        .bind(&package_base)
+        .bind(i64::from(request.allow_check))
+        .bind(Utc::now())
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    append_event_in_transaction(
+        &mut transaction,
+        "package_base",
+        &package_base,
+        "package_build_policy_changed",
+        json!({"allow_check": request.allow_check}),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "package_base": package_base,
+        "build_policy": {"allow_check": request.allow_check}
     })))
 }
 
@@ -2342,5 +2406,57 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending_runs, 3, "完整 Fetch 结果必须启动三个低成本 Agent");
+    }
+
+    #[tokio::test]
+    async fn build_job_freezes_check_policy_and_all_split_outputs() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let created = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        let revision_id = created["revision_id"].as_str().unwrap();
+        let batch_id = created["batch_id"].as_str().unwrap();
+        let worker_id = Uuid::new_v4().to_string();
+        let fetch_job_id = Uuid::new_v4().to_string();
+        let fetch_attempt_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, last_seen_at, created_at, updated_at) VALUES (?, 'builder-test', 'builder', 'online', 'ssh://aursmith@builder:2222', ?, 1, '[]', ?, ?, ?)")
+            .bind(&worker_id).bind("a".repeat(64)).bind(now).bind(now).bind(now)
+            .execute(&database).await.unwrap();
+        sqlx::query("UPDATE revisions SET source_manifest_sha256 = ?, dependency_snapshot_sha256 = ? WHERE id = ?")
+            .bind("b".repeat(64)).bind("c".repeat(64)).bind(revision_id)
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', '{}', '{}', '[]', 'approved', ?)")
+            .bind("d".repeat(64)).bind(revision_id).bind(now)
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, worker_id, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', ?, 'succeeded', 50, ?, 'fetch', ?, ?, ?, '[]', '[]', '[]', ?, ?)")
+            .bind(&fetch_job_id).bind(batch_id).bind(revision_id).bind(&worker_id)
+            .bind("e".repeat(64)).bind("f".repeat(64)).bind("b".repeat(64)).bind("c".repeat(64))
+            .bind(now).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO attempts(id, job_id, generation, token_sha256, status) VALUES (?, ?, 0, ?, 'succeeded')")
+            .bind(&fetch_attempt_id).bind(&fetch_job_id).bind("1".repeat(64))
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO package_build_policies(package_base, allow_check, updated_at) VALUES ('demo', 0, ?)")
+            .bind(now).execute(&database).await.unwrap();
+        sqlx::query("UPDATE release_batches SET state = 'awaiting_audit' WHERE id = ?")
+            .bind(batch_id)
+            .execute(&database)
+            .await
+            .unwrap();
+
+        schedule_ready_builds(&database).await.unwrap();
+
+        let row = sqlx::query("SELECT expected_outputs_json, allow_check FROM jobs WHERE batch_id = ? AND kind = 'build'")
+            .bind(batch_id).fetch_one(&database).await.unwrap();
+        let outputs: Vec<String> = serde_json::from_str(row.get("expected_outputs_json")).unwrap();
+        assert_eq!(outputs, ["demo-cli", "demo-lib"]);
+        assert_eq!(row.get::<i64, _>("allow_check"), 0);
     }
 }

@@ -121,6 +121,12 @@ docker compose -f deploy/controller/compose.yaml start controller
 
 Archiver 库存巡检由 Controller 自动调度：七天没有成功报告时执行文件集合与大小检查，九十天没有完整报告时重新计算全部摘要。巡检通过现有 forced-command SSH 发起，结果由 Archiver 身份密钥签名。归档页面显示最近报告的级别、Release/文件数量和失败数；任何失败都应先隔离存储故障并从其他已验证副本恢复，不要直接修改 Receipt 或控制面状态。
 
+## 按包构建策略
+
+软件包详情页默认显示“执行 `check()`”。只有确认上游测试在隔离构建环境中不可用时，才使用“禁用 `check()`”；该设置只影响之后创建的新 Build Job，不会修改已经签名或运行中的 Job。禁用状态会进入 JobSpec、provenance 和事件日志。恢复启用后同样只影响后续任务。
+
+无论用户关注 split package 中的哪些输出，Builder 都会构建并核对该 pkgbase 声明的完整 outputs。缺少或多出产物会使 Job 失败，不能通过只发布成功的子包绕过批次原子性。
+
 ## Git 与发布
 
 - 日常开发直接进入 `main`，每个独立且验证通过的改动形成一个英文提交。

@@ -97,6 +97,12 @@ fn main() -> anyhow::Result<()> {
         } else {
             vec![]
         },
+        expected_outputs: if fixture_kind == "fetch" {
+            vec![]
+        } else {
+            vec!["aursmith-profile-fixture".into()]
+        },
+        allow_check: true,
         limits: ResourceLimits {
             cpu_count: 1,
             memory_mib: 1024,

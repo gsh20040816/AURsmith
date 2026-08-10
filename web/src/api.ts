@@ -88,6 +88,7 @@ export type PackageDetail = {
   description: string | null;
   maintainer: string | null;
   outputs: string[];
+  build_policy: { allow_check: boolean };
   revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; created_at: string }>;
   dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
   events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
@@ -307,6 +308,11 @@ export const api = {
     ),
   packageDetail: (packageBase: string) =>
     request<PackageDetail>(`/api/v1/packages/${encodeURIComponent(packageBase)}`),
+  setBuildPolicy: (packageBase: string, allowCheck: boolean) =>
+    request<{ package_base: string; build_policy: { allow_check: boolean } }>(
+      `/api/v1/packages/${encodeURIComponent(packageBase)}/build-policy`,
+      { method: "POST", body: JSON.stringify({ allow_check: allowCheck }) }
+    ),
   selectProvider: (packageBase: string, dependencyName: string, selectedPackageBase: string) =>
     request<{ package_base: string; dependency_name: string; selected_package_base: string }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/providers/${encodeURIComponent(dependencyName)}`,

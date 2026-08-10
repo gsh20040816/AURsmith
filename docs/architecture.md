@@ -95,7 +95,7 @@ Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日�
 
 在 Builder 间 `TransferCapability` 传输尚未完成前，一个 ReleaseBatch 固定到第一个接单的 Builder。审计批准后的 Build Job 必须引用该节点上已经完成的 Fetch Attempt；Builder 再次验证 FetchResult、Source Manifest 和 completed 文件树后，才将 prepared source 复制进新的只读输入目录。这是显式的安全亲和策略：缺少原 Fetch Attempt 时任务保持不可调度，不允许 Build VM 重新联网获取源码。后续跨 Builder 调度只能通过同一摘要约束的 rsync Capability 扩展，不能绕过这条不变量。
 
-Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
+Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。Controller 把完整 split outputs 和当前包的 `check()` 策略冻结进签名 JobSpec；Guest 要求实际 `.PKGINFO` 包名集合精确相等。默认执行 `check()`，只有 UI 中按包显式禁用才加入 `--nocheck`，结果同时写入 provenance。构建产物随后由 Guest 使用固定 argv 执行 namcap，报告摘要也进入 provenance。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
 
 JobSpec 同时固定直接运行、构建和检查依赖及其来源。Fetch Guest 只对 `official` 依赖使用 pacman 下载，并使用不可变 Profile 内已授权的 Arch HTTPS 镜像；包文件进入 prepared source、完整 Source Manifest 和解析后的名称/版本/摘要清单。AUR 依赖不会伪装成官方依赖下载。Controller 使用 Fetch 实际结果替换预估的依赖快照摘要。按 DAG 构建时，Builder 从同批次已成功 Build Attempt 中重新验证并复制直接 AUR 依赖产物。Build Guest 以 PID 1 身份先用 pacman 离线安装两类依赖，再降权执行 makepkg；依赖缺失时确定性失败，绝不临时添加网卡。BuildResult 通过 Profile 摘要间接固定镜像配置，控制面可从对应 Profile 清单还原该事实。
 

@@ -823,6 +823,8 @@ mod tests {
             dependencies: vec![],
             inputs: vec![],
             inline_inputs: vec![],
+            expected_outputs: vec![],
+            allow_check: true,
             limits: ResourceLimits {
                 cpu_count: 2,
                 memory_mib: 1024,

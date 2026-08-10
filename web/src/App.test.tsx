@@ -43,4 +43,27 @@ describe("AURsmith 控制台", () => {
     expect(screen.getByLabelText("profile-candidate.json")).toHaveAttribute("type", "file");
     expect(screen.getByRole("button", { name: "提交并创建 fixture" })).toBeInTheDocument();
   });
+
+  it("软件包详情可以显式禁用 check", async () => {
+    let allowCheck = true;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      let body: unknown;
+      if (url.endsWith("/setup/status")) body = { initialized: true };
+      else if (url.endsWith("/auth/me")) body = { id: "admin-id", username: "admin" };
+      else if (url.endsWith("/requirements")) body = { items: [] };
+      else if (url.endsWith("/subscriptions")) body = { items: [{ id: "sub", package_base: "demo", kind: "direct", state: "active", reference_count: 0, followed_outputs: ["demo"], version: "1-1", description: "演示", outputs: ["demo"], maintainer: "tester", out_of_date: null }] };
+      else if (url.endsWith("/packages/demo/build-policy") && init?.method === "POST") {
+        allowCheck = false;
+        body = { package_base: "demo", build_policy: { allow_check: false } };
+      } else if (url.endsWith("/packages/demo")) body = { package_base: "demo", version: "1-1", description: "演示", maintainer: "tester", outputs: ["demo"], build_policy: { allow_check: allowCheck }, revisions: [], dependency_resolution: [], events: [] };
+      else body = { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /软件包/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "详情" }));
+    fireEvent.click(await screen.findByRole("button", { name: "禁用 check()" }));
+    expect(await screen.findByText("已显式禁用")).toBeInTheDocument();
+  });
 });

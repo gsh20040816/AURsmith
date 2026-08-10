@@ -7,6 +7,7 @@ use aursmith_protocol::{
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::Read,
     os::unix::fs::symlink,
@@ -305,11 +306,8 @@ fn download_official_dependencies(
 
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     let log = Path::new(OUTPUT).join("build.log");
-    run_as_builder(
-        &["/usr/bin/makepkg", "--noconfirm", "--cleanbuild", "--force"],
-        Some(&log),
-        false,
-    )?;
+    let makepkg_arguments = makepkg_arguments(spec.allow_check);
+    run_as_builder(&makepkg_arguments, Some(&log), false)?;
     let packages = collect_package_files(Path::new(BUILD))?;
     if packages.is_empty() {
         bail!("makepkg 未生成软件包");
@@ -333,6 +331,15 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
             architecture: Some(package_metadata.2),
         });
     }
+    validate_expected_outputs(&artifacts, &spec.expected_outputs)?;
+    let namcap_log = Path::new(OUTPUT).join("namcap.log");
+    let mut namcap_arguments = vec!["/usr/bin/namcap"];
+    let artifact_paths = artifacts
+        .iter()
+        .map(|artifact| format!("{OUTPUT}/{}", artifact.path))
+        .collect::<Vec<_>>();
+    namcap_arguments.extend(artifact_paths.iter().map(String::as_str));
+    run_as_builder(&namcap_arguments, Some(&namcap_log), false)?;
     Ok(BuildResult {
         job_id: spec.job_id,
         attempt: spec.attempt.clone(),
@@ -353,7 +360,16 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         provenance: [
             ("guest_agent".into(), env!("CARGO_PKG_VERSION").into()),
             ("network".into(), "none".into()),
-            ("check".into(), "enabled".into()),
+            (
+                "check".into(),
+                if spec.allow_check {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .into(),
+            ),
+            ("namcap_sha256".into(), file_digest(&namcap_log)?),
             (
                 "published_pkgrel".into(),
                 spec.published_pkgrel
@@ -366,6 +382,33 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         log_sha256: file_digest(&log)?,
         finished_at: Utc::now(),
     })
+}
+
+fn makepkg_arguments(allow_check: bool) -> Vec<&'static str> {
+    let mut arguments = vec!["/usr/bin/makepkg", "--noconfirm", "--cleanbuild", "--force"];
+    if !allow_check {
+        arguments.push("--nocheck");
+    }
+    arguments
+}
+
+fn validate_expected_outputs(
+    artifacts: &[ArtifactRecord],
+    expected_outputs: &[String],
+) -> anyhow::Result<()> {
+    let actual = artifacts
+        .iter()
+        .filter_map(|artifact| artifact.package_name.clone())
+        .collect::<BTreeSet<_>>();
+    let expected = expected_outputs.iter().cloned().collect::<BTreeSet<_>>();
+    if !expected.is_empty() && actual != expected {
+        bail!(
+            "构建产物与签名 JobSpec 的 split outputs 不一致：预期 {:?}，实际 {:?}",
+            expected,
+            actual
+        );
+    }
+    Ok(())
 }
 
 fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)> {
@@ -719,5 +762,23 @@ mod tests {
         .unwrap();
         assert!(apply_published_pkgrel(&directory, Some("1"), Some("1.1")).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn check_policy_is_explicit_and_split_outputs_must_match() {
+        assert!(!makepkg_arguments(true).contains(&"--nocheck"));
+        assert!(makepkg_arguments(false).contains(&"--nocheck"));
+        let artifact = ArtifactRecord {
+            path: "demo-1-1-any.pkg.tar.zst".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+            package_name: Some("demo".into()),
+            package_version: Some("1-1".into()),
+            architecture: Some("any".into()),
+        };
+        assert!(
+            validate_expected_outputs(std::slice::from_ref(&artifact), &["demo".into()]).is_ok()
+        );
+        assert!(validate_expected_outputs(&[artifact], &["missing-split-output".into()]).is_err());
     }
 }

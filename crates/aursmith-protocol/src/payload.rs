@@ -107,9 +107,17 @@ pub struct JobSpec {
     pub inputs: Vec<ManifestEntry>,
     #[serde(default)]
     pub inline_inputs: Vec<InlineInput>,
+    #[serde(default)]
+    pub expected_outputs: Vec<String>,
+    #[serde(default = "default_allow_check")]
+    pub allow_check: bool,
     pub limits: ResourceLimits,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+fn default_allow_check() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,19 +146,6 @@ impl BuildProfileSpec {
         }
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&content)?)))
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuestJob {
-    pub schema_version: u16,
-    pub kind: JobKind,
-    pub job_id: Uuid,
-    pub attempt: AttemptRef,
-    pub revision_sha256: String,
-    pub source_manifest_sha256: Option<String>,
-    pub dependency_snapshot_sha256: Option<String>,
-    pub expected_outputs: Vec<String>,
-    pub allow_check: bool,
 }
 
 impl JobSpec {
@@ -327,6 +322,8 @@ mod tests {
             dependencies: Vec::new(),
             inputs: Vec::new(),
             inline_inputs: Vec::new(),
+            expected_outputs: vec!["demo".into()],
+            allow_check: true,
             limits: ResourceLimits {
                 cpu_count: 1,
                 memory_mib: 1024,
@@ -338,6 +335,12 @@ mod tests {
         };
         assert!(!spec.is_expired_at(now));
         assert!(spec.is_expired_at(now + Duration::minutes(6)));
+        let mut legacy = serde_json::to_value(&spec).unwrap();
+        legacy.as_object_mut().unwrap().remove("expected_outputs");
+        legacy.as_object_mut().unwrap().remove("allow_check");
+        let decoded: JobSpec = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.allow_check, "旧 JobSpec 必须保持默认执行 check()");
+        assert!(decoded.expected_outputs.is_empty());
     }
 
     #[test]

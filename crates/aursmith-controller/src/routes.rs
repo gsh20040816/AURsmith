@@ -122,6 +122,10 @@ pub fn router(state: AppState) -> Router {
             post(crate::packages::refresh_package),
         )
         .route(
+            "/api/v1/packages/{package_base}/build-policy",
+            post(crate::packages::set_build_policy),
+        )
+        .route(
             "/api/v1/packages/{package_base}/providers/{dependency_name}",
             post(crate::packages::select_provider),
         )
@@ -804,6 +808,9 @@ struct CreateJobRequest {
     #[serde(default)]
     inline_inputs: Vec<InlineInput>,
     #[serde(default)]
+    expected_outputs: Vec<String>,
+    allow_check: Option<bool>,
+    #[serde(default)]
     required_labels: Vec<String>,
     limits: Option<ResourceLimits>,
     #[serde(default)]
@@ -922,7 +929,7 @@ async fn create_job(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(role_name(request.required_role))
@@ -936,6 +943,8 @@ async fn create_job(
     .bind(request.source_attempt_id.map(|value| value.to_string()))
     .bind(serde_json::to_string(&request.inputs).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&request.inline_inputs).map_err(ApiError::internal)?)
+    .bind(serde_json::to_string(&request.expected_outputs).map_err(ApiError::internal)?)
+    .bind(i64::from(request.allow_check.unwrap_or(true)))
     .bind(serde_json::to_string(&request.required_labels).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&limits).map_err(ApiError::internal)?)
     .bind(now)
