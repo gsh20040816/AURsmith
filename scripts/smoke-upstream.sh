@@ -65,6 +65,17 @@ vcs_result="$("${repository_root}/target/debug/aursmithctl" worker \
   --socket "${runtime_directory}/worker.sock" aur-snapshot paru-git)"
 jq -e '.ok == true and (.data.vcs_commit | test("^[0-9a-f]{40}$"))' \
   <<<"${vcs_result}" >/dev/null
+vcs_source="$(jq -r '.data.sources[] | select(startswith("git+https://"))' <<<"${vcs_result}" | head -n1)"
+vcs_repository="${vcs_source#git+}"
+vcs_repository="${vcs_repository%%#*}"
+git -c protocol.file.allow=never -c protocol.ext.allow=never -c http.followRedirects=false \
+  clone --filter=blob:none --no-checkout --depth=2 "${vcs_repository}" "${runtime_directory}/vcs-upstream" >/dev/null 2>&1
+previous_vcs_commit="$(git -C "${runtime_directory}/vcs-upstream" rev-parse HEAD^)"
+vcs_ancestry_result="$("${repository_root}/target/debug/aursmithctl" worker \
+  --socket "${runtime_directory}/worker.sock" aur-snapshot paru-git \
+  --previous-vcs-commit "${previous_vcs_commit}")"
+jq -e '.ok == true and .data.vcs_ancestor_of_current == true' \
+  <<<"${vcs_ancestry_result}" >/dev/null
 
 official_result="$("${repository_root}/target/debug/aursmithctl" worker \
   --socket "${runtime_directory}/worker.sock" official-info pacman)"

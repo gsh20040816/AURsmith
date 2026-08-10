@@ -146,9 +146,13 @@ pub async fn aur_snapshot(
     config: &Config,
     endpoint: &str,
     package_base: &str,
+    previous_vcs_commit: Option<&str>,
 ) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(&serde_json::json!({"package_base": package_base}))
-        .map_err(ApiError::internal)?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "package_base": package_base,
+        "previous_vcs_commit": previous_vcs_commit
+    }))
+    .map_err(ApiError::internal)?;
     invoke(config, endpoint, "aur-snapshot", Some(body)).await
 }
 

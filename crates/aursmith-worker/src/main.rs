@@ -140,22 +140,56 @@ struct Worker {
 enum WorkerCommand {
     Status,
     Drain,
-    Submit { envelope: SignedEnvelope },
-    Query { job_id: String },
-    AurSearch { query: String },
-    AurInfo { names: Vec<String> },
-    AurProviders { names: Vec<String> },
-    OfficialInfo { names: Vec<String> },
-    AurSnapshot { package_base: String },
-    AuthorizeExport { envelope: SignedEnvelope },
-    ResolveExport { capability_id: String },
-    CompleteExport { envelope: SignedEnvelope },
-    AuthorizeImport { envelope: SignedEnvelope },
-    AuthorizeRelease { envelope: SignedEnvelope },
-    QueryRelease { release_id: String },
-    ReleaseFiles { release_id: String },
-    AuthorizeRollback { envelope: SignedEnvelope },
-    Inventory { full_digest: bool },
+    Submit {
+        envelope: SignedEnvelope,
+    },
+    Query {
+        job_id: String,
+    },
+    AurSearch {
+        query: String,
+    },
+    AurInfo {
+        names: Vec<String>,
+    },
+    AurProviders {
+        names: Vec<String>,
+    },
+    OfficialInfo {
+        names: Vec<String>,
+    },
+    AurSnapshot {
+        package_base: String,
+        #[serde(default)]
+        previous_vcs_commit: Option<String>,
+    },
+    AuthorizeExport {
+        envelope: SignedEnvelope,
+    },
+    ResolveExport {
+        capability_id: String,
+    },
+    CompleteExport {
+        envelope: SignedEnvelope,
+    },
+    AuthorizeImport {
+        envelope: SignedEnvelope,
+    },
+    AuthorizeRelease {
+        envelope: SignedEnvelope,
+    },
+    QueryRelease {
+        release_id: String,
+    },
+    ReleaseFiles {
+        release_id: String,
+    },
+    AuthorizeRollback {
+        envelope: SignedEnvelope,
+    },
+    Inventory {
+        full_digest: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -407,7 +441,10 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         WorkerCommand::AurInfo { names } => aur_info(worker, &names).await,
         WorkerCommand::AurProviders { names } => aur_providers(worker, &names).await,
         WorkerCommand::OfficialInfo { names } => official_info(worker, &names).await,
-        WorkerCommand::AurSnapshot { package_base } => aur_snapshot(worker, &package_base).await,
+        WorkerCommand::AurSnapshot {
+            package_base,
+            previous_vcs_commit,
+        } => aur_snapshot(worker, &package_base, previous_vcs_commit.as_deref()).await,
         WorkerCommand::AuthorizeExport { envelope } => authorize_export(worker, envelope).await,
         WorkerCommand::ResolveExport { capability_id } => {
             resolve_export(worker, &capability_id).await
@@ -1983,11 +2020,15 @@ async fn official_info(worker: &Worker, names: &[String]) -> WorkerResponse {
     WorkerResponse::ok("OFFICIAL_INFO", serde_json::Value::Object(items))
 }
 
-async fn aur_snapshot(worker: &Worker, package_base: &str) -> WorkerResponse {
+async fn aur_snapshot(
+    worker: &Worker,
+    package_base: &str,
+    previous_vcs_commit: Option<&str>,
+) -> WorkerResponse {
     if worker.role != WorkerRole::Publisher {
         return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以访问 AUR");
     }
-    match worker.aur.snapshot(package_base).await {
+    match worker.aur.snapshot(package_base, previous_vcs_commit).await {
         Ok(snapshot) => WorkerResponse::ok("AUR_SNAPSHOT", serde_json::json!(snapshot)),
         Err(error) => WorkerResponse::error("AUR_UPSTREAM_ERROR", error.to_string()),
     }

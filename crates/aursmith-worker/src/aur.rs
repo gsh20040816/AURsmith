@@ -66,6 +66,8 @@ pub struct AurSnapshot {
     pub package_base: String,
     pub aur_commit: String,
     pub vcs_commit: Option<String>,
+    #[serde(default)]
+    pub vcs_ancestor_of_current: Option<bool>,
     pub version: String,
     pub outputs: Vec<String>,
     pub dependencies: Vec<Dependency>,
@@ -172,7 +174,11 @@ impl AurClient {
         Ok(payload.results)
     }
 
-    pub async fn snapshot(&self, package_base: &str) -> anyhow::Result<AurSnapshot> {
+    pub async fn snapshot(
+        &self,
+        package_base: &str,
+        previous_vcs_commit: Option<&str>,
+    ) -> anyhow::Result<AurSnapshot> {
         let package_base = validate_package_base(package_base)?;
         let repository = self.base.join(&format!("{package_base}.git"))?;
         let temporary = TempDir::new().context("无法创建 AUR 快照临时目录")?;
@@ -189,7 +195,10 @@ impl AurClient {
         let mut snapshot = parse_srcinfo(package_base, commit, srcinfo)?;
         snapshot.files = collect_snapshot_files(temporary.path()).await?;
         if package_base.ends_with("-git") {
-            snapshot.vcs_commit = resolve_git_vcs_commit(&snapshot.sources).await?;
+            let (commit, ancestor) =
+                resolve_git_vcs_commit(&snapshot.sources, previous_vcs_commit).await?;
+            snapshot.vcs_commit = commit;
+            snapshot.vcs_ancestor_of_current = ancestor;
         }
         Ok(snapshot)
     }
@@ -328,7 +337,10 @@ async fn run_git_output(directory: &Path, arguments: &[&str]) -> anyhow::Result<
         .map(|value| value.trim().to_owned())
 }
 
-async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<String>> {
+async fn resolve_git_vcs_commit(
+    sources: &[String],
+    previous_vcs_commit: Option<&str>,
+) -> anyhow::Result<(Option<String>, Option<bool>)> {
     let Some(source) = sources.iter().find(|source| {
         source
             .split_once("::")
@@ -336,7 +348,7 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
             .unwrap_or(source)
             .starts_with("git+https://")
     }) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let source = source
         .split_once("::")
@@ -344,6 +356,9 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
         .unwrap_or(source)
         .trim_start_matches("git+");
     let url = Url::parse(source).context("Git VCS source URL 无效")?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("Git VCS source URL 不允许内嵌凭据");
+    }
     let host = url.host_str().context("Git VCS source 缺少主机")?;
     let port = url.port_or_known_default().unwrap_or(443);
     let addresses = public_addresses(host, port).await?;
@@ -356,7 +371,7 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
         {
-            return Ok(Some(commit.to_owned()));
+            return Ok((Some(commit.to_owned()), None));
         }
     }
     let reference = fragment
@@ -368,6 +383,7 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
                 .map(|value| format!("refs/tags/{value}"))
         })
         .unwrap_or_else(|| "HEAD".to_owned());
+    let fetch_repository = repository.clone();
     repository
         .path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Git VCS URL 不能作为路径基址"))?
@@ -409,7 +425,138 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
         })
         .map(|(commit, _)| commit.clone())
         .ok_or_else(|| anyhow::anyhow!("Git VCS 上游没有返回目标 ref"))?;
-    Ok(Some(commit))
+    let ancestor = match previous_vcs_commit {
+        Some(previous) if previous != commit => Some(
+            git_commit_is_ancestor(
+                &fetch_repository,
+                &reference,
+                previous,
+                &commit,
+                host,
+                port,
+                addresses[0].ip(),
+            )
+            .await?,
+        ),
+        Some(_) => Some(true),
+        None => None,
+    };
+    Ok((Some(commit), ancestor))
+}
+
+async fn git_commit_is_ancestor(
+    repository: &Url,
+    reference: &str,
+    previous: &str,
+    current: &str,
+    host: &str,
+    port: u16,
+    address: std::net::IpAddr,
+) -> anyhow::Result<bool> {
+    if !valid_commit(previous) || !valid_commit(current) {
+        bail!("Git VCS ancestry commit 无效");
+    }
+    let temporary = TempDir::new().context("无法创建 Git VCS ancestry 临时目录")?;
+    run_git_ancestry_command(temporary.path(), &["init", "--bare", "."]).await?;
+    let address = match address {
+        std::net::IpAddr::V4(value) => value.to_string(),
+        std::net::IpAddr::V6(value) => format!("[{value}]"),
+    };
+    let curl_resolve = format!("http.curloptResolve={host}:{port}:{address}");
+    run_git_ancestry_command(
+        temporary.path(),
+        &[
+            "-c",
+            "protocol.file.allow=never",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            &curl_resolve,
+            "fetch",
+            "--no-tags",
+            "--filter=blob:none",
+            repository.as_str(),
+            reference,
+        ],
+    )
+    .await?;
+    let fetched =
+        run_git_ancestry_command(temporary.path(), &["rev-parse", "FETCH_HEAD^{commit}"]).await?;
+    if fetched.trim() != current {
+        bail!("Git VCS ancestry 获取的 commit 与 refs 广告不一致");
+    }
+    if !git_object_exists(
+        temporary.path(),
+        &["cat-file", "-e", &format!("{previous}^{{commit}}")],
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    git_condition(
+        temporary.path(),
+        &["merge-base", "--is-ancestor", previous, current],
+    )
+    .await
+}
+
+fn valid_commit(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+async fn run_git_ancestry_command(directory: &Path, arguments: &[&str]) -> anyhow::Result<String> {
+    let output = git_ancestry_output(directory, arguments).await?;
+    if !output.status.success() {
+        bail!(
+            "检查 Git VCS ancestry 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("Git VCS ancestry 输出不是 UTF-8")
+}
+
+async fn git_condition(directory: &Path, arguments: &[&str]) -> anyhow::Result<bool> {
+    let output = git_ancestry_output(directory, arguments).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "检查 Git VCS ancestry 条件失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+async fn git_object_exists(directory: &Path, arguments: &[&str]) -> anyhow::Result<bool> {
+    let output = git_ancestry_output(directory, arguments).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(_) => Ok(false),
+        None => bail!("检查 Git VCS 对象时进程被信号终止"),
+    }
+}
+
+async fn git_ancestry_output(
+    directory: &Path,
+    arguments: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    timeout(
+        Duration::from_secs(120),
+        Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .context("检查 Git VCS ancestry 超时")?
+    .context("无法启动 Git VCS ancestry 检查")
 }
 
 fn parse_git_advertisement(body: &[u8]) -> Vec<(String, String)> {
@@ -538,6 +685,7 @@ fn parse_srcinfo(
         package_base: package_base.to_owned(),
         aur_commit: commit,
         vcs_commit: None,
+        vcs_ancestor_of_current: None,
         version,
         outputs: outputs.into_iter().collect(),
         dependencies: dependencies
@@ -642,5 +790,75 @@ mod tests {
             "0123456789012345678901234567890123456789".into(),
             "refs/heads/main".into()
         )));
+    }
+
+    #[tokio::test]
+    async fn git_ancestry_distinguishes_fast_forward_and_rewritten_history() {
+        let repository = TempDir::new().unwrap();
+        run_git_ancestry_command(repository.path(), &["init", "."])
+            .await
+            .unwrap();
+        run_git_ancestry_command(repository.path(), &["config", "user.name", "AURsmith Test"])
+            .await
+            .unwrap();
+        run_git_ancestry_command(
+            repository.path(),
+            &["config", "user.email", "test@aursmith.invalid"],
+        )
+        .await
+        .unwrap();
+        std::fs::write(repository.path().join("fixture"), "first").unwrap();
+        run_git_ancestry_command(repository.path(), &["add", "fixture"])
+            .await
+            .unwrap();
+        run_git_ancestry_command(repository.path(), &["commit", "-m", "first"])
+            .await
+            .unwrap();
+        let first = run_git_ancestry_command(repository.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        std::fs::write(repository.path().join("fixture"), "second").unwrap();
+        run_git_ancestry_command(repository.path(), &["commit", "-am", "second"])
+            .await
+            .unwrap();
+        let second = run_git_ancestry_command(repository.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        assert!(
+            git_condition(
+                repository.path(),
+                &["merge-base", "--is-ancestor", first.trim(), second.trim()]
+            )
+            .await
+            .unwrap()
+        );
+
+        run_git_ancestry_command(repository.path(), &["checkout", "--orphan", "rewritten"])
+            .await
+            .unwrap();
+        std::fs::remove_file(repository.path().join("fixture")).unwrap();
+        std::fs::write(repository.path().join("replacement"), "rewritten").unwrap();
+        run_git_ancestry_command(repository.path(), &["add", "-A"])
+            .await
+            .unwrap();
+        run_git_ancestry_command(repository.path(), &["commit", "-m", "rewritten"])
+            .await
+            .unwrap();
+        let rewritten = run_git_ancestry_command(repository.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        assert!(
+            !git_condition(
+                repository.path(),
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    first.trim(),
+                    rewritten.trim()
+                ]
+            )
+            .await
+            .unwrap()
+        );
     }
 }

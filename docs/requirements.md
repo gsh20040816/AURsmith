@@ -5,7 +5,7 @@
 | ID | 需求 | 第一阶段验证方式 |
 |---|---|---|
 | P01 | 搜索、订阅、暂停、退订和清除 AUR 软件包 | API 与生命周期测试 |
-| P02 | 跟踪 AUR commit 和 Git VCS 上游 commit | 同步器测试 |
+| P02 | 跟踪 AUR commit 和 Git VCS 上游 commit；历史重写必须阻断并人工确认 | 同步器、祖先关系与人工审批测试 |
 | P03 | 以 pkgbase 为单位构建全部 split outputs | 软件包基础模型测试 |
 | P04 | 解析依赖 DAG、隐式引用、Provider 和循环依赖 | 依赖图测试 |
 | P05 | 把受影响依赖闭包作为一个 ReleaseBatch 构建和发布 | 发布批次测试 |

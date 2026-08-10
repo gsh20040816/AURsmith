@@ -69,6 +69,8 @@ Controller 在写数据库前遍历最多 64 个 AUR pkgbase 的依赖闭包。�
 
 普通包的 AUR commit 变化就产生新 Revision。`-git` 包还从 `.SRCINFO` 的 `git+https` source 查询上游 commit；查询前拒绝私网、回环、链路本地和保留地址，并禁用 Git 重定向及 file/ext 协议。AUR commit、VCS commit 或固定 Provider 变化都会产生新 Revision，未开始发布的旧 Revision 标记为 `superseded`。split outputs 始终整体固定和构建，用户选择只表示客户端关注项。
 
+Git VCS commit 变化时，Controller 把上一 Revision 的 commit 交给 Publisher。Publisher 先用固定 IP 的 smart HTTP 广告取得当前 ref，再以 `protocol.file/ext=never`、禁重定向、`GIT_TERMINAL_PROMPT=0` 和 `http.curloptResolve` 固定同一公共地址，仅获取该 ref 的无 blob 历史并执行 `merge-base --is-ancestor`。正常快进自动继续；上一 commit 不存在或不是祖先时，不创建新 Revision，而是写入 `vcs_history_rewrite_detected` 事件、critical 告警和待处理人工动作。管理员在包详情中批准或拒绝精确的 previous/current commit 对；批准不能永久信任包，下一次不同重写仍重新阻断。
+
 Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包同名会被拒绝；周期检查发现已有订阅进入官方仓库时，会暂停后续 AUR 更新、保留当前私有版本，并生成迁移告警和独立事件。
 
 Controller 每六小时读取当前 Release 中 Artifact 构建时记录的官方依赖名称、版本和包摘要，再通过 Publisher 查询当前官方版本。版本变化只生成“建议重建”，明确不把版本比较描述成 ABI 兼容性证明；建议默认积累七天后合并为一个 ReleaseBatch，也可按包立即调度或关闭。重建覆盖受影响包及其反向依赖闭包，每个节点派生新的不可变 Revision，重新进入 Fetch、Source Manifest、三 Agent 审计和无网 Build 流程，绝不复用旧官方依赖快照。

@@ -133,6 +133,10 @@ pub fn router(state: AppState) -> Router {
             post(crate::packages::set_build_policy),
         )
         .route(
+            "/api/v1/packages/{package_base}/vcs-rewrite-decision",
+            post(crate::packages::decide_vcs_rewrite),
+        )
+        .route(
             "/api/v1/packages/{package_base}/providers/{dependency_name}",
             post(crate::packages::select_provider),
         )

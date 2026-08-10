@@ -12,12 +12,12 @@
 | ID | 状态 | 当前证据 | 第一版剩余缺口 |
 |---|---|---|---|
 | P01 | 已验证 | 搜索、订阅、暂停、恢复、退订、清除 API 与 Web；清除通过完整 Release 生效 | 隐式依赖保留期目前只有状态，没有按天自动清理策略 |
-| P02 | 部分验证 | AUR commit 与 Git VCS commit 跟踪；真实 AUR smoke | VCS 上游历史重写尚未形成独立事件 |
+| P02 | 已验证 | AUR commit、Git VCS commit 与真实祖先关系跟踪；`paru-git` 上游祖先检查冒烟 | 非 Git VCS 精细跟踪明确延期 |
 | P03 | 已验证 | pkgbase DAG、完整 split outputs 构建与 Guest 强校验 | 无 |
 | P04 | 已验证 | 依赖闭包、隐式引用、Provider 选择、循环阻断测试 | bootstrap 循环按计划人工处理 |
 | P05 | 已验证 | ReleaseBatch 拓扑构建、私有依赖输入和整批发布状态机 | 尚未跑订阅到发布的单次无人值守 E2E |
 | P06 | 已验证 | 本地 pkgrel 派生、Guest 工作副本改写和产物版本反验 | 动态 pkgrel 明确失败关闭，需人工处理 |
-| P07 | 部分验证 | AUR 消失、维护者/orphan/source 域名、官方晋升和依赖变化事件 | Git VCS 历史重写事件未完成 |
+| P07 | 已验证 | AUR 消失、维护者/orphan/source 域名、官方晋升、依赖变化及 VCS 历史重写事件 | 无 |
 | P08 | 已验证 | 新批次失败不改变当前 Release；发布故障与回滚实际验证 | 无 |
 | A01 | 已验证 | 包装层扫描、Fetch 后 AuditBundle、三 Runner 调度 | 真实外部模型调用未验证 |
 | A02 | 已验证 | 3/2/≤1、单次重试和高成本批准规则自动测试 | 随机复查率保持默认 0%，尚无 UI 配置 |
@@ -49,7 +49,6 @@
 
 1. B03/R03：现有签名证据已包含 Revision、AuditBundle、Agent 报告、构建 provenance 和日志摘要；继续通过受限传输加入可取得的原始日志、Profile、Source Manifest 文件及 License bundle。暂时不能取得的内容必须列为缺失，不能伪装已归档。
 2. U01：在现有 Release 证据摘要基础上，为构建 Job 提供原始日志读取，并允许展开证据文档；第一版不要求复杂日志搜索。
-3. P02/P07：Git VCS 上游 commit 回退或不再包含上次 commit 时，形成独立历史重写事件并阻止自动发布，等待人工确认。
-4. A03/B02：提供可在没有真实付费调用时执行的 Agent/Fetch Doctor；真实 provider 与真实 source E2E 仍需部署者凭据和网络，若发布前无法执行必须保留为未验证范围。
+3. A03/B02：提供可在没有真实付费调用时执行的 Agent/Fetch Doctor；真实 provider 与真实 source E2E 仍需部署者凭据和网络，若发布前无法执行必须保留为未验证范围。
 
 B04 的性能闭环、跨设备恢复演练和外部通知冒烟很重要，但第一版可以在代码主路径、风险边界和手工操作说明完整时作为部署验收项，不继续扩展为高可用或复杂观测系统。

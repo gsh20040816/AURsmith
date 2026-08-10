@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
@@ -101,5 +101,33 @@ describe("AURsmith 控制台", () => {
     expect(await screen.findByText("1 条证据记录")).toBeInTheDocument();
     expect(screen.getByText("job_result")).toBeInTheDocument();
     expect(screen.getByText("build-job")).toBeInTheDocument();
+  });
+
+  it("软件包详情可以审批 Git VCS 历史重写", async () => {
+    let approved = false;
+    let submitted: unknown = null;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      let body: unknown;
+      if (url.endsWith("/setup/status")) body = { initialized: true };
+      else if (url.endsWith("/auth/me")) body = { id: "admin-id", username: "admin" };
+      else if (url.endsWith("/requirements")) body = { items: [] };
+      else if (url.endsWith("/subscriptions")) body = { items: [{ id: "sub", package_base: "demo-git", kind: "direct", state: "active", reference_count: 0, followed_outputs: ["demo-git"], version: "1-1", description: "演示", outputs: ["demo-git"], maintainer: "tester", out_of_date: null }] };
+      else if (url.endsWith("/packages/demo-git/vcs-rewrite-decision")) {
+        submitted = JSON.parse(String(init?.body));
+        approved = true;
+        body = { package_base: "demo-git", state: "approved" };
+      } else if (url.endsWith("/packages/demo-git")) body = { package_base: "demo-git", version: "1-1", description: "演示", maintainer: "tester", outputs: ["demo-git"], build_policy: { allow_check: true }, vcs_rewrite_review: approved ? { previous_commit: "a".repeat(40), current_commit: "b".repeat(40), state: "approved", rationale: "确认上游公告可信", requested_at: "2026-08-10T00:00:00Z", decided_at: "2026-08-10T00:01:00Z" } : { previous_commit: "a".repeat(40), current_commit: "b".repeat(40), state: "pending", rationale: null, requested_at: "2026-08-10T00:00:00Z", decided_at: null }, revisions: [], dependency_resolution: [], events: [] };
+      else body = { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /软件包/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "详情" }));
+    expect(await screen.findByText("Git VCS 历史重写待确认")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("人工判断理由"), { target: { value: "确认上游公告可信" } });
+    fireEvent.click(screen.getByRole("button", { name: "批准本次重写" }));
+    await waitFor(() => expect(submitted).toEqual({ approve: true, rationale: "确认上游公告可信" }));
+    await waitFor(() => expect(screen.queryByText("Git VCS 历史重写待确认")).not.toBeInTheDocument());
   });
 });

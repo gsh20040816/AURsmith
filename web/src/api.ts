@@ -92,6 +92,14 @@ export type PackageDetail = {
   maintainer: string | null;
   outputs: string[];
   build_policy: { allow_check: boolean };
+  vcs_rewrite_review: {
+    previous_commit: string;
+    current_commit: string;
+    state: "pending" | "approved" | "rejected";
+    rationale: string | null;
+    requested_at: string;
+    decided_at: string | null;
+  } | null;
   revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; created_at: string }>;
   dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
   events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
@@ -346,6 +354,11 @@ export const api = {
     request<{ package_base: string; build_policy: { allow_check: boolean } }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/build-policy`,
       { method: "POST", body: JSON.stringify({ allow_check: allowCheck }) }
+    ),
+  decideVcsRewrite: (packageBase: string, approve: boolean, rationale: string) =>
+    request<{ package_base: string; state: string }>(
+      `/api/v1/packages/${encodeURIComponent(packageBase)}/vcs-rewrite-decision`,
+      { method: "POST", body: JSON.stringify({ approve, rationale }) }
     ),
   selectProvider: (packageBase: string, dependencyName: string, selectedPackageBase: string) =>
     request<{ package_base: string; dependency_name: string; selected_package_base: string }>(
