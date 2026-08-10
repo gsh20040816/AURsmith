@@ -834,6 +834,8 @@ mod tests {
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
             profile_sha256: Some("a".repeat(64)),
+            upstream_pkgrel: None,
+            published_pkgrel: None,
             source_attempt_id: None,
             dependency_attempt_ids: vec![],
             dependencies: vec![],

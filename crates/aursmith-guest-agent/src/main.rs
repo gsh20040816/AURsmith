@@ -73,6 +73,11 @@ fn run() -> anyhow::Result<()> {
     }
     if spec.kind == JobKind::Build {
         install_offline_dependencies(Path::new(BUILD))?;
+        apply_published_pkgrel(
+            Path::new(BUILD),
+            spec.upstream_pkgrel.as_deref(),
+            spec.published_pkgrel.as_deref(),
+        )?;
     }
     run_checked("/usr/bin/chown", &["-R", "builder:builder", BUILD], None)?;
     let result = match spec.kind {
@@ -121,6 +126,64 @@ fn install_offline_dependencies(build: &Path) -> anyhow::Result<()> {
     if !status.success() {
         bail!("离线依赖安装失败，状态 {status}");
     }
+    Ok(())
+}
+
+fn apply_published_pkgrel(
+    build: &Path,
+    upstream_pkgrel: Option<&str>,
+    published_pkgrel: Option<&str>,
+) -> anyhow::Result<()> {
+    let (Some(upstream_pkgrel), Some(published_pkgrel)) = (upstream_pkgrel, published_pkgrel)
+    else {
+        return Ok(());
+    };
+    if [upstream_pkgrel, published_pkgrel].iter().any(|pkgrel| {
+        pkgrel.is_empty()
+            || !pkgrel
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || ".+_".contains(value))
+    }) {
+        bail!("签名 JobSpec 中的发布 pkgrel 非法");
+    }
+    let path = build.join("PKGBUILD");
+    let source = fs::read_to_string(&path).context("PKGBUILD 不是有效 UTF-8")?;
+    let mut replacements = 0_u8;
+    let mut rewritten = String::with_capacity(source.len() + published_pkgrel.len());
+    for line in source.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = content.trim_start();
+        if !content.starts_with(char::is_whitespace)
+            && trimmed.starts_with("pkgrel=")
+            && !trimmed.starts_with("pkgrel+=")
+        {
+            replacements = replacements.saturating_add(1);
+            let original = trimmed.strip_prefix("pkgrel=").unwrap_or_default().trim();
+            let original = original
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+                .or_else(|| {
+                    original
+                        .strip_prefix('"')
+                        .and_then(|value| value.strip_suffix('"'))
+                })
+                .unwrap_or(original);
+            if original != upstream_pkgrel {
+                bail!("PKGBUILD pkgrel 与签名 JobSpec 的上游值不一致");
+            }
+            rewritten.push_str("pkgrel=");
+            rewritten.push_str(published_pkgrel);
+            if line.ends_with('\n') {
+                rewritten.push('\n');
+            }
+        } else {
+            rewritten.push_str(line);
+        }
+    }
+    if replacements != 1 {
+        bail!("PKGBUILD 必须恰好包含一个顶层 pkgrel 赋值，实际为 {replacements}");
+    }
+    fs::write(path, rewritten)?;
     Ok(())
 }
 
@@ -291,6 +354,12 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
             ("guest_agent".into(), env!("CARGO_PKG_VERSION").into()),
             ("network".into(), "none".into()),
             ("check".into(), "enabled".into()),
+            (
+                "published_pkgrel".into(),
+                spec.published_pkgrel
+                    .clone()
+                    .unwrap_or_else(|| "upstream".into()),
+            ),
         ]
         .into_iter()
         .collect(),
@@ -577,6 +646,20 @@ fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_build_directory() -> PathBuf {
+        let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aursmith-guest-test-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn links_cannot_escape_guest_build_directory() {
@@ -595,5 +678,46 @@ mod tests {
             link_target: None,
         }];
         assert_eq!(manifest_digest(&entries).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn published_pkgrel_only_rewrites_the_vm_working_copy() {
+        let directory = temporary_build_directory();
+        fs::write(
+            directory.join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\npkgrel=1\npackage() { :; }\n",
+        )
+        .unwrap();
+        apply_published_pkgrel(&directory, Some("1"), Some("1.2")).unwrap();
+        assert!(
+            fs::read_to_string(directory.join("PKGBUILD"))
+                .unwrap()
+                .contains("pkgrel=1.2\n")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_or_dynamic_pkgrel_is_rejected() {
+        let directory = temporary_build_directory();
+        fs::write(
+            directory.join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\npkgrel=$BUILD_NUMBER\npkgrel=2\n",
+        )
+        .unwrap();
+        assert!(apply_published_pkgrel(&directory, Some("1"), Some("1.1")).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn single_dynamic_pkgrel_is_rejected() {
+        let directory = temporary_build_directory();
+        fs::write(
+            directory.join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\npkgrel=$BUILD_NUMBER\n",
+        )
+        .unwrap();
+        assert!(apply_published_pkgrel(&directory, Some("1"), Some("1.1")).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

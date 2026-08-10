@@ -12,9 +12,21 @@ pub struct PublishedVersion {
 pub enum VersionError {
     #[error("upstream version and pkgrel must not be empty")]
     EmptyComponent,
+    #[error("upstream package version must use the pkgver-pkgrel form")]
+    InvalidFullVersion,
 }
 
 impl PublishedVersion {
+    pub fn from_full_version(
+        upstream_full_version: &str,
+        local_rebuild: u32,
+    ) -> Result<Self, VersionError> {
+        let (upstream_version, upstream_pkgrel) = upstream_full_version
+            .rsplit_once('-')
+            .ok_or(VersionError::InvalidFullVersion)?;
+        Self::new(upstream_version, upstream_pkgrel, local_rebuild)
+    }
+
     pub fn new(
         upstream_version: impl Into<String>,
         upstream_pkgrel: impl Into<String>,
@@ -61,6 +73,22 @@ mod tests {
         assert_eq!(
             PublishedVersion::new("2.0", "1", 2).unwrap().display(),
             "2.0-1.2"
+        );
+    }
+
+    #[test]
+    fn parses_epoch_and_upstream_pkgrel_from_full_version() {
+        let version = PublishedVersion::from_full_version("2:1.4.0-3", 1).unwrap();
+        assert_eq!(version.upstream_version, "2:1.4.0");
+        assert_eq!(version.upstream_pkgrel, "3");
+        assert_eq!(version.display(), "2:1.4.0-3.1");
+    }
+
+    #[test]
+    fn rejects_version_without_pkgrel() {
+        assert_eq!(
+            PublishedVersion::from_full_version("1.0", 0),
+            Err(VersionError::InvalidFullVersion)
         );
     }
 }

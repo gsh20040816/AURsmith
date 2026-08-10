@@ -53,6 +53,8 @@ fn main() -> anyhow::Result<()> {
         source_manifest_sha256: Some(fetch.source_manifest_sha256),
         dependency_snapshot_sha256: Some(fetch.dependency_snapshot_sha256),
         profile_sha256: Some(profile_sha256),
+        upstream_pkgrel: Some("1".into()),
+        published_pkgrel: Some("1".into()),
         source_attempt_id: Some(source_attempt_id),
         dependency_attempt_ids: vec![],
         dependencies: vec![],

@@ -79,6 +79,8 @@ fn main() -> anyhow::Result<()> {
         source_manifest_sha256: Some("0".repeat(64)),
         dependency_snapshot_sha256: Some("0".repeat(64)),
         profile_sha256: Some(candidate.spec.profile_sha256.clone()),
+        upstream_pkgrel: None,
+        published_pkgrel: None,
         source_attempt_id: None,
         dependency_attempt_ids: vec![],
         dependencies: vec![],

@@ -95,6 +95,10 @@ pub struct JobSpec {
     pub dependency_snapshot_sha256: Option<String>,
     pub profile_sha256: Option<String>,
     #[serde(default)]
+    pub upstream_pkgrel: Option<String>,
+    #[serde(default)]
+    pub published_pkgrel: Option<String>,
+    #[serde(default)]
     pub source_attempt_id: Option<Uuid>,
     #[serde(default)]
     pub dependency_attempt_ids: Vec<Uuid>,
@@ -309,6 +313,8 @@ mod tests {
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
             profile_sha256: None,
+            upstream_pkgrel: None,
+            published_pkgrel: None,
             source_attempt_id: None,
             dependency_attempt_ids: Vec::new(),
             dependencies: Vec::new(),

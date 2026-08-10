@@ -36,6 +36,8 @@ pub struct OfficialPackage {
     pub pkgname: String,
     pub pkgver: String,
     pub pkgrel: String,
+    #[serde(default)]
+    pub epoch: u64,
     pub repo: String,
     pub arch: String,
 }

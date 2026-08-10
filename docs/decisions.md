@@ -32,6 +32,8 @@
 - ADR-028：归档库存检查分为每周集合/大小复验和每九十天完整 SHA-256 巡检。报告由 Archiver 身份密钥签署并在 Controller 端核对，不把 SSH 传输成功或文件存在等同于长期数据完整。
 - ADR-029：控制面备份进入 Archiver 时复用 OpenSSH、rsync 和 TransferCapability，但 Controller 仅为备份导出运行无 Shell 的容器化 SSH sidecar。传输源 UUID由 Controller 公钥确定，Archiver 仍使用静态端点和独立拉取凭据；数据库字节不经过 JSON 控制消息，也不引入新的集群协议。
 - ADR-030：AUR 包不可见时建模为含删除、重命名、合并三种可能原因的生命周期事件，不从一次空查询猜测具体原因。维护者、orphan 和 source 域名变化使用快照差异独立记录，且不伪装成普通构建失败。
+- ADR-031：官方依赖版本变化采用保守的重建建议，不宣称从包版本或 ELF 信息证明 ABI 已改变或兼容。建议默认七天合批，用户可立即执行或按包关闭；实际执行必须派生新 Revision 并重新 Fetch、审计和构建，禁止复用旧依赖快照。
+- ADR-032：本地重建版本由 Controller 根据同一上游完整版本的成功历史单调派生，并通过签名 JobSpec 固定到 Build Guest。Guest 只改写工作副本中唯一、静态的顶层 `pkgrel`；动态或歧义赋值失败关闭。Controller 以产物 `.PKGINFO` 反向核验授权版本，避免只更新数据库字段却生成客户端无法升级的同版本软件包。
 
 ## 已拒绝
 

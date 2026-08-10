@@ -120,4 +120,12 @@
 - 成功刷新会在同一控制面事务中比较旧 package/revision 元数据，记录维护者、orphan 和 source 域名集合变化；域名单元测试确认 `git+` 前缀、source 别名和主机名大小写被规范化，本地 source 不被误认为网络域名。
 - AUR RPC 找不到原 pkgbase 时会打开稳定告警并只追加一次 `package_missing_from_aur` 事件，payload 明确保留 deleted/renamed/merged 三种可能；当前订阅和稳定 Release 不会因此被删除。
 - Web 包页面补齐详情入口，展示 split outputs、不可变 Revision、Provider/依赖解析和 append-only 事件，并补上与退订语义分开的“清除”操作。
-- 未覆盖：尚未对真实发生 AUR merge 的包验证上游是否提供可可靠固定的目标线索；VCS 历史重写和官方依赖 ABI 建议重建仍需要单独实现与验收。
+- 未覆盖：尚未对真实发生 AUR merge 的包验证上游是否提供可可靠固定的目标线索；VCS 历史重写仍需要单独实现与验收。
+
+## 2026-08-10：官方依赖变化建议与本地重建版本
+
+- 控制面保存每个 Artifact 构建时实际解析的官方依赖名称、版本和包摘要；周期检查只把版本变化建模为保守重建建议，并在 UI 明示这不能证明 ABI 兼容性。建议支持立即调度、按包关闭和七天自动合批。
+- 重建测试确认系统不会复用旧 Fetch Attempt：它为受影响闭包派生新的 `rebuild_generation`、Revision 和 AuditPreScan，在没有活动 Profile 时停在可解释的 `awaiting_profile`，后续仍必须经过新 Fetch、Agent 审计和 Build。
+- 版本测试确认首次发布保留上游 `pkgrel`，同一上游完整版本的新 AUR commit 或依赖重建派生 `.1` 后缀；支持带 epoch 的版本。签名 JobSpec 把派生 `pkgrel` 交给 Guest，Guest 单测确认只改写构建工作副本，并拒绝多个或歧义 `pkgrel` 赋值。Controller 还会拒绝 `.PKGINFO` 版本与授权值不一致的 BuildResult。
+- 已运行 `cargo test -p aursmith-domain -p aursmith-protocol -p aursmith-guest-agent -p aursmith-controller`；补充单个动态 `pkgrel` 失败关闭及上游元数据缺失不误清除建议的用例后，四个相关 crate 共 59 个测试全部通过。随后执行 `bash scripts/test-all.sh`，全仓库 83 个 Rust 测试、前端类型检查、Vitest、生产构建和四套 Compose 安全策略检查全部通过。
+- 未覆盖：尚未用真实官方包升级触发一次完整的“检测→七天合批→KVM 重新下载依赖→Agent 审计→pacman 客户端升级”端到端流程，因此当前验证覆盖领域规则、数据库状态机、协议约束和 Guest 工作副本改写，不声称真实 ABI 或客户端升级已经验收。

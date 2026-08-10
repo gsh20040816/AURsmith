@@ -4,7 +4,9 @@ use crate::{
     routes::{AppState, append_event_in_transaction},
     transport,
 };
-use aursmith_domain::{AuditFile, DependencyGraph, FindingSeverity, scan_aur_wrapper};
+use aursmith_domain::{
+    AuditFile, DependencyGraph, FindingSeverity, PublishedVersion, scan_aur_wrapper,
+};
 use aursmith_protocol::{ReleaseRollbackAuthorization, SignedEnvelope};
 use axum::{
     Json,
@@ -434,7 +436,7 @@ async fn apply_snapshot(
         .map_err(ApiError::internal)?;
     supersede_other_revisions(&mut transaction, snapshot, &provider_selection_sha256).await?;
     let existing_revision: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ?",
+        "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ? ORDER BY rebuild_generation DESC LIMIT 1",
     )
     .bind(&snapshot.package_base)
     .bind(&snapshot.aur_commit)
@@ -811,13 +813,13 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
             continue;
         };
         let revision_id: String = next.get("revision_id");
-        let fetch = sqlx::query("SELECT jobs.worker_id, jobs.profile_sha256, jobs.source_manifest_sha256, jobs.dependency_snapshot_sha256, attempts.id AS attempt_id FROM jobs JOIN attempts ON attempts.job_id = jobs.id AND attempts.status = 'succeeded' WHERE jobs.batch_id = ? AND jobs.revision_id = ? AND jobs.kind = 'fetch' AND jobs.status = 'succeeded' ORDER BY attempts.generation DESC LIMIT 1")
-            .bind(&batch_id).bind(&revision_id).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
+        let fetch = sqlx::query("SELECT jobs.worker_id, jobs.profile_sha256, jobs.source_manifest_sha256, jobs.dependency_snapshot_sha256, attempts.id AS attempt_id FROM jobs JOIN attempts ON attempts.job_id = jobs.id AND attempts.status = 'succeeded' WHERE jobs.revision_id = ? AND jobs.kind = 'fetch' AND jobs.status = 'succeeded' ORDER BY CASE WHEN jobs.batch_id = ? THEN 0 ELSE 1 END, attempts.generation DESC LIMIT 1")
+            .bind(&revision_id).bind(&batch_id).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::conflict("FETCH_RESULT_MISSING", "审计已批准，但找不到可供 Build 使用的 Fetch Attempt"))?;
         let worker_id: String = fetch.get("worker_id");
         let profile_sha256: String = fetch.get("profile_sha256");
         let revision_digests = sqlx::query(
-            "SELECT source_manifest_sha256, dependency_snapshot_sha256 FROM revisions WHERE id = ?",
+            "SELECT package_base, upstream_version, source_manifest_sha256, dependency_snapshot_sha256 FROM revisions WHERE id = ?",
         )
         .bind(&revision_id)
         .fetch_one(&mut *transaction)
@@ -825,11 +827,18 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         .map_err(ApiError::internal)?;
         let source_manifest_sha256: String = revision_digests.get("source_manifest_sha256");
         let dependency_snapshot_sha256: String = revision_digests.get("dependency_snapshot_sha256");
+        let published_version = derive_published_version(
+            &mut transaction,
+            &revision_id,
+            revision_digests.get("package_base"),
+            revision_digests.get("upstream_version"),
+        )
+        .await?;
         let source_attempt_id: String = fetch.get("attempt_id");
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?, ?)")
             .bind(Uuid::new_v4().to_string()).bind(&batch_id).bind(&revision_id)
-            .bind(next.get::<String,_>("input_sha256")).bind(profile_sha256).bind(source_manifest_sha256)
+            .bind(next.get::<String,_>("input_sha256")).bind(profile_sha256).bind(&published_version.upstream_pkgrel).bind(published_version.published_pkgrel()).bind(source_manifest_sha256)
             .bind(dependency_snapshot_sha256).bind(worker_id).bind(source_attempt_id)
             .bind(r#"{"cpu_count":2,"memory_mib":4096,"disk_mib":16384,"timeout_seconds":3600}"#)
             .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
@@ -843,6 +852,125 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         transaction.commit().await.map_err(ApiError::internal)?;
     }
     Ok(())
+}
+
+async fn derive_published_version(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    revision_id: &str,
+    package_base: &str,
+    upstream_full_version: &str,
+) -> Result<PublishedVersion, ApiError> {
+    let previous: Vec<String> = sqlx::query_scalar(
+        "SELECT published_version FROM revisions WHERE package_base = ? AND upstream_version = ? AND id != ? AND state IN ('built', 'published') AND published_version IS NOT NULL",
+    )
+    .bind(package_base)
+    .bind(upstream_full_version)
+    .bind(revision_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    let prefix = format!("{upstream_full_version}.");
+    let mut maximum = None;
+    for value in previous {
+        let generation = if value == upstream_full_version {
+            0
+        } else {
+            value
+                .strip_prefix(&prefix)
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    ApiError::conflict(
+                        "PUBLISHED_VERSION_INVALID",
+                        format!("历史发布版本 {value} 与上游版本 {upstream_full_version} 不一致"),
+                    )
+                })?
+        };
+        maximum = Some(maximum.map_or(generation, |current: u32| current.max(generation)));
+    }
+    let local_rebuild = match maximum {
+        Some(value) => value.checked_add(1).ok_or_else(|| {
+            ApiError::conflict("PUBLISHED_VERSION_OVERFLOW", "本地重建序号已溢出")
+        })?,
+        None => 0,
+    };
+    PublishedVersion::from_full_version(upstream_full_version, local_rebuild)
+        .map_err(ApiError::internal)
+}
+
+pub(crate) async fn schedule_rebuild_batch(
+    database: &SqlitePool,
+    changed: BTreeSet<String>,
+    actor: &str,
+) -> Result<Option<String>, ApiError> {
+    if changed.is_empty() {
+        return Ok(None);
+    }
+    let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+    let graph = load_dependency_graph(&mut transaction).await?;
+    let packages = graph
+        .affected_release_closure(&changed)
+        .map_err(ApiError::internal)?;
+    let batch_graph = graph
+        .induced_subgraph(&packages)
+        .map_err(ApiError::internal)?;
+    let order = batch_graph
+        .topological_order()
+        .map_err(|error| ApiError::conflict("REBUILD_DEPENDENCY_CYCLE", error.to_string()))?;
+    let batch_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    sqlx::query("INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, 'awaiting_fetch', ?, NULL, ?, ?)")
+        .bind(&batch_id).bind(serde_json::to_string(&batch_graph).map_err(ApiError::internal)?)
+        .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    for (index, package_base) in order.into_iter().enumerate() {
+        let previous = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, rebuild_generation, metadata_json FROM revisions WHERE package_base = ? AND state != 'superseded' ORDER BY rebuild_generation DESC, created_at DESC LIMIT 1")
+            .bind(&package_base).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::conflict("REBUILD_REVISION_MISSING", format!("{package_base} 没有可重建 Revision")))?;
+        let previous_id: String = previous.get("id");
+        let revision_id = Uuid::new_v4().to_string();
+        let metadata_json: String = previous.get("metadata_json");
+        let snapshot: UpstreamSnapshot =
+            serde_json::from_str(&metadata_json).map_err(ApiError::internal)?;
+        let input_sha256 = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "upstream_input_sha256": previous.get::<String,_>("input_sha256"),
+                "rebuild_batch_id": batch_id,
+                "reason": "official_dependency_changed"
+            }))
+            .map_err(ApiError::internal)?,
+        ));
+        let rebuild_generation = previous.get::<i64, _>("rebuild_generation") + 1;
+        sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, rebuild_generation, state, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?, ?)")
+            .bind(&revision_id).bind(&package_base).bind(previous.get::<String,_>("aur_commit"))
+            .bind(previous.get::<Option<String>,_>("vcs_commit")).bind(previous.get::<String,_>("upstream_version"))
+            .bind(&input_sha256).bind(previous.get::<String,_>("audit_policy_version"))
+            .bind(previous.get::<String,_>("provider_selection_sha256")).bind(rebuild_generation).bind(&metadata_json).bind(now)
+            .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("INSERT INTO revision_dependencies(revision_id, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json) SELECT ?, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json FROM revision_dependencies WHERE revision_id = ?")
+            .bind(&revision_id).bind(previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        create_audit_pre_scan(&mut transaction, &revision_id, &snapshot).await?;
+        sqlx::query("INSERT INTO release_batch_revisions(batch_id, revision_id, build_order) VALUES (?, ?, ?)")
+            .bind(&batch_id).bind(&revision_id).bind(i64::try_from(index).map_err(ApiError::internal)?)
+            .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
+    if enqueue_fetch_jobs(&mut transaction, &batch_id).await? {
+        sqlx::query("UPDATE release_batches SET state = 'fetching', updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(&batch_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    append_event_in_transaction(
+        &mut transaction,
+        "release_batch",
+        &batch_id,
+        "official_dependency_rebuild_batch_created",
+        json!({"changed_packages": changed}),
+        actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Some(batch_id))
 }
 
 pub async fn list_subscriptions(
@@ -1615,7 +1743,7 @@ async fn upsert_implicit_node(
         .map_err(ApiError::internal)?;
     supersede_other_revisions(transaction, snapshot, &provider_selection_sha256).await?;
     let revision_id: String = sqlx::query_scalar(
-        "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ?",
+        "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ? ORDER BY rebuild_generation DESC LIMIT 1",
     )
     .bind(&snapshot.package_base)
     .bind(&snapshot.aur_commit)
@@ -1924,6 +2052,96 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(direct, 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_batch_derives_new_revision_and_returns_to_fetch_pipeline() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let first = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        let first_revision = first["revision_id"].as_str().unwrap().to_owned();
+        let batch_id =
+            schedule_rebuild_batch(&database, BTreeSet::from(["demo".into()]), "scheduler")
+                .await
+                .unwrap()
+                .unwrap();
+        let batches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_batches")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(batches, 2);
+        let state: String = sqlx::query_scalar("SELECT state FROM release_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(state, "awaiting_profile");
+        let revisions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, aur_commit FROM revisions WHERE package_base = 'demo' ORDER BY rowid",
+        )
+        .fetch_all(&database)
+        .await
+        .unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].0, first_revision);
+        assert_eq!(revisions[0].1, revisions[1].1);
+        let new_pre_scan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_pre_scans WHERE revision_id = ? AND state = 'ready_for_fetch'")
+            .bind(&revisions[1].0).fetch_one(&database).await.unwrap();
+        assert_eq!(new_pre_scan, 1);
+    }
+
+    #[tokio::test]
+    async fn published_pkgrel_increments_when_upstream_version_does_not_change() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let first = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE revisions SET state = 'built', published_version = '1.0-1' WHERE id = ?",
+        )
+        .bind(first["revision_id"].as_str().unwrap())
+        .execute(&database)
+        .await
+        .unwrap();
+        let mut changed = snapshot();
+        changed.aur_commit = "c".repeat(40);
+        let second = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &changed,
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        let mut transaction = database.begin().await.unwrap();
+        let version = derive_published_version(
+            &mut transaction,
+            second["revision_id"].as_str().unwrap(),
+            "demo",
+            "1.0-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(version.published_pkgrel(), "1.1");
+        assert_eq!(version.display(), "1.0-1.1");
+        transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]

@@ -63,6 +63,10 @@ Controller 在写数据库前遍历最多 64 个 AUR pkgbase 的依赖闭包。�
 
 Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包同名会被拒绝；周期检查发现已有订阅进入官方仓库时，会暂停后续 AUR 更新、保留当前私有版本，并生成迁移告警和独立事件。
 
+Controller 每六小时读取当前 Release 中 Artifact 构建时记录的官方依赖名称、版本和包摘要，再通过 Publisher 查询当前官方版本。版本变化只生成“建议重建”，明确不把版本比较描述成 ABI 兼容性证明；建议默认积累七天后合并为一个 ReleaseBatch，也可按包立即调度或关闭。重建覆盖受影响包及其反向依赖闭包，每个节点派生新的不可变 Revision，重新进入 Fetch、Source Manifest、三 Agent 审计和无网 Build 流程，绝不复用旧官方依赖快照。
+
+每个 Build Job 在 Controller 签名的 JobSpec 中固定发布 `pkgrel`。某个完整上游版本第一次构建保留原 `pkgrel`；相同上游版本再次构建时，按历史成功产物派生 `.1`、`.2` 等单调递增后缀。Guest Agent 只改写 VM 内复制出的 PKGBUILD 工作副本，要求它恰好有一个可确定的顶层 `pkgrel=` 赋值；原始 AUR 快照不变。Controller 收到 BuildResult 后核对所有 split output 的 `.PKGINFO` 版本都与授权值一致，之后才把 `published_version` 写入 Revision。
+
 每次成功刷新还会把上一份 package/revision 元数据与新快照比较。维护者变化、进入或离开 orphan 状态，以及规范化后的 source 域名集合变化分别写入 append-only 包事件；source 名称别名、本地补丁和 URL 大小写不会制造域名变化。AUR RPC 已找不到原 pkgbase 时，系统只报告“可能已删除、重命名或合并”，使用稳定告警 fingerprint 并保留当前 Release，不在缺少 AUR 合并证据时猜测具体目标。包详情 UI 同时展示 Revision、split outputs、依赖解析和这些生命周期事件。
 
 ## 发布安全

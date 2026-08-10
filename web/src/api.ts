@@ -92,6 +92,14 @@ export type PackageDetail = {
   dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
   events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
 };
+export type RebuildRecommendation = {
+  package_base: string;
+  state: "suggested" | "disabled" | "scheduled" | "resolved";
+  reason: string;
+  changes: Array<{ dependency: string; built_with: string; current: string }>;
+  detected_at: string;
+  updated_at: string;
+};
 export type Audit = {
   sha256: string;
   revision_id: string;
@@ -278,6 +286,11 @@ export const api = {
     ),
   packageDetail: (packageBase: string) =>
     request<PackageDetail>(`/api/v1/packages/${encodeURIComponent(packageBase)}`),
+  rebuildRecommendations: () => request<{ items: RebuildRecommendation[] }>("/api/v1/rebuild-recommendations"),
+  disableRebuildRecommendation: (packageBase: string) =>
+    request<{ package_base: string; state: string }>(`/api/v1/rebuild-recommendations/${encodeURIComponent(packageBase)}/disable`, { method: "POST" }),
+  scheduleRebuildRecommendation: (packageBase: string) =>
+    request<{ package_base: string; state: string; batch_id: string }>(`/api/v1/rebuild-recommendations/${encodeURIComponent(packageBase)}/schedule`, { method: "POST" }),
   refreshPackage: (packageBase: string) =>
     request<{ package_base: string; batch_id: string | null; batch_state: string }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/refresh`,
