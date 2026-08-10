@@ -31,3 +31,22 @@
 - 验证：对最终 `release-manifest.json.sig` 实际执行 `gpg --verify`，签名有效，测试指纹为 `2AB6 48B7 402E 9526 9411 4A92 BCD2 FD6F 30E9 C801`。
 - 边界：尚未覆盖 Publisher 从 Builder 拉取 Artifact、公开 hot set 切换、客户端 pacman 安装或生产 GPG 指纹引导。
 - 清理：Signer 进程已停止；包含临时测试私钥、GPG home、inbox 和 signed Release 的目录已整体移动到回收站，可恢复。
+
+## 2026-08-10：Builder 受限 rsync 导出
+
+- 部署：使用 Builder Compose 启动真实 Worker 与永久降权 SSH sidecar，SSH 端口只绑定回环地址；Worker Journal 报告实例 UUID `35fe7758-e306-4fcb-ba68-ecefbeed397c`。
+- 授权：固定测试 Controller 密钥签发十分钟有效的 TransferCapability，绑定源 Worker、随机目标 Worker、Job、Attempt 和单个 KVM 构建包的路径、大小、SHA-256。
+- 导出：Builder 从 completed Attempt 重新读取并验证 Artifact，只把授权文件复制到 `/jobs/transfers/e2f9e278-e34e-4d40-bd53-f1e7c5fcc61e`。
+- SSH：通过真实 OpenSSH forced command 执行 rsync sender；任意 Shell 仍被拒绝，rsync 只能读取上述 Capability 目录。
+- 结果：接收文件与原 KVM Artifact 的 SHA-256 均为 `744859e3eceb7675962040dc91150b1cef219936e1ad4a11bec5d630119ee24b`。
+- 边界：本条验证了 Builder export 与真实 SSH/rsync sender；Publisher 自动拉取另见下一条。尚未验证 Controller 调度器跨两端自动推进整个状态机。
+- 清理：测试 Compose 的容器、网络和全部卷已经删除；客户端/host SSH 密钥及接收目录已移动到回收站。
+
+## 2026-08-10：Publisher 能力绑定拉取
+
+- 部署：Builder 使用 Compose 中的 Worker 与永久降权 SSH sidecar，Publisher 使用真实 Worker daemon；两端实例 UUID 分别为 `619c4763-1aba-49c4-a0a4-638b2e2f4326` 和 `845d862c-6e4e-473a-b7f2-f817feabde20`。
+- 授权：TransferCapability `9108d8ad-7931-4398-a405-7eceae3e35fa` 同时绑定 Builder、Publisher、Build Job、Attempt generation、writer epoch 和唯一 Artifact 的路径、大小及 SHA-256。Builder 静态 SSH 地址由 Publisher 配置按源实例 UUID 解析，不接受 Capability 自带网络地址。
+- 传输：Publisher 以固定 argv 启动 rsync，启用 `partial` 与 `delay-updates`；自定义远程 Shell 只接受固定 rsync sender 形态，OpenSSH 再由 Builder forced command 对 Capability 目录二次授权。
+- 接管：文件先进入 `.9108d8ad-7931-4398-a405-7eceae3e35fa.partial`，完整核对文件集合、普通文件类型、大小和摘要后才原子改名到 landing 目录。Worker 返回 `IMPORT_VERIFIED`，文件 SHA-256 为 `744859e3eceb7675962040dc91150b1cef219936e1ad4a11bec5d630119ee24b`，与原 KVM Artifact 一致。
+- 实际发现并修复：rsync 3.4.4 调用自定义远程 Shell 时使用 `-l 用户 主机` 参数形态；包装器最初安全失败关闭，随后改为显式识别该形态并继续严格拒绝未知远端命令。
+- 边界：尚未覆盖 Controller 定时调度实际签发 Capability，也未覆盖 Publisher 调用 Signer、公开 hot set 原子切换和 Archiver Receipt。

@@ -17,6 +17,10 @@ services:
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
       AURSMITH_AUR_BASE_URL: ${AURSMITH_AUR_BASE_URL:-https://aur.archlinux.org/}
+      AURSMITH_TRANSFER_ENDPOINTS_JSON: ${AURSMITH_TRANSFER_ENDPOINTS_JSON:?必须配置 Builder ID 到 SSH 端点的静态映射}
+      AURSMITH_TRANSFER_SSH_IDENTITY_FILE: /run/secrets/builder_pull_key
+      AURSMITH_TRANSFER_SSH_KNOWN_HOSTS_FILE: /run/secrets/builder_known_hosts
+      AURSMITH_WRITER_EPOCH: ${AURSMITH_WRITER_EPOCH:-0}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
       - worker-run:/run/aursmith
@@ -26,6 +30,9 @@ services:
       - publisher-hot:/repository
       - signer-inbox:/signer-inbox
       - signer-output:/signer-output:ro
+    secrets:
+      - builder_pull_key
+      - builder_known_hosts
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks: [control, egress]
@@ -116,6 +123,10 @@ secrets:
     file: ${AURSMITH_AUTHORIZED_KEYS_FILE:-./secrets/authorized_keys}
   repository_gpg_private_key:
     file: ${AURSMITH_GPG_PRIVATE_KEY_FILE:-./secrets/repository_gpg_private_key.asc}
+  builder_pull_key:
+    file: ${AURSMITH_BUILDER_PULL_KEY_FILE:-./secrets/builder_pull_key}
+  builder_known_hosts:
+    file: ${AURSMITH_BUILDER_KNOWN_HOSTS_FILE:-./secrets/builder_known_hosts}
 
 volumes:
   worker-run:

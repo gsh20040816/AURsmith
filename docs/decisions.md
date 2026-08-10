@@ -21,6 +21,7 @@
 - ADR-017：首个可运行的 Fetch/Build 接力以 ReleaseBatch 为单位固定 Builder 亲和性。Build Job 引用已验证的 Fetch Attempt 和 Source Manifest，不允许重新下载。跨 Builder 接力必须等待受签名 `TransferCapability` 约束的 rsync 路径完成，不能用共享可写卷或临时联网代替。
 - ADR-018：官方依赖只允许 Fetch Guest 通过 pacman 和固定代理下载，并进入 Source Manifest；批次内 AUR 依赖只允许来自较早的成功 Build Attempt。Build Guest 在无网状态使用 pacman 安装两类包，禁止把 AUR 依赖固化进 Profile 或在构建失败后临时放开网络。
 - ADR-019：Signer 使用独立断网容器和私有 tmpfs GPG home。Publisher 只能写入 inbox、只读 signed 输出，Signer 不挂载公开仓库；它必须自行验证 ReleaseAuthorization、Artifact Manifest 和 `.PKGINFO`，并用官方 repo-add 从完整包集合创建数据库。
+- ADR-020：Worker UUID 由本地 Journal 首次生成并持久化，Controller 注册必须以远端报告值为准，不能在两端各自生成不相关 ID。Artifact 传输采用源端最小 export 目录、固定 rsync sender forced command 和目标端 partial+摘要复验；Publisher 的 Builder 端点来自静态 UUID 映射，不增加服务发现或自研传输协议。
 
 ## 已拒绝
 

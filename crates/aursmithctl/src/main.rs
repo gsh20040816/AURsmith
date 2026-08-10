@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     env,
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::{
@@ -20,6 +21,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "aursmithctl", version, about = "AURsmith 容器内运维工具")]
@@ -67,6 +69,11 @@ enum Command {
         #[arg(long, default_value = "base")]
         name: String,
     },
+    /// 仅供 Publisher 的 rsync 固定 remote-shell 使用。
+    RsyncSsh {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -80,6 +87,8 @@ enum WorkerCommand {
     AurProviders { names: Vec<String> },
     OfficialInfo { names: Vec<String> },
     AurSnapshot { package_base: String },
+    AuthorizeExport { envelope_file: PathBuf },
+    AuthorizeImport { envelope_file: PathBuf },
 }
 
 #[tokio::main]
@@ -114,6 +123,16 @@ async fn main() -> anyhow::Result<()> {
                 WorkerCommand::AurSnapshot { package_base } => {
                     json!({"command": "aur_snapshot", "package_base": package_base})
                 }
+                WorkerCommand::AuthorizeExport { envelope_file } => {
+                    let bytes = tokio::fs::read(&envelope_file).await?;
+                    let envelope: Value = serde_json::from_slice(&bytes)?;
+                    json!({"command": "authorize_export", "envelope": envelope})
+                }
+                WorkerCommand::AuthorizeImport { envelope_file } => {
+                    let bytes = tokio::fs::read(&envelope_file).await?;
+                    let envelope: Value = serde_json::from_slice(&bytes)?;
+                    json!({"command": "authorize_import", "envelope": envelope})
+                }
             };
             let response = worker_request(&socket, request).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
@@ -140,8 +159,100 @@ async fn main() -> anyhow::Result<()> {
             output,
             name,
         } => export_profile(&source, &output, &name)?,
+        Command::RsyncSsh { arguments } => rsync_ssh(arguments)?,
     }
     Ok(())
+}
+
+fn rsync_ssh(arguments: Vec<OsString>) -> anyhow::Result<()> {
+    if arguments.len() < 3 {
+        bail!("rsync ssh 参数不足");
+    }
+    let command_offset = arguments
+        .iter()
+        .position(|value| value == "rsync")
+        .context("rsync ssh 缺少远端 rsync 命令")?;
+    let remote_parts = &arguments[..command_offset];
+    let remote = if remote_parts.len() == 3 && remote_parts[0] == "-l" {
+        format!(
+            "{}@{}",
+            remote_parts[1].to_string_lossy(),
+            remote_parts[2].to_string_lossy()
+        )
+    } else if remote_parts.len() == 2 && !remote_parts[0].to_string_lossy().contains('@') {
+        format!(
+            "{}@{}",
+            remote_parts[0].to_string_lossy(),
+            remote_parts[1].to_string_lossy()
+        )
+    } else if remote_parts.len() == 1 {
+        remote_parts[0].to_string_lossy().into_owned()
+    } else {
+        bail!("rsync ssh 远端参数形态无效：{arguments:?}");
+    };
+    if remote.is_empty()
+        || !remote
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || "@._:-[]".contains(value))
+    {
+        bail!("rsync ssh 远端无效");
+    }
+    let remote_command = arguments[command_offset..]
+        .iter()
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>();
+    let option_cluster = remote_command.get(3).map(|value| value.as_ref());
+    let path_offset = if remote_command.get(4).map(|value| value.as_ref()) == Some("--numeric-ids")
+    {
+        5
+    } else {
+        4
+    };
+    let transfer_path = remote_command
+        .get(path_offset + 1)
+        .map(|value| value.as_ref());
+    let capability_id = transfer_path
+        .and_then(|value| value.strip_prefix("/jobs/transfers/"))
+        .and_then(|value| value.strip_suffix('/'));
+    let allowed_cluster = matches!(
+        option_cluster,
+        Some("-logDtpre.iLsfxCIvu") | Some("-logDtpre.LsfxCIvu")
+    );
+    if remote_command.first().map(|value| value.as_ref()) != Some("rsync")
+        || remote_command.get(1).map(|value| value.as_ref()) != Some("--server")
+        || remote_command.get(2).map(|value| value.as_ref()) != Some("--sender")
+        || !allowed_cluster
+        || remote_command.get(path_offset).map(|value| value.as_ref()) != Some(".")
+        || remote_command.len() != path_offset + 2
+        || capability_id
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_none()
+    {
+        bail!("rsync ssh 远端命令未被允许：{remote_command:?}");
+    }
+    let identity = env::var("AURSMITH_RSYNC_SSH_IDENTITY_FILE")?;
+    let known_hosts = env::var("AURSMITH_RSYNC_SSH_KNOWN_HOSTS_FILE")?;
+    let port = env::var("AURSMITH_RSYNC_SSH_PORT")?
+        .parse::<u16>()
+        .context("rsync SSH 端口无效")?;
+    let error = ProcessCommand::new("/usr/bin/ssh")
+        .arg("-T")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-i")
+        .arg(identity)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={known_hosts}"))
+        .arg(&remote)
+        .args(&arguments[command_offset..])
+        .exec();
+    Err(error).context("无法启动固定 rsync SSH")
 }
 
 fn export_profile(source: &Path, output: &Path, name: &str) -> anyhow::Result<()> {
@@ -291,6 +402,9 @@ fn generate_controller_key() -> anyhow::Result<()> {
 async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
     let original = env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
     let parts: Vec<_> = original.split_ascii_whitespace().collect();
+    if parts.first() == Some(&"rsync") {
+        return rsync_sender_gateway(socket, &parts).await;
+    }
     let request = match parts.as_slice() {
         ["status"] => json!({"command": "status"}),
         ["drain"] => json!({"command": "drain"}),
@@ -311,6 +425,20 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         ["aur-providers"] => read_limited_json_command("aur_providers").await?,
         ["official-info"] => read_limited_json_command("official_info").await?,
         ["aur-snapshot"] => read_limited_json_command("aur_snapshot").await?,
+        ["authorize-export"] | ["authorize-import"] => {
+            let mut bytes = Vec::new();
+            tokio::io::stdin()
+                .take(4 * 1024 * 1024)
+                .read_to_end(&mut bytes)
+                .await
+                .context("读取 TransferCapability Envelope 失败")?;
+            let envelope: Value = serde_json::from_slice(&bytes)
+                .context("TransferCapability Envelope 不是有效 JSON")?;
+            json!({
+                "command": if parts[0] == "authorize-export" { "authorize_export" } else { "authorize_import" },
+                "envelope": envelope
+            })
+        }
         _ => bail!("SSH 命令未被允许"),
     };
     let response = worker_request(socket, request).await?;
@@ -319,6 +447,67 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         bail!("Worker 返回失败");
     }
     Ok(())
+}
+
+async fn rsync_sender_gateway(socket: &PathBuf, parts: &[&str]) -> anyhow::Result<()> {
+    let valid_shape = matches!(
+        parts,
+        [
+            "rsync",
+            "--server",
+            "--sender",
+            "-logDtpre.iLsfxCIvu",
+            "--numeric-ids",
+            ".",
+            _
+        ] | [
+            "rsync",
+            "--server",
+            "--sender",
+            "-logDtpre.iLsfxCIvu",
+            ".",
+            _
+        ] | [
+            "rsync",
+            "--server",
+            "--sender",
+            "-logDtpre.LsfxCIvu",
+            "--numeric-ids",
+            ".",
+            _
+        ] | [
+            "rsync",
+            "--server",
+            "--sender",
+            "-logDtpre.LsfxCIvu",
+            ".",
+            _
+        ]
+    );
+    if !valid_shape {
+        bail!("rsync 参数未被允许");
+    }
+    let requested = parts.last().context("rsync 缺少导出路径")?;
+    let normalized = requested.trim_end_matches('/');
+    let prefix = "/jobs/transfers/";
+    let capability_id = normalized
+        .strip_prefix(prefix)
+        .filter(|value| uuid_like(value))
+        .context("rsync 导出路径未绑定 Capability")?;
+    let response = worker_request(
+        socket,
+        json!({"command": "resolve_export", "capability_id": capability_id}),
+    )
+    .await?;
+    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false)
+        || response["data"]["directory"].as_str() != Some(normalized)
+    {
+        bail!("Worker 未授权该 rsync 导出");
+    }
+    let error = ProcessCommand::new("/usr/bin/rsync")
+        .args(&parts[1..])
+        .exec();
+    Err(error).context("无法启动受限 rsync sender")
 }
 
 async fn read_limited_json_command(command: &str) -> anyhow::Result<Value> {

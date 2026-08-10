@@ -5,6 +5,7 @@ set -euo pipefail
 export KVM_GID="${KVM_GID:-996}"
 export AURSMITH_CONTROLLER_VERIFYING_KEY_HEX="${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_FETCH_PROXY="${AURSMITH_FETCH_PROXY:-192.0.2.10:8080}"
+export AURSMITH_TRANSFER_ENDPOINTS_JSON="${AURSMITH_TRANSFER_ENDPOINTS_JSON:-{\"00000000-0000-0000-0000-000000000001\":\"ssh://aursmith@192.0.2.10:2222\"}}"
 
 for stack in controller builder publisher archiver; do
   json="$(docker compose -f "deploy/${stack}/compose.yaml" config --format json)"
@@ -40,6 +41,16 @@ done < <(rg '^FROM ' deploy/images)
 builder_json="$(docker compose -f deploy/builder/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.devices[]? | select(.source == "/dev/kvm")] | length' <<<"${builder_json}")" != "1" ]]; then
   echo "Builder 必须且只能显式获得 /dev/kvm 构建设备" >&2
+  exit 1
+fi
+
+publisher_json="$(docker compose -f deploy/publisher/compose.yaml config --format json)"
+if [[ "$(jq '[.services.signer | select(.network_mode == "none")] | length' <<<"${publisher_json}")" != "1" ]]; then
+  echo "Signer 必须完全断网" >&2
+  exit 1
+fi
+if jq -e '.services.signer.volumes[]? | select(.target == "/repository")' <<<"${publisher_json}" >/dev/null; then
+  echo "Signer 禁止挂载公开仓库" >&2
   exit 1
 fi
 

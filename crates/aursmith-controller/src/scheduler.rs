@@ -59,12 +59,136 @@ pub fn spawn(state: AppState) {
             if let Err(error) = reconcile_one(&state).await {
                 tracing::warn!(%error, "不确定任务对账失败");
             }
+            if let Err(error) = dispatch_transfer_one(&state).await {
+                tracing::warn!(%error, "Artifact 传输调度失败");
+            }
         }
     });
 }
 
+async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
+    sqlx::query("UPDATE transfer_capabilities SET state = 'expired', updated_at = ? WHERE state IN ('issued', 'export_ready') AND expires_at <= ?")
+        .bind(Utc::now()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+    let pending = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.state, transfer_capabilities.envelope_json, transfer_capabilities.attempt_count, source.endpoint AS source_endpoint, destination.endpoint AS destination_endpoint FROM transfer_capabilities JOIN workers AS source ON source.id = transfer_capabilities.source_worker_id JOIN workers AS destination ON destination.id = transfer_capabilities.destination_worker_id WHERE transfer_capabilities.state IN ('issued', 'export_ready') AND transfer_capabilities.expires_at > ? ORDER BY transfer_capabilities.updated_at LIMIT 1")
+        .bind(Utc::now()).fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = pending {
+        let id: String = row.get("id");
+        let transfer_state: String = row.get("state");
+        let envelope: SignedEnvelope =
+            serde_json::from_str(row.get("envelope_json")).map_err(ApiError::internal)?;
+        let result = if transfer_state == "issued" {
+            transport::authorize_export(&state.config, row.get("source_endpoint"), &envelope)
+                .await
+                .map(|_| "export_ready")
+        } else {
+            transport::authorize_import(&state.config, row.get("destination_endpoint"), &envelope)
+                .await
+                .map(|_| "verified")
+        };
+        match result {
+            Ok(next_state) => {
+                sqlx::query("UPDATE transfer_capabilities SET state = ?, last_error = NULL, updated_at = ? WHERE id = ?")
+                    .bind(next_state).bind(Utc::now()).bind(&id).execute(&state.database).await.map_err(ApiError::internal)?;
+            }
+            Err(error) => {
+                let attempts: i64 = row.get("attempt_count");
+                sqlx::query("UPDATE transfer_capabilities SET state = CASE WHEN attempt_count + 1 >= 3 THEN 'failed' ELSE state END, attempt_count = attempt_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
+                    .bind(error.to_string()).bind(Utc::now()).bind(&id).execute(&state.database).await.map_err(ApiError::internal)?;
+                if attempts + 1 >= 3 {
+                    sqlx::query("UPDATE release_batches SET state = 'transfer_failed', failure_reason = ?, updated_at = ? WHERE id = (SELECT batch_id FROM transfer_capabilities WHERE id = ?)")
+                        .bind(error.to_string()).bind(Utc::now()).bind(&id).execute(&state.database).await.map_err(ApiError::internal)?;
+                    let fingerprint = format!("artifact-transfer-failed:{id}");
+                    sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
+                        .bind(Uuid::new_v4().to_string()).bind(fingerprint).bind("Artifact 传输失败")
+                        .bind(json!({"transfer_capability_id": id, "error": error.to_string()}).to_string())
+                        .bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let candidate = sqlx::query("SELECT jobs.id AS job_id, jobs.batch_id, jobs.worker_id AS source_worker_id, workers.endpoint AS source_endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id WHERE jobs.kind = 'build' AND jobs.status = 'succeeded' AND jobs.batch_id IN (SELECT id FROM release_batches WHERE state = 'ready_to_publish') AND NOT EXISTS (SELECT 1 FROM transfer_capabilities WHERE transfer_capabilities.source_job_id = jobs.id AND transfer_capabilities.state IN ('issued', 'export_ready', 'verified')) ORDER BY jobs.updated_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = candidate {
+        let publisher = sqlx::query("SELECT id, writer_epoch FROM workers WHERE role = 'publisher' AND state = 'online' ORDER BY name LIMIT 1")
+            .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+        let Some(publisher) = publisher else {
+            return Ok(());
+        };
+        let job_id: String = row.get("job_id");
+        let attempt = sqlx::query("SELECT id, generation FROM attempts WHERE job_id = ? AND status = 'succeeded' ORDER BY generation DESC LIMIT 1")
+            .bind(&job_id).fetch_one(&state.database).await.map_err(ApiError::internal)?;
+        let artifacts =
+            sqlx::query("SELECT path, sha256, size FROM artifacts WHERE job_id = ? ORDER BY path")
+                .bind(&job_id)
+                .fetch_all(&state.database)
+                .await
+                .map_err(ApiError::internal)?;
+        if artifacts.is_empty() {
+            return Err(ApiError::conflict(
+                "ARTIFACTS_MISSING",
+                "成功 Build Job 没有 Artifact 记录",
+            ));
+        }
+        let files = artifacts
+            .into_iter()
+            .map(|artifact| aursmith_protocol::ManifestEntry {
+                path: artifact.get("path"),
+                sha256: artifact.get("sha256"),
+                size: u64::try_from(artifact.get::<i64, _>("size")).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        let transfer_id = Uuid::new_v4();
+        let now = Utc::now();
+        let expires_at = now + Duration::hours(1);
+        let capability = aursmith_protocol::TransferCapability {
+            id: transfer_id,
+            source_worker: Uuid::parse_str(row.get("source_worker_id"))
+                .map_err(ApiError::internal)?,
+            destination_worker: Uuid::parse_str(publisher.get("id")).map_err(ApiError::internal)?,
+            attempt: Some(AttemptRef {
+                job_id: Uuid::parse_str(&job_id).map_err(ApiError::internal)?,
+                attempt_id: Uuid::parse_str(attempt.get("id")).map_err(ApiError::internal)?,
+                generation: u32::try_from(attempt.get::<i64, _>("generation"))
+                    .map_err(ApiError::internal)?,
+            }),
+            writer_epoch: u64::try_from(publisher.get::<i64, _>("writer_epoch"))
+                .map_err(ApiError::internal)?,
+            files,
+            expires_at,
+        };
+        let envelope = SignedEnvelope::sign(
+            "aursmith.transfer_capability",
+            &capability,
+            &state.signing_key,
+        )
+        .map_err(ApiError::internal)?;
+        sqlx::query("INSERT INTO transfer_capabilities(id, batch_id, source_job_id, source_worker_id, destination_worker_id, state, envelope_json, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'issued', ?, ?, ?, ?)")
+            .bind(transfer_id.to_string()).bind(row.get::<String,_>("batch_id")).bind(&job_id)
+            .bind(row.get::<String,_>("source_worker_id")).bind(publisher.get::<String,_>("id"))
+            .bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+            .bind(expires_at).bind(now).bind(now).execute(&state.database).await.map_err(ApiError::internal)?;
+        return Ok(());
+    }
+
+    let batches: Vec<String> = sqlx::query_scalar("SELECT id FROM release_batches WHERE state = 'ready_to_publish' AND EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = release_batches.id AND jobs.kind = 'build') AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = release_batches.id AND jobs.kind = 'build' AND NOT EXISTS (SELECT 1 FROM transfer_capabilities WHERE transfer_capabilities.source_job_id = jobs.id AND transfer_capabilities.state = 'verified'))")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    for batch_id in batches {
+        sqlx::query(
+            "UPDATE release_batches SET state = 'artifacts_ready', updated_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now())
+        .bind(batch_id)
+        .execute(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
 pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, ApiError> {
-    let row = sqlx::query("SELECT endpoint, role FROM workers WHERE id = ?")
+    let row = sqlx::query("SELECT endpoint, role, writer_epoch FROM workers WHERE id = ?")
         .bind(worker_id)
         .fetch_optional(&state.database)
         .await
@@ -75,9 +199,15 @@ pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, A
         Ok(reply) => {
             let protocol = reply.data["protocol_major"].as_u64().unwrap_or_default();
             let remote_role = reply.data["role"].as_str().unwrap_or_default();
+            let remote_id = reply.data["instance_id"].as_str().unwrap_or_default();
             let expected_role: String = row.get("role");
-            let new_state = if protocol != u64::from(aursmith_protocol::PROTOCOL_MAJOR)
+            let expected_writer_epoch: i64 = row.get("writer_epoch");
+            let writer_epoch_mismatch = expected_role == "publisher"
+                && reply.data["writer_epoch"].as_u64() != u64::try_from(expected_writer_epoch).ok();
+            let new_state = if remote_id != worker_id
+                || protocol != u64::from(aursmith_protocol::PROTOCOL_MAJOR)
                 || remote_role != expected_role
+                || writer_epoch_mismatch
             {
                 "incompatible"
             } else {

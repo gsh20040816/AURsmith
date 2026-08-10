@@ -1,4 +1,4 @@
-use crate::{auth, config::Config, error::ApiError};
+use crate::{auth, config::Config, error::ApiError, transport};
 use aursmith_domain::{REQUIREMENTS, WorkerRole, WorkerState};
 use aursmith_protocol::{InlineInput, JobKind, ManifestEntry, ResourceLimits};
 use axum::{
@@ -305,7 +305,22 @@ async fn register_worker(
         ));
     }
     let role = role_name(request.role);
-    let id = Uuid::new_v4().to_string();
+    let remote = transport::status(&state.config, request.endpoint.trim()).await?;
+    let id = remote.data["instance_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| ApiError::conflict("WORKER_ID_MISSING", "Worker 没有报告有效实例 ID"))?
+        .to_string();
+    if remote.data["name"].as_str() != Some(request.name.trim())
+        || remote.data["role"].as_str() != Some(role)
+        || remote.data["protocol_major"].as_u64() != Some(u64::from(request.protocol_version))
+        || (role == "publisher" && remote.data["writer_epoch"].as_u64() != Some(0))
+    {
+        return Err(ApiError::conflict(
+            "WORKER_IDENTITY_MISMATCH",
+            "Worker 报告的名称、角色或协议与注册请求不一致",
+        ));
+    }
     let now = Utc::now();
     let labels_json = serde_json::to_string(&request.labels).map_err(ApiError::internal)?;
     sqlx::query(
