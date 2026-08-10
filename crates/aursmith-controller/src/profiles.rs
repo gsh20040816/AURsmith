@@ -36,12 +36,20 @@ pub async fn authorize(
             .map_err(ApiError::internal)?;
     let envelope_json = serde_json::to_string(&envelope).map_err(ApiError::internal)?;
     let id = Uuid::new_v4().to_string();
+    let job_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("INSERT INTO build_profiles(id, name, architecture, runner, manifest_sha256, state, package_manifest_json, envelope_json, created_at) VALUES (?, ?, 'x86_64', 'kvm', ?, 'candidate', ?, ?, ?)")
         .bind(&id).bind(request.name.trim()).bind(&request.spec.profile_sha256)
         .bind(serde_json::to_string(&request.spec.installed_packages).map_err(ApiError::internal)?)
-        .bind(&envelope_json).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
-    crate::routes::append_event(
-        &state.database,
+        .bind(&envelope_json).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, 'builder', 'queued', 100, ?, 'profile_fixture', ?, ?, ?, '[]', '[]', ?, ?, ?)")
+        .bind(&job_id).bind(&request.spec.profile_sha256).bind(&request.spec.profile_sha256)
+        .bind("0".repeat(64)).bind("0".repeat(64))
+        .bind(r#"{"cpu_count":1,"memory_mib":1024,"disk_mib":4096,"timeout_seconds":300}"#)
+        .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    crate::routes::append_event_in_transaction(
+        &mut transaction,
         "build_profile",
         &id,
         "profile_authorized",
@@ -49,10 +57,11 @@ pub async fn authorize(
         &actor,
     )
     .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
     Ok((
         StatusCode::CREATED,
         Json(
-            json!({"id": id, "profile_sha256": request.spec.profile_sha256, "envelope": envelope}),
+            json!({"id": id, "profile_sha256": request.spec.profile_sha256, "fixture_job_id": job_id, "envelope": envelope}),
         ),
     ))
 }

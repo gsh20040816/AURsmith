@@ -476,22 +476,24 @@ async fn apply_snapshot(
     recalculate_reference_counts(&mut transaction).await?;
 
     let graph = load_dependency_graph(&mut transaction).await?;
-    let batch_packages: BTreeSet<&str> = dependency_closure
-        .nodes
-        .iter()
-        .map(|node| node.snapshot.package_base.as_str())
-        .chain(std::iter::once(snapshot.package_base.as_str()))
-        .collect();
+    let changed = BTreeSet::from([snapshot.package_base.clone()]);
+    let batch_packages = graph
+        .affected_release_closure(&changed)
+        .map_err(ApiError::internal)?;
+    let batch_graph = graph
+        .induced_subgraph(&batch_packages)
+        .map_err(ApiError::internal)?;
     let blocked_rows = sqlx::query("SELECT revisions.package_base FROM audit_bundles JOIN revisions ON revisions.id = audit_bundles.revision_id WHERE audit_bundles.state = 'blocked' AND revisions.state != 'superseded'")
         .fetch_all(&mut *transaction).await.map_err(ApiError::internal)?;
     let batch_has_blocker = blocked_rows
         .iter()
-        .any(|row| batch_packages.contains(row.get::<String, _>("package_base").as_str()));
+        .any(|row| batch_packages.contains(&row.get::<String, _>("package_base")));
     let (batch_id, batch_state) = if idempotent_revision {
         (None, "unchanged")
     } else {
         let batch_id = Uuid::new_v4().to_string();
-        let (batch_state, failure_reason) = match graph.topological_order() {
+        let build_order = batch_graph.topological_order();
+        let (batch_state, failure_reason) = match &build_order {
             _ if batch_has_blocker => (
                 "blocked_deterministically",
                 Some("一个或多个 Revision 被确定性审计规则阻断".to_owned()),
@@ -508,13 +510,22 @@ async fn apply_snapshot(
         )
         .bind(&batch_id)
         .bind(batch_state)
-        .bind(serde_json::to_string(&graph).map_err(ApiError::internal)?)
+        .bind(serde_json::to_string(&batch_graph).map_err(ApiError::internal)?)
         .bind(&failure_reason)
         .bind(now)
         .bind(now)
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
+        if let Ok(build_order) = build_order {
+            for (index, package_base) in build_order.into_iter().enumerate() {
+                let member_revision: String = sqlx::query_scalar("SELECT id FROM revisions WHERE package_base = ? AND state != 'superseded' ORDER BY created_at DESC LIMIT 1")
+                    .bind(&package_base).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
+                sqlx::query("INSERT INTO release_batch_revisions(batch_id, revision_id, build_order) VALUES (?, ?, ?)")
+                    .bind(&batch_id).bind(member_revision).bind(i64::try_from(index).map_err(ApiError::internal)?)
+                    .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+            }
+        }
         (Some(batch_id), batch_state)
     };
     append_event_in_transaction(
@@ -1535,7 +1546,36 @@ mod tests {
         assert_eq!(first["batch_state"], "awaiting_provider_selection");
 
         let selected = DependencyClosure {
-            nodes: vec![],
+            nodes: vec![SnapshotNode {
+                package: UpstreamPackage {
+                    name: "provider-a".into(),
+                    package_base: "provider-a".into(),
+                    version: "1.0-1".into(),
+                    description: None,
+                    maintainer: Some("tester".into()),
+                    out_of_date: None,
+                    last_modified: 1,
+                    depends: vec![],
+                    make_depends: vec![],
+                    check_depends: vec![],
+                    opt_depends: vec![],
+                    provides: vec!["virtual-api".into()],
+                },
+                snapshot: UpstreamSnapshot {
+                    package_base: "provider-a".into(),
+                    aur_commit: "d".repeat(40),
+                    vcs_commit: None,
+                    version: "1.0-1".into(),
+                    outputs: vec!["provider-a".into()],
+                    dependencies: vec![],
+                    optional_dependencies: vec![],
+                    provides: vec!["virtual-api".into()],
+                    architectures: vec!["x86_64".into()],
+                    sources: vec![],
+                    srcinfo: "pkgbase = provider-a".into(),
+                    files: vec![],
+                },
+            }],
             resolutions: BTreeMap::from([("virtual-api".into(), "provider-a".into())]),
             provider_candidates: BTreeMap::new(),
         };

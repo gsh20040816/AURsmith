@@ -30,6 +30,12 @@ pub struct ManifestEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineInput {
+    pub entry: ManifestEntry,
+    pub content_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSpec {
     pub job_id: Uuid,
     pub attempt: AttemptRef,
@@ -41,6 +47,8 @@ pub struct JobSpec {
     pub dependency_snapshot_sha256: Option<String>,
     pub profile_sha256: Option<String>,
     pub inputs: Vec<ManifestEntry>,
+    #[serde(default)]
+    pub inline_inputs: Vec<InlineInput>,
     pub limits: ResourceLimits,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -201,6 +209,7 @@ mod tests {
             dependency_snapshot_sha256: None,
             profile_sha256: None,
             inputs: Vec::new(),
+            inline_inputs: Vec::new(),
             limits: ResourceLimits {
                 cpu_count: 1,
                 memory_mib: 1024,

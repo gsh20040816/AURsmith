@@ -1,6 +1,6 @@
 use crate::{auth, config::Config, error::ApiError};
 use aursmith_domain::{REQUIREMENTS, WorkerRole, WorkerState};
-use aursmith_protocol::ResourceLimits;
+use aursmith_protocol::{InlineInput, JobKind, ManifestEntry, ResourceLimits};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -414,6 +415,15 @@ struct CreateJobRequest {
     required_role: WorkerRole,
     revision_sha256: String,
     #[serde(default)]
+    kind: JobKind,
+    profile_sha256: Option<String>,
+    source_manifest_sha256: Option<String>,
+    dependency_snapshot_sha256: Option<String>,
+    #[serde(default)]
+    inputs: Vec<ManifestEntry>,
+    #[serde(default)]
+    inline_inputs: Vec<InlineInput>,
+    #[serde(default)]
     required_labels: Vec<String>,
     limits: Option<ResourceLimits>,
     #[serde(default)]
@@ -437,6 +447,82 @@ async fn create_job(
             "revision_sha256 必须是 64 位十六进制 SHA-256",
         ));
     }
+    for (name, digest) in [
+        ("profile_sha256", request.profile_sha256.as_deref()),
+        (
+            "source_manifest_sha256",
+            request.source_manifest_sha256.as_deref(),
+        ),
+        (
+            "dependency_snapshot_sha256",
+            request.dependency_snapshot_sha256.as_deref(),
+        ),
+    ] {
+        if let Some(digest) = digest
+            && (digest.len() != 64 || !digest.chars().all(|value| value.is_ascii_hexdigit()))
+        {
+            return Err(ApiError::bad_request(
+                "INVALID_JOB_DIGEST",
+                format!("{name} 必须是 SHA-256"),
+            ));
+        }
+    }
+    if request.inputs.len() > 4096 {
+        return Err(ApiError::bad_request(
+            "TOO_MANY_INPUTS",
+            "Job 输入文件不能超过 4096 个",
+        ));
+    }
+    if request.inline_inputs.len() > 256 {
+        return Err(ApiError::bad_request(
+            "TOO_MANY_INLINE_INPUTS",
+            "Job 内联输入文件不能超过 256 个",
+        ));
+    }
+    let declared_inline_size = request
+        .inline_inputs
+        .iter()
+        .try_fold(0_u64, |total, input| total.checked_add(input.entry.size))
+        .ok_or_else(|| ApiError::bad_request("INLINE_INPUT_TOO_LARGE", "Job 内联输入大小溢出"))?;
+    if declared_inline_size > 4 * 1024 * 1024 {
+        return Err(ApiError::bad_request(
+            "INLINE_INPUT_TOO_LARGE",
+            "Job 内联输入总大小不能超过 4 MiB",
+        ));
+    }
+    for input in &request.inputs {
+        aursmith_protocol::validate_relative_path(&input.path)
+            .map_err(|error| ApiError::bad_request("INVALID_INPUT_PATH", error.to_string()))?;
+    }
+    for input in &request.inline_inputs {
+        aursmith_protocol::validate_relative_path(&input.entry.path)
+            .map_err(|error| ApiError::bad_request("INVALID_INPUT_PATH", error.to_string()))?;
+        if input.entry.path == ".aursmith" || input.entry.path.starts_with(".aursmith/") {
+            return Err(ApiError::bad_request(
+                "RESERVED_INPUT_PATH",
+                ".aursmith 是 Worker 控制目录，不能作为 Job 输入",
+            ));
+        }
+        let content = STANDARD.decode(&input.content_base64).map_err(|_| {
+            ApiError::bad_request("INVALID_INLINE_INPUT", "内联输入不是合法 Base64")
+        })?;
+        if content.len() as u64 != input.entry.size
+            || hex::encode(Sha256::digest(&content)) != input.entry.sha256
+        {
+            return Err(ApiError::bad_request(
+                "INVALID_INLINE_INPUT",
+                "内联输入内容与 Manifest 摘要不一致",
+            ));
+        }
+    }
+    if matches!(request.kind, JobKind::Build | JobKind::ProfileFixture)
+        && request.profile_sha256.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "PROFILE_REQUIRED",
+            "Build Job 必须固定 Profile",
+        ));
+    }
     let limits = request.limits.unwrap_or(ResourceLimits {
         cpu_count: 1,
         memory_mib: 1024,
@@ -456,12 +542,18 @@ async fn create_job(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(role_name(request.required_role))
     .bind(request.priority)
     .bind(request.revision_sha256.to_ascii_lowercase())
+    .bind(job_kind_name(request.kind))
+    .bind(request.profile_sha256)
+    .bind(request.source_manifest_sha256)
+    .bind(request.dependency_snapshot_sha256)
+    .bind(serde_json::to_string(&request.inputs).map_err(ApiError::internal)?)
+    .bind(serde_json::to_string(&request.inline_inputs).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&request.required_labels).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&limits).map_err(ApiError::internal)?)
     .bind(now)
@@ -519,6 +611,14 @@ fn role_name(role: WorkerRole) -> &'static str {
         WorkerRole::Builder => "builder",
         WorkerRole::Publisher => "publisher",
         WorkerRole::Archiver => "archiver",
+    }
+}
+
+fn job_kind_name(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Fetch => "fetch",
+        JobKind::Build => "build",
+        JobKind::ProfileFixture => "profile_fixture",
     }
 }
 

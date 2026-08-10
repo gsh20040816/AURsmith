@@ -71,6 +71,27 @@ impl DependencyGraph {
         }
     }
 
+    pub fn induced_subgraph(&self, nodes: &BTreeSet<String>) -> Result<Self, GraphError> {
+        if let Some(missing) = nodes
+            .iter()
+            .find(|node| !self.dependencies.contains_key(*node))
+        {
+            return Err(GraphError::UnknownPackage(missing.clone()));
+        }
+        let dependencies = nodes
+            .iter()
+            .map(|node| {
+                let selected = self.dependencies[node]
+                    .iter()
+                    .filter(|dependency| nodes.contains(*dependency))
+                    .cloned()
+                    .collect();
+                (node.clone(), selected)
+            })
+            .collect();
+        Ok(Self { dependencies })
+    }
+
     /// 返回发生变化的节点、它们的全部反向依赖，以及把这些受影响节点作为
     /// 一个发布批次重建时需要的全部依赖。
     pub fn affected_release_closure(
@@ -157,6 +178,20 @@ mod tests {
                 "library".to_owned(),
                 "toolchain-addon".to_owned(),
             ])
+        );
+    }
+
+    #[test]
+    fn induced_subgraph_drops_unrelated_nodes_without_losing_required_edges() {
+        let selected = BTreeSet::from([
+            "app".to_owned(),
+            "library".to_owned(),
+            "toolchain-addon".to_owned(),
+        ]);
+        let subgraph = graph().induced_subgraph(&selected).unwrap();
+        assert_eq!(
+            subgraph.topological_order().unwrap(),
+            vec!["toolchain-addon", "library", "app"]
         );
     }
 }

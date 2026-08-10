@@ -337,6 +337,7 @@ async fn status(worker: &Worker) -> WorkerResponse {
                 "role": role_name(worker.role),
                 "state": state,
                 "protocol_major": PROTOCOL_MAJOR,
+                "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
                 "time": Utc::now(),
             }),
         ),
@@ -381,7 +382,6 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
     if !matches!(state.as_deref(), Ok("online")) {
         return WorkerResponse::error("WORKER_DRAINING", "Worker 当前不接收新任务");
     }
-
     let envelope_sha256 = hex::encode(Sha256::digest(&envelope.payload));
     let spec_json = match serde_json::to_string(&envelope) {
         Ok(value) => value,
@@ -421,6 +421,18 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
         }
     }
 
+    if !spec.inline_inputs.is_empty() {
+        let Some(builder) = &worker.builder else {
+            return WorkerResponse::error(
+                "INLINE_INPUT_UNSUPPORTED",
+                "只有 Builder 可以接收内联构建输入",
+            );
+        };
+        if let Err(error) = builder.materialize_inline_inputs(&spec) {
+            return WorkerResponse::error("INVALID_INLINE_INPUT", error.to_string());
+        }
+    }
+
     let inserted = sqlx::query(
         "INSERT INTO attempts(job_id, attempt_id, generation, envelope_sha256, status, received_at, spec_json) VALUES (?, ?, ?, ?, 'queued', ?, ?)",
     )
@@ -442,7 +454,17 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
                 "status": status_name(JobStatus::Queued),
             }),
         ),
-        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+        Err(error) => {
+            if let Some(builder) = &worker.builder {
+                let _ = std::fs::remove_dir_all(
+                    builder
+                        .jobs_dir()
+                        .join("staging")
+                        .join(spec.attempt.attempt_id.to_string()),
+                );
+            }
+            WorkerResponse::error("JOURNAL_ERROR", error.to_string())
+        }
     }
 }
 

@@ -2,6 +2,7 @@ use anyhow::{Context, bail};
 use aursmith_protocol::{
     BuildProfileSpec, GuestResult, JobKind, JobSpec, ManifestEntry, SignedEnvelope,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
@@ -27,6 +28,78 @@ impl BuilderRuntime {
             jobs_dir,
             fetch_proxy,
         }
+    }
+
+    pub fn available_profiles(&self) -> Vec<String> {
+        let mut profiles = fs::read_dir(&self.profiles_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.len() == 64 && name.chars().all(|value| value.is_ascii_hexdigit()))
+            .collect::<Vec<_>>();
+        profiles.sort();
+        profiles
+    }
+
+    pub fn jobs_dir(&self) -> &Path {
+        &self.jobs_dir
+    }
+
+    pub fn materialize_inline_inputs(&self, spec: &JobSpec) -> anyhow::Result<()> {
+        const MAX_FILE_COUNT: usize = 256;
+        const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024;
+        if spec.inline_inputs.len() > MAX_FILE_COUNT {
+            bail!("TOO_MANY_INLINE_INPUTS");
+        }
+        let total_size = spec.inline_inputs.iter().try_fold(0_u64, |total, input| {
+            total
+                .checked_add(input.entry.size)
+                .context("INLINE_INPUT_TOO_LARGE")
+        })?;
+        if total_size > MAX_TOTAL_SIZE {
+            bail!("INLINE_INPUT_TOO_LARGE");
+        }
+
+        let staging = self
+            .jobs_dir
+            .join("staging")
+            .join(spec.attempt.attempt_id.to_string());
+        fs::create_dir_all(self.jobs_dir.join("staging"))?;
+        fs::create_dir(&staging).context("STAGING_ALREADY_EXISTS")?;
+        let input_root = staging.join("input");
+        fs::create_dir(&input_root)?;
+        let materialized = (|| -> anyhow::Result<()> {
+            for input in &spec.inline_inputs {
+                aursmith_protocol::validate_relative_path(&input.entry.path)?;
+                if input.entry.path == ".aursmith" || input.entry.path.starts_with(".aursmith/") {
+                    bail!("INPUT_RESERVED_PATH:{}", input.entry.path);
+                }
+                let bytes = STANDARD
+                    .decode(&input.content_base64)
+                    .context("INLINE_INPUT_INVALID_BASE64")?;
+                if bytes.len() as u64 != input.entry.size
+                    || hex::encode(Sha256::digest(&bytes)) != input.entry.sha256
+                {
+                    bail!("INLINE_INPUT_DIGEST_MISMATCH:{}", input.entry.path);
+                }
+                let path = input_root.join(&input.entry.path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                use std::io::Write;
+                options.open(path)?.write_all(&bytes)?;
+            }
+            verify_inputs(&input_root, &spec.inputs)
+        })();
+        if materialized.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        materialized
     }
 }
 
@@ -591,6 +664,7 @@ mod tests {
             dependency_snapshot_sha256: None,
             profile_sha256: Some("a".repeat(64)),
             inputs: vec![],
+            inline_inputs: vec![],
             limits: ResourceLimits {
                 cpu_count: 2,
                 memory_mib: 1024,
@@ -643,6 +717,52 @@ mod tests {
             .collect();
         assert!(args.iter().any(|value| value.as_ref() == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:192.0.2.10:8080"));
         assert!(!args.windows(2).any(|pair| pair == ["-nic", "none"]));
+    }
+
+    #[test]
+    fn inline_inputs_are_verified_before_materialization() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime =
+            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let mut spec = job(JobKind::Fetch);
+        let content = b"pkgname=aursmith-fixture\n";
+        let manifest = entry("snapshot/PKGBUILD", content);
+        spec.inputs.push(manifest.clone());
+        spec.inline_inputs.push(aursmith_protocol::InlineInput {
+            entry: manifest,
+            content_base64: STANDARD.encode(content),
+        });
+
+        runtime.materialize_inline_inputs(&spec).unwrap();
+        let path = runtime
+            .jobs_dir
+            .join("staging")
+            .join(spec.attempt.attempt_id.to_string())
+            .join("input/snapshot/PKGBUILD");
+        assert_eq!(fs::read(path).unwrap(), content);
+    }
+
+    #[test]
+    fn invalid_inline_input_is_removed_without_partial_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime =
+            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let mut spec = job(JobKind::Fetch);
+        spec.inputs.push(entry("PKGBUILD", b"trusted"));
+        spec.inline_inputs.push(aursmith_protocol::InlineInput {
+            entry: entry("PKGBUILD", b"trusted"),
+            content_base64: STANDARD.encode(b"tampered"),
+        });
+
+        let error = runtime.materialize_inline_inputs(&spec).unwrap_err();
+        assert!(error.to_string().contains("INLINE_INPUT_DIGEST_MISMATCH"));
+        assert!(
+            !runtime
+                .jobs_dir
+                .join("staging")
+                .join(spec.attempt.attempt_id.to_string())
+                .exists()
+        );
     }
 
     #[test]

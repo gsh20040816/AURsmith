@@ -81,6 +81,7 @@ impl RunningWorker {
             dependency_snapshot_sha256: None,
             profile_sha256: None,
             inputs: Vec::new(),
+            inline_inputs: Vec::new(),
             limits: ResourceLimits {
                 cpu_count: 1,
                 memory_mib: 1024,
@@ -148,6 +149,7 @@ async fn worker_rejects_self_signed_untrusted_controller() {
         dependency_snapshot_sha256: None,
         profile_sha256: None,
         inputs: Vec::new(),
+        inline_inputs: Vec::new(),
         limits: ResourceLimits {
             cpu_count: 1,
             memory_mib: 1024,
