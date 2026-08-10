@@ -60,6 +60,11 @@ enum WorkerCommand {
     Drain,
     Query { job_id: String },
     Submit { envelope_file: PathBuf },
+    AurSearch { query: String },
+    AurInfo { names: Vec<String> },
+    AurProviders { names: Vec<String> },
+    OfficialInfo { names: Vec<String> },
+    AurSnapshot { package_base: String },
 }
 
 #[tokio::main]
@@ -78,6 +83,21 @@ async fn main() -> anyhow::Result<()> {
                     let envelope: Value =
                         serde_json::from_slice(&bytes).context("Envelope 文件不是有效 JSON")?;
                     json!({"command": "submit", "envelope": envelope})
+                }
+                WorkerCommand::AurSearch { query } => {
+                    json!({"command": "aur_search", "query": query})
+                }
+                WorkerCommand::AurInfo { names } => {
+                    json!({"command": "aur_info", "names": names})
+                }
+                WorkerCommand::AurProviders { names } => {
+                    json!({"command": "aur_providers", "names": names})
+                }
+                WorkerCommand::OfficialInfo { names } => {
+                    json!({"command": "official_info", "names": names})
+                }
+                WorkerCommand::AurSnapshot { package_base } => {
+                    json!({"command": "aur_snapshot", "package_base": package_base})
                 }
             };
             let response = worker_request(&socket, request).await?;
@@ -201,6 +221,11 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
                 serde_json::from_slice(&bytes).context("JobSpec Envelope 不是有效 JSON")?;
             json!({"command": "submit", "envelope": envelope})
         }
+        ["aur-search"] => read_limited_json_command("aur_search").await?,
+        ["aur-info"] => read_limited_json_command("aur_info").await?,
+        ["aur-providers"] => read_limited_json_command("aur_providers").await?,
+        ["official-info"] => read_limited_json_command("official_info").await?,
+        ["aur-snapshot"] => read_limited_json_command("aur_snapshot").await?,
         _ => bail!("SSH 命令未被允许"),
     };
     let response = worker_request(socket, request).await?;
@@ -209,6 +234,21 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         bail!("Worker 返回失败");
     }
     Ok(())
+}
+
+async fn read_limited_json_command(command: &str) -> anyhow::Result<Value> {
+    let mut bytes = Vec::new();
+    tokio::io::stdin()
+        .take(1024 * 1024)
+        .read_to_end(&mut bytes)
+        .await
+        .context("读取上游请求失败")?;
+    let mut request: Value = serde_json::from_slice(&bytes).context("上游请求不是有效 JSON")?;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("上游请求必须是 JSON 对象"))?;
+    object.insert("command".into(), Value::String(command.into()));
+    Ok(request)
 }
 
 fn uuid_like(value: &str) -> bool {

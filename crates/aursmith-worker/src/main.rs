@@ -1,3 +1,5 @@
+mod aur;
+
 use anyhow::{Context, bail};
 use aursmith_domain::{JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{JobSpec, PROTOCOL_MAJOR, SignedEnvelope};
@@ -37,6 +39,12 @@ struct Cli {
     database: String,
     #[arg(long, env = "AURSMITH_CONTROLLER_VERIFYING_KEY_HEX")]
     controller_verifying_key_hex: String,
+    #[arg(
+        long,
+        env = "AURSMITH_AUR_BASE_URL",
+        default_value = "https://aur.archlinux.org/"
+    )]
+    aur_base_url: String,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -62,6 +70,7 @@ struct Worker {
     role: WorkerRole,
     database: SqlitePool,
     trusted_controller_key: Vec<u8>,
+    aur: aur::AurClient,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +80,11 @@ enum WorkerCommand {
     Drain,
     Submit { envelope: SignedEnvelope },
     Query { job_id: String },
+    AurSearch { query: String },
+    AurInfo { names: Vec<String> },
+    AurProviders { names: Vec<String> },
+    OfficialInfo { names: Vec<String> },
+    AurSnapshot { package_base: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -114,11 +128,13 @@ async fn main() -> anyhow::Result<()> {
         bail!("Controller verifying key 必须是 32 字节 Ed25519 公钥");
     }
     let database = connect(&cli.database).await?;
+    let aur = aur::AurClient::new(&cli.aur_base_url)?;
     let worker = Arc::new(Worker {
         name: cli.name,
         role: cli.role.into(),
         database,
         trusted_controller_key,
+        aur,
     });
     prepare_socket(&cli.socket).await?;
     let listener = UnixListener::bind(&cli.socket)
@@ -198,6 +214,79 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         WorkerCommand::Drain => drain(worker).await,
         WorkerCommand::Submit { envelope } => submit(worker, envelope).await,
         WorkerCommand::Query { job_id } => query(worker, &job_id).await,
+        WorkerCommand::AurSearch { query } => aur_search(worker, &query).await,
+        WorkerCommand::AurInfo { names } => aur_info(worker, &names).await,
+        WorkerCommand::AurProviders { names } => aur_providers(worker, &names).await,
+        WorkerCommand::OfficialInfo { names } => official_info(worker, &names).await,
+        WorkerCommand::AurSnapshot { package_base } => aur_snapshot(worker, &package_base).await,
+    }
+}
+
+async fn aur_search(worker: &Worker, query: &str) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以访问 AUR");
+    }
+    match worker.aur.search(query).await {
+        Ok(packages) => WorkerResponse::ok("AUR_SEARCH", serde_json::json!({"items": packages})),
+        Err(error) => WorkerResponse::error("AUR_UPSTREAM_ERROR", error.to_string()),
+    }
+}
+
+async fn aur_info(worker: &Worker, names: &[String]) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以访问 AUR");
+    }
+    match worker.aur.info(names).await {
+        Ok(packages) => WorkerResponse::ok("AUR_INFO", serde_json::json!({"items": packages})),
+        Err(error) => WorkerResponse::error("AUR_UPSTREAM_ERROR", error.to_string()),
+    }
+}
+
+async fn aur_providers(worker: &Worker, names: &[String]) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以访问 AUR");
+    }
+    if names.is_empty() || names.len() > 50 {
+        return WorkerResponse::error("INVALID_REQUEST", "每次只能查询 1 至 50 个 Provider");
+    }
+    let mut items = serde_json::Map::new();
+    for name in names {
+        match worker.aur.providers(name).await {
+            Ok(packages) => {
+                items.insert(name.clone(), serde_json::json!(packages));
+            }
+            Err(error) => return WorkerResponse::error("AUR_UPSTREAM_ERROR", error.to_string()),
+        }
+    }
+    WorkerResponse::ok("AUR_PROVIDERS", serde_json::Value::Object(items))
+}
+
+async fn official_info(worker: &Worker, names: &[String]) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以访问官方仓库元数据");
+    }
+    if names.is_empty() || names.len() > 50 {
+        return WorkerResponse::error("INVALID_REQUEST", "每次只能查询 1 至 50 个官方包名");
+    }
+    let mut items = serde_json::Map::new();
+    for name in names {
+        match worker.aur.official(name).await {
+            Ok(packages) => {
+                items.insert(name.clone(), serde_json::json!(packages));
+            }
+            Err(error) => return WorkerResponse::error("ARCH_UPSTREAM_ERROR", error.to_string()),
+        }
+    }
+    WorkerResponse::ok("OFFICIAL_INFO", serde_json::Value::Object(items))
+}
+
+async fn aur_snapshot(worker: &Worker, package_base: &str) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以访问 AUR");
+    }
+    match worker.aur.snapshot(package_base).await {
+        Ok(snapshot) => WorkerResponse::ok("AUR_SNAPSHOT", serde_json::json!(snapshot)),
+        Err(error) => WorkerResponse::error("AUR_UPSTREAM_ERROR", error.to_string()),
     }
 }
 

@@ -51,6 +51,43 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
+        .route("/api/v1/aur/search", get(crate::packages::search))
+        .route(
+            "/api/v1/subscriptions",
+            get(crate::packages::list_subscriptions).post(crate::packages::subscribe),
+        )
+        .route(
+            "/api/v1/subscriptions/{package_base}/pause",
+            post(crate::packages::pause),
+        )
+        .route(
+            "/api/v1/subscriptions/{package_base}/resume",
+            post(crate::packages::resume),
+        )
+        .route(
+            "/api/v1/subscriptions/{package_base}/unsubscribe",
+            post(crate::packages::unsubscribe),
+        )
+        .route(
+            "/api/v1/subscriptions/{package_base}/purge",
+            post(crate::packages::purge),
+        )
+        .route(
+            "/api/v1/packages/{package_base}",
+            get(crate::packages::package_detail),
+        )
+        .route(
+            "/api/v1/packages/{package_base}/refresh",
+            post(crate::packages::refresh_package),
+        )
+        .route(
+            "/api/v1/packages/{package_base}/providers/{dependency_name}",
+            post(crate::packages::select_provider),
+        )
+        .route(
+            "/api/v1/release-batches",
+            get(crate::packages::list_batches),
+        )
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -506,7 +543,7 @@ async fn append_event(
     Ok(())
 }
 
-async fn append_event_in_transaction(
+pub(crate) async fn append_event_in_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     aggregate_type: &str,
     aggregate_id: &str,

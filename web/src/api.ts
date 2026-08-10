@@ -53,6 +53,33 @@ export type Job = {
   created_at: string;
   updated_at: string;
 };
+export type AurPackage = {
+  name: string;
+  package_base: string;
+  version: string;
+  description: string | null;
+  maintainer: string | null;
+  out_of_date: number | null;
+  last_modified: number;
+  depends: string[];
+  make_depends: string[];
+  check_depends: string[];
+  opt_depends: string[];
+  provides: string[];
+};
+export type Subscription = {
+  id: string;
+  package_base: string;
+  kind: "direct" | "implicit";
+  state: "active" | "paused" | "retained_without_references";
+  reference_count: number;
+  followed_outputs: string[];
+  version: string | null;
+  description: string | null;
+  outputs: string[];
+  maintainer: string | null;
+  out_of_date: number | null;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -70,6 +97,34 @@ export const api = {
   requirements: () => request<{ items: Requirement[] }>("/api/v1/requirements"),
   workers: () => request<{ items: Worker[] }>("/api/v1/workers"),
   jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
+  searchAur: (query: string) =>
+    request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
+  subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
+  subscribe: (packageName: string) =>
+    request<{ package_base: string; revision_id: string; batch_id: string | null; batch_state: string }>(
+      "/api/v1/subscriptions",
+      { method: "POST", body: JSON.stringify({ package_name: packageName }) }
+    ),
+  pauseSubscription: (packageBase: string) =>
+    request<{ package_base: string; state: string }>(
+      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/pause`,
+      { method: "POST" }
+    ),
+  resumeSubscription: (packageBase: string) =>
+    request<{ package_base: string; state: string }>(
+      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/resume`,
+      { method: "POST" }
+    ),
+  unsubscribe: (packageBase: string) =>
+    request<{ package_base: string; direct_subscription: boolean }>(
+      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/unsubscribe`,
+      { method: "POST" }
+    ),
+  refreshPackage: (packageBase: string) =>
+    request<{ package_base: string; batch_id: string | null; batch_state: string }>(
+      `/api/v1/packages/${encodeURIComponent(packageBase)}/refresh`,
+      { method: "POST" }
+    ),
   probeWorker: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/workers/${id}/probe`, {
       method: "POST"

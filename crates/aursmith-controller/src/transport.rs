@@ -31,6 +31,56 @@ pub async fn submit(
     invoke(config, endpoint, "submit", Some(body)).await
 }
 
+pub async fn aur_search(
+    config: &Config,
+    endpoint: &str,
+    query: &str,
+) -> Result<WorkerReply, ApiError> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({"query": query})).map_err(ApiError::internal)?;
+    invoke(config, endpoint, "aur-search", Some(body)).await
+}
+
+pub async fn aur_info(
+    config: &Config,
+    endpoint: &str,
+    names: &[String],
+) -> Result<WorkerReply, ApiError> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({"names": names})).map_err(ApiError::internal)?;
+    invoke(config, endpoint, "aur-info", Some(body)).await
+}
+
+pub async fn aur_snapshot(
+    config: &Config,
+    endpoint: &str,
+    package_base: &str,
+) -> Result<WorkerReply, ApiError> {
+    let body = serde_json::to_vec(&serde_json::json!({"package_base": package_base}))
+        .map_err(ApiError::internal)?;
+    invoke(config, endpoint, "aur-snapshot", Some(body)).await
+}
+
+pub async fn aur_providers(
+    config: &Config,
+    endpoint: &str,
+    names: &[String],
+) -> Result<WorkerReply, ApiError> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({"names": names})).map_err(ApiError::internal)?;
+    invoke(config, endpoint, "aur-providers", Some(body)).await
+}
+
+pub async fn official_info(
+    config: &Config,
+    endpoint: &str,
+    names: &[String],
+) -> Result<WorkerReply, ApiError> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({"names": names})).map_err(ApiError::internal)?;
+    invoke(config, endpoint, "official-info", Some(body)).await
+}
+
 async fn invoke(
     config: &Config,
     endpoint: &str,

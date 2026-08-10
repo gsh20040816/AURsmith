@@ -87,6 +87,24 @@ td { padding: 14px 12px; border-bottom: 1px solid var(--line); font-size: .84rem
 .secondary-button, .primary-button { border: 1px solid var(--ink); padding: 10px 16px; background: transparent; color: var(--ink); }
 .primary-button { width: 100%; margin-top: 9px; background: var(--ink); color: white; }
 .primary-button:hover { background: #2b3933; }
+.primary-button:disabled, .secondary-button:disabled { cursor: wait; opacity: .52; }
+.search-panel { margin-top: 30px; background: var(--ink); color: white; padding: 25px 27px; }
+.package-search { display: grid; gap: 9px; }
+.package-search label { color: #abb6b0; font-size: .72rem; letter-spacing: .1em; }
+.package-search > div { display: grid; grid-template-columns: 1fr auto; }
+.package-search input { min-width: 0; border: 1px solid #56635c; border-right: 0; background: #222d28; color: white; padding: 12px 14px; border-radius: 0; }
+.package-search .primary-button { width: auto; margin: 0; border-color: var(--heat); background: var(--heat); }
+.search-results { margin-top: 22px; border-top: 1px solid #445049; }
+.search-result { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 24px; padding: 18px 0; border-bottom: 1px solid #3c4741; }
+.search-result p { color: #c1c9c4; margin: 7px 0; font-size: .84rem; }
+.search-result small { color: #89968f; }
+.search-result .secondary-button { color: white; border-color: #6f7b75; }
+.package-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.package-title strong { font-family: "Noto Serif SC", serif; font-size: 1.1rem; }
+.package-title code { color: #e69679; }
+.package-title span { color: #89968f; font-size: .7rem; }
+.cell-note { display: block; max-width: 320px; color: var(--steel); margin-top: 5px; line-height: 1.45; }
+.text-button.danger { color: #9a4935; }
 
 .notice { padding: 12px 14px; margin: 16px 0; border-left: 3px solid var(--arc); background: rgba(36,101,154,.08); font-size: .85rem; }
 .notice.error { border-color: var(--heat); background: rgba(212,91,50,.08); color: #823820; }
@@ -135,6 +153,7 @@ td { padding: 14px 12px; border-bottom: 1px solid var(--line); font-size: .84rem
   .forge-stage { grid-template-columns: 17px 1fr; justify-items: start; text-align: left; }
   .auth-intro .forge-rail { display: none; }
   .auth-form { padding: 35px 20px; }
+  .search-result { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }

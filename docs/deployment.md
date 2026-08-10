@@ -22,6 +22,10 @@ Controller 使用严格的 `known_hosts`，不能配置 `StrictHostKeyChecking=n
 
 Worker 账户的 `/bin/sh` 只用于 OpenSSH 按其协议执行服务端 forced command；客户端提交的原始命令不会交给该 shell。`ForceCommand` 会无条件替换请求，`aursmithctl ssh-gateway` 再按固定语法白名单解析，且 PTY、转发、密码登录和交互会话均被禁用。
 
+Publisher 的 `AURSMITH_AUR_BASE_URL` 默认固定为 `https://aur.archlinux.org/`。AUR 搜索、info、Provider 查询和 Git 快照均从 Publisher 发起；Controller Stack 不需要 AUR 外网出口。第一版单次订阅最多展开 64 个 AUR pkgbase，超过上限会明确失败并保持数据库不变。
+
+开发机具备外网时，可以运行 `scripts/smoke-upstream.sh` 验证真实 AUR 搜索、普通包快照、Git VCS commit 固定和 Arch 官方包查询。该脚本使用临时 SQLite、Unix Socket 和 Publisher 进程，结束时清理全部临时状态，不接触生产配置。
+
 Compose 的本地文件型 secret 不支持可靠设置容器内 `uid/gid/mode`。AURsmith 不依赖该行为：SSH 容器只在启动器复制 secret 时短暂使用 root，并且仅增加 `DAC_READ_SEARCH`、`CHOWN`、`SETGID`、`SETUID` 以及清空 capability 集合所需的 `SETPCAP`。启动器先校验 secret 是有界的普通文件，再以 `0600`、禁止覆盖的方式复制到 tmpfs、变更为服务 UID，随后通过 `setpriv` 清空 capability bounding/inheritable/ambient 集合、永久降权并以 `exec` 启动非 root sshd。Controller 也只把 SSH 客户端私钥物化到自己的私有 tmpfs。原始 secret 始终为只读挂载，容器重启后私有副本自动消失。
 
 Compose file-backed secret 以 UID/GID `10001`、模式 `0400` 挂载。部署前使用 `docker compose config` 检查实际渲染结果，不要把 `deploy/*/secrets` 加入 Git。

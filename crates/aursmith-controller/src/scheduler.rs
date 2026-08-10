@@ -20,6 +20,19 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+    let upstream_state = state.clone();
+    tokio::spawn(async move {
+        let initial_jitter = 300 + u64::from(std::process::id() % 600);
+        tokio::time::sleep(std::time::Duration::from_secs(initial_jitter)).await;
+        let mut timer = interval(std::time::Duration::from_secs(60));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = crate::packages::refresh_due(&upstream_state).await {
+                tracing::warn!(%error, "AUR 到期订阅轮询失败");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);

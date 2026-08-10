@@ -16,6 +16,7 @@ services:
       AURSMITH_WORKER_DATABASE: sqlite:///var/lib/aursmith/runtime/worker.db
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
+      AURSMITH_AUR_BASE_URL: ${AURSMITH_AUR_BASE_URL:-https://aur.archlinux.org/}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
       - worker-run:/run/aursmith

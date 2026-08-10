@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiError, Job, Requirement, Session, Worker, api } from "./api";
+import { ApiError, AurPackage, Job, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -107,7 +107,8 @@ export function App() {
         {view === "dashboard" && <Dashboard />}
         {view === "workers" && <WorkersView />}
         {view === "builds" && <BuildsView />}
-        {view !== "dashboard" && view !== "workers" && view !== "builds" && <PlannedView view={view} />}
+        {view === "packages" && <PackagesView />}
+        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && <PlannedView view={view} />}
       </main>
     </div>
   );
@@ -230,6 +231,61 @@ function BuildsView() {
   const refresh = () => void api.jobs().then((response) => setJobs(response.items)).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
   return <><header className="page-header compact"><div><p className="eyebrow">W04 / B03</p><h1>构建任务</h1><p className="lede">Controller 签发 JobSpec；Worker Journal 拒绝冲突和迟到 Attempt。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="table-panel"><div className="section-heading"><h2>任务队列</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>{jobs.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>没有构建任务</strong><p>订阅产生通过审计的 Revision 后，完整依赖闭包会显示在这里。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>任务</th><th>角色</th><th>状态</th><th>Worker</th><th>Revision</th><th>更新时间</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td><code>{job.id.slice(0, 8)}</code></td><td>{roleLabel(job.required_role)}</td><td><span className={`state ${job.status}`}>{job.failure_code ?? job.status}</span></td><td>{job.worker_name ?? "—"}</td><td><code>{job.revision_sha256?.slice(0, 12) ?? "—"}</code></td><td>{new Date(job.updated_at).toLocaleString("zh-CN")}</td></tr>)}</tbody></table></div>}</section></>;
+}
+
+function PackagesView() {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<AurPackage[]>([]);
+  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const refresh = () => void api.subscriptions().then((response) => setSubscriptions(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  const search = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    if (query.trim().length < 2) {
+      setError("搜索词至少需要 2 个字符");
+      return;
+    }
+    setBusy("search");
+    try {
+      setResults((await api.searchAur(query.trim())).items);
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy("");
+    }
+  };
+  const operate = async (key: string, action: () => Promise<unknown>) => {
+    setBusy(key);
+    setError("");
+    try {
+      await action();
+      refresh();
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy("");
+    }
+  };
+  return <>
+    <header className="page-header compact"><div><p className="eyebrow">P01 / P02 / P03 / P04</p><h1>AUR 软件包</h1><p className="lede">搜索在 Publisher 上执行；订阅会固定完整 pkgbase Git commit，并展开隐式 AUR 依赖。</p></div></header>
+    {error && <Notice kind="error">{error}</Notice>}
+    <section className="search-panel">
+      <form className="package-search" onSubmit={(event) => void search(event)}>
+        <label htmlFor="aur-query">搜索 AUR</label>
+        <div><input id="aur-query" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="例如 visual-studio-code-bin" /><button className="primary-button" disabled={busy === "search"}>{busy === "search" ? "查询中…" : "查询"}</button></div>
+      </form>
+      {results.length > 0 && <div className="search-results">{results.map((item) => {
+        const subscribed = subscriptions.some((subscription) => subscription.package_base === item.package_base && subscription.kind === "direct");
+        return <article key={item.name} className="search-result"><div><div className="package-title"><strong>{item.name}</strong><code>{item.version}</code>{item.name !== item.package_base && <span>pkgbase {item.package_base}</span>}</div><p>{item.description ?? "没有描述"}</p><small>{item.maintainer ? `维护者 ${item.maintainer}` : "孤儿包"}{item.out_of_date ? " · 已标记过期" : ""}</small></div><button className="secondary-button" disabled={subscribed || busy === item.name} onClick={() => void operate(item.name, () => api.subscribe(item.name))}>{subscribed ? "已订阅" : busy === item.name ? "解析依赖…" : "加入构建"}</button></article>;
+      })}</div>}
+    </section>
+    <section className="table-panel"><div className="section-heading"><div><p className="eyebrow">订阅账本</p><h2>直接与隐式订阅</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>
+      {subscriptions.length === 0 ? <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未订阅软件包</strong><p>先部署并注册在线 Publisher，然后从上方搜索 AUR。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>pkgbase</th><th>来源</th><th>版本 / outputs</th><th>状态</th><th>引用</th><th /></tr></thead><tbody>{subscriptions.map((subscription) => <tr key={subscription.id}><td><strong>{subscription.package_base}</strong><small className="cell-note">{subscription.description}</small></td><td>{subscription.kind === "direct" ? "用户订阅" : "隐式依赖"}</td><td><code>{subscription.version ?? "等待同步"}</code><small className="cell-note">{subscription.outputs.join(" · ") || "—"}</small></td><td><span className={`state ${subscription.state}`}>{subscription.state}</span></td><td>{subscription.reference_count}</td><td><div className="row-actions">{subscription.kind === "direct" && <button className="text-button" onClick={() => void operate(`refresh-${subscription.id}`, () => api.refreshPackage(subscription.package_base))}>检查</button>}{subscription.kind === "direct" && subscription.state === "active" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.pauseSubscription(subscription.package_base))}>暂停</button>}{subscription.kind === "direct" && subscription.state === "paused" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.resumeSubscription(subscription.package_base))}>恢复</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(subscription.id, () => api.unsubscribe(subscription.package_base))}>退订</button>}</div></td></tr>)}</tbody></table></div>}
+    </section>
+  </>;
 }
 
 function PlannedView({ view }: { view: View }) {

@@ -11,6 +11,8 @@
 - ADR-007：热点依赖进入不可变 KVM Guest Profile，不进入服务容器镜像。
 - ADR-008：AURsmith 自有代码使用 Apache-2.0 许可证。
 - ADR-009：交付全过程在 `main` 上使用 Git。每个验证通过的阶段形成独立提交，提交标题使用英文 `<type>: <message>`；Release Manifest 记录源码 commit，签名设施可用后为发布版本创建带签名的 annotated tag。
+- ADR-010：AUR RPC、AUR Git 和 `.SRCINFO` 获取只在 Publisher Worker 中执行。Controller 通过现有 OpenSSH forced command 请求小型结构化响应，不新增常驻集群协议；任何 PKGBUILD 动态求值仍留给后续隔离 Fetch VM。
+- ADR-011：官方包晋升检查使用 Arch 官方仓库 JSON 接口，由 Publisher 发起。发现晋升时暂停 AUR 自动更新而不删除当前包，用户确认客户端迁移后再清理。
 
 ## 已拒绝
 
