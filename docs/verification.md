@@ -151,3 +151,9 @@
 - Worker 页面新增名称、固定角色、SSH 端点、host key 指纹和调度标签表单；注册请求仍由 Controller 执行真实 SSH 探测并核对 Worker UUID、名称、角色、协议和身份签名公钥，不在浏览器侧伪造在线状态。
 - 包详情页对 `needs_selection` 依赖展示全部 Provider 候选。用户选择后调用既有受认证 API，重新同步依赖闭包并刷新详情，选择只绑定新 Revision，不形成永久信任。
 - 前端类型检查、两个 Vitest 用例和生产构建通过；新增用例实际进入 Worker 页面并检查注册表单的可访问标签和提交按钮。
+
+## 2026-08-10：Profile candidate Web 授权
+
+- Profile 页面新增 JSON 文件选择入口，浏览器解析 profile-builder 生成的 candidate 后调用现有授权 API；成功响应显示重新计算的 Profile 摘要并可下载 `profile-envelope.json`。
+- qcow2、内核和 initramfs 不上传 Controller，继续按摘要复制到 Builder 持久卷；这避免让控制面承担大文件传输，也保留 Builder 必须实际发现 Profile 后才能执行 fixture 的约束。
+- 前端类型检查、三个 Vitest 页面用例和生产构建通过。当前 UI 测试覆盖入口和文件控件；真实 candidate 的 API 签名与 fixture 状态机由 Controller 测试覆盖，尚未在浏览器自动化中选择本地文件。

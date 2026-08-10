@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Alert, ApiError, ArchiveCopy, ArchiveInventory, Audit, AurPackage, BuildProfile, ClientBootstrap, ControlPlaneBackup, Doctor, Job, PackageDetail, ProfileRecommendation, RebuildRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
+import { Alert, ApiError, ArchiveCopy, ArchiveInventory, Audit, AurPackage, AuthorizedProfile, BuildProfile, ClientBootstrap, ControlPlaneBackup, Doctor, Job, PackageDetail, ProfileRecommendation, RebuildRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -369,13 +369,31 @@ function ProfilesView() {
   const [recommendations, setRecommendations] = useState<ProfileRecommendation[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [authorized, setAuthorized] = useState<AuthorizedProfile | null>(null);
   const refresh = () => void Promise.all([api.profiles(), api.profileRecommendations()]).then(([profileResponse, recommendationResponse]) => { setProfiles(profileResponse.items); setRecommendations(recommendationResponse.items); }).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
   const activate = async (profile: BuildProfile) => {
     setBusy(profile.id); setError("");
     try { await api.activateProfile(profile.id); refresh(); } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
   };
-  return <><header className="page-header compact"><div><p className="eyebrow">B04</p><h1>构建 Profile</h1><p className="lede">Profile 是签名且不可变的 KVM 根文件系统；候选通过 fixture 验证后才能参与任务选择。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="table-panel"><div className="section-heading"><div><p className="eyebrow">最多四个活跃版本</p><h2>Profile 清单</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>{profiles.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>尚无已授权 Profile</strong><p>运行一次性 profile-builder，随后把 candidate 提交给 Controller 授权。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>名称</th><th>状态</th><th>摘要</th><th>包数量</th><th>验证</th><th /></tr></thead><tbody>{profiles.map((profile) => <tr key={profile.id}><td><strong>{profile.name}</strong><small className="cell-note">{profile.architecture}</small></td><td><span className={`state ${profile.state}`}>{profile.state}</span></td><td><code>{profile.profile_sha256.slice(0, 16)}</code></td><td>{profile.packages.length}</td><td>{profile.failure_reason ?? (profile.last_verified_at ? new Date(profile.last_verified_at).toLocaleString("zh-CN") : "等待 fixture")}</td><td>{profile.state !== "active" && <button className="text-button" disabled={busy === profile.id} onClick={() => void activate(profile)}>激活</button>}</td></tr>)}</tbody></table></div>}</section><section className="table-panel"><div className="section-heading"><div><p className="eyebrow">每七天评估 · 两周期加入 · 三周期移除</p><h2>官方构建依赖建议</h2></div></div>{recommendations.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>仍在观察</strong><p>前 20 次真实构建只统计，不会提前固化依赖。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>依赖</th><th>建议</th><th>最近 20 次</th><th>月使用</th><th>预计节省</th><th>连续周期</th></tr></thead><tbody>{recommendations.map((item) => <tr key={item.package_name}><td><strong>{item.package_name}</strong></td><td><span className={`state ${item.action}`}>{item.action}</span></td><td>{item.stats.uses_recent}</td><td>{item.stats.uses_this_month}</td><td>{item.stats.average_saved_seconds} 秒</td><td>热 {item.consecutive_hot_periods} / 冷 {item.consecutive_low_periods}</td></tr>)}</tbody></table></div>}</section></>;
+  const authorize = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setError(""); setBusy("authorize"); setAuthorized(null);
+    const input = event.currentTarget.elements.namedItem("candidate") as HTMLInputElement | null;
+    const file = input?.files?.[0];
+    if (!file) { setError("请选择 profile-candidate.json"); setBusy(""); return; }
+    try {
+      const candidate = JSON.parse(await file.text()) as unknown;
+      setAuthorized(await api.authorizeProfile(candidate));
+      refresh();
+    } catch (reason) { setError(reason instanceof SyntaxError ? "Profile candidate 不是有效 JSON" : messageOf(reason)); }
+    finally { setBusy(""); }
+  };
+  const downloadEnvelope = () => {
+    if (!authorized) return;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(authorized.envelope, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = "profile-envelope.json"; link.click(); URL.revokeObjectURL(url);
+  };
+  return <><header className="page-header compact"><div><p className="eyebrow">B04</p><h1>构建 Profile</h1><p className="lede">Profile 是签名且不可变的 KVM 根文件系统；候选通过 fixture 验证后才能参与任务选择。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="work-panel"><div className="section-heading"><div><p className="eyebrow">一次性 profile-builder 输出</p><h2>授权 Profile candidate</h2></div></div><form className="worker-form" onSubmit={(event) => void authorize(event)}><label>profile-candidate.json<input name="candidate" type="file" accept="application/json,.json" required /></label><button className="secondary-button" disabled={busy === "authorize"}>{busy === "authorize" ? "正在授权…" : "提交并创建 fixture"}</button></form>{authorized && <div className="notice"><strong>Profile {authorized.profile_sha256.slice(0, 16)} 已授权。</strong><p>下载 Envelope，与三个构建文件一起放入 Builder 的同摘要 Profile 目录；fixture 成功后再激活。</p><button className="text-button" onClick={downloadEnvelope}>下载 profile-envelope.json</button></div>}</section><section className="table-panel"><div className="section-heading"><div><p className="eyebrow">最多四个活跃版本</p><h2>Profile 清单</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>{profiles.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>尚无已授权 Profile</strong><p>运行一次性 profile-builder，随后在上方提交 candidate。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>名称</th><th>状态</th><th>摘要</th><th>包数量</th><th>验证</th><th /></tr></thead><tbody>{profiles.map((profile) => <tr key={profile.id}><td><strong>{profile.name}</strong><small className="cell-note">{profile.architecture}</small></td><td><span className={`state ${profile.state}`}>{profile.state}</span></td><td><code>{profile.profile_sha256.slice(0, 16)}</code></td><td>{profile.packages.length}</td><td>{profile.failure_reason ?? (profile.last_verified_at ? new Date(profile.last_verified_at).toLocaleString("zh-CN") : "等待 fixture")}</td><td>{profile.state !== "active" && <button className="text-button" disabled={busy === profile.id} onClick={() => void activate(profile)}>激活</button>}</td></tr>)}</tbody></table></div>}</section><section className="table-panel"><div className="section-heading"><div><p className="eyebrow">每七天评估 · 两周期加入 · 三周期移除</p><h2>官方构建依赖建议</h2></div></div>{recommendations.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>仍在观察</strong><p>前 20 次真实构建只统计，不会提前固化依赖。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>依赖</th><th>建议</th><th>最近 20 次</th><th>月使用</th><th>预计节省</th><th>连续周期</th></tr></thead><tbody>{recommendations.map((item) => <tr key={item.package_name}><td><strong>{item.package_name}</strong></td><td><span className={`state ${item.action}`}>{item.action}</span></td><td>{item.stats.uses_recent}</td><td>{item.stats.uses_this_month}</td><td>{item.stats.average_saved_seconds} 秒</td><td>热 {item.consecutive_hot_periods} / 冷 {item.consecutive_low_periods}</td></tr>)}</tbody></table></div>}</section></>;
 }
 
 function ReleasesView() {

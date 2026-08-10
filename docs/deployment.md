@@ -82,7 +82,7 @@ docker compose -f deploy/builder/compose.yaml --profile profile-build build prof
 docker compose -f deploy/builder/compose.yaml --profile profile-build run --rm profile-builder --name base
 ```
 
-导出卷包含 `profile-candidate.json` 以及三个固定二进制文件。管理员把 candidate 提交到 `POST /api/v1/profiles` 后，Controller 会忽略候选中自报的摘要、重新计算内容摘要并返回签名 Envelope。Envelope 和三个文件必须放入 `/profiles/<profile_sha256>/`。Profile 未通过启动、无网和固定 fixture build 前，激活 API 会返回 `PROFILE_NOT_VERIFIED`；不能用人工改数据库绕过。
+导出卷包含 `profile-candidate.json` 以及三个固定二进制文件。管理员可在 Web 的 Profile 页面选择该 JSON，也可以提交到 `POST /api/v1/profiles`；Controller 会忽略候选中自报的摘要、重新计算内容摘要并返回签名 Envelope。页面提供 `profile-envelope.json` 下载。Envelope 和三个文件必须放入 `/profiles/<profile_sha256>/`。Profile 未通过启动、无网和固定 fixture build 前，激活 API 会返回 `PROFILE_NOT_VERIFIED`；不能用人工改数据库绕过。
 
 已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`。实际生成的 base Profile 已冷启动到嵌入的 Guest Agent；在未提供 virtiofs 的负向测试中，Guest 在 0.8 秒左右明确报告输入挂载失败、执行 poweroff，QEMU 正常退出。这证明 direct-kernel、initramfs、根文件系统和 PID 1 链路可用，但不替代后续带输入的完整 fixture build 验收。
 

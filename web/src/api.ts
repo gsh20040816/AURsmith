@@ -126,6 +126,12 @@ export type BuildProfile = {
   last_verified_at: string | null;
   failure_reason: string | null;
 };
+export type AuthorizedProfile = {
+  id: string;
+  profile_sha256: string;
+  fixture_job_id: string;
+  envelope: unknown;
+};
 export type ProfileRecommendation = {
   package_name: string;
   action: string;
@@ -246,6 +252,10 @@ export const api = {
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
   profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
+  authorizeProfile: (candidate: unknown) => request<AuthorizedProfile>("/api/v1/profiles", {
+    method: "POST",
+    body: JSON.stringify(candidate)
+  }),
   profileRecommendations: () => request<{ items: ProfileRecommendation[] }>("/api/v1/profile-recommendations"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
   rollbackRelease: (id: string) => request<{
