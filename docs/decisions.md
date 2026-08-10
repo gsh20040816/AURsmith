@@ -37,6 +37,7 @@
 - ADR-033：Publisher 对不可信软件包执行独立归档检查。路径、文件类型和必需元数据属于确定性发布门禁；INSTALL、hook、服务、setuid 和内核模块只形成可追踪风险事实，不能脱离审计上下文直接判为恶意。检查报告由 Signer 纳入签名 Release Manifest，避免发布后只剩包文件而丢失 Publisher 的判断依据。
 - ADR-034：第一版先用独立、无缓存的 Squid 容器补齐 Fetch VM 的实际外网出口，只允许 80/443 并拒绝全部本地和保留目标。pacoloco 命中率、按 Revision 自动下发精确域名 ACL 属于后续优化；Build VM 无网边界不因此变化。
 - ADR-035：Arch 软件仓库镜像在不可变 Profile 构建时配置，而不是作为每个 Build Job 的可变参数。镜像必须是 HTTPS Base URL，同时写入 Guest mirrorlist 和签名 Profile 清单；Fetch Guest 用它下载官方依赖，Build Guest 继续使用已准备好的离线包。这样镜像选择可追溯，也不会破坏无网构建边界。
+- ADR-036：以 QEMU 内置 virtio-9p `mapped-xattr` 取代原计划的两个 virtiofsd 进程。真实容器验证确认当前 Rust virtiofsd 在非 root、`cap_drop: ALL` 条件下无法初始化共享目录，而官方文档也把 root 作为常规运行前提；给 Builder 增加 root 或 capability 与既定安全边界冲突。9p 输入固定只读，输出限于 Attempt 目录，Guest 仍处于 KVM 边界，Worker 对全部输出重新验证。以后若 virtiofsd 提供经过验证的无特权模式，可通过新 ADR 重新评估。
 
 ## 已拒绝
 

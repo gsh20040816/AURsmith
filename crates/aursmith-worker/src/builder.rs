@@ -342,14 +342,10 @@ async fn execute_attempt(
     .await?;
     let paths = VmPaths {
         overlay,
-        input_socket: work.join("input.sock"),
-        output_socket: work.join("output.sock"),
+        input_directory: staging.join("input"),
+        output_directory: work.join("output"),
         control_socket: work.join("control.sock"),
     };
-    let mut input_fs = start_virtiofsd(&paths.input_socket, &staging.join("input"), true).await?;
-    let mut output_fs = start_virtiofsd(&paths.output_socket, &work.join("output"), false).await?;
-    wait_for_socket(&paths.input_socket).await?;
-    wait_for_socket(&paths.output_socket).await?;
     let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.fetch_proxy)?;
     let qemu = Command::new(plan.executable)
         .args(&plan.arguments)
@@ -369,8 +365,6 @@ async fn execute_attempt(
     };
     fs::write(work.join("qemu.stdout.log"), &execution.stdout)?;
     fs::write(work.join("qemu.stderr.log"), &execution.stderr)?;
-    let _ = input_fs.kill().await;
-    let _ = output_fs.kill().await;
     if !execution.status.success() {
         let failed = runtime.jobs_dir.join("failed").join(attempt_id);
         fs::create_dir_all(&failed)?;
@@ -386,6 +380,10 @@ async fn execute_attempt(
         serde_json::from_slice(&result).context("GUEST_RESULT_INVALID")?;
     validate_guest_result(&guest_result, &spec, &work.join("output"))?;
     let digest = hex::encode(Sha256::digest(&result));
+    fs::remove_file(work.join("overlay.qcow2")).context("OVERLAY_CLEANUP_FAILED")?;
+    if work.join("control.sock").exists() {
+        fs::remove_file(work.join("control.sock")).context("CONTROL_SOCKET_CLEANUP_FAILED")?;
+    }
     let completed = runtime.jobs_dir.join("completed").join(attempt_id);
     fs::create_dir_all(runtime.jobs_dir.join("completed"))?;
     fs::rename(&work, &completed)?;
@@ -506,37 +504,6 @@ fn verify_inputs(root: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn start_virtiofsd(
-    socket: &Path,
-    shared: &Path,
-    readonly: bool,
-) -> anyhow::Result<tokio::process::Child> {
-    let mut command = Command::new("/usr/lib/virtiofsd");
-    command
-        .arg(format!("--socket-path={}", socket.display()))
-        .arg(format!("--shared-dir={}", shared.display()))
-        .arg("--sandbox=none")
-        .arg("--announce-submounts")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    if readonly {
-        command.arg("--readonly");
-    }
-    command.spawn().context("无法启动 virtiofsd")
-}
-
-async fn wait_for_socket(path: &Path) -> anyhow::Result<()> {
-    for _ in 0..100 {
-        if path.exists() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    bail!("VIRTIOFS_SOCKET_TIMEOUT")
-}
-
 async fn run_checked(
     executable: &str,
     arguments: &[OsString],
@@ -563,7 +530,6 @@ fn classify_failure(error: &anyhow::Error) -> &'static str {
         "GUEST_RESULT_INVALID",
         "GUEST_RESULT_IDENTITY_MISMATCH",
         "GUEST_RESULT_KIND_MISMATCH",
-        "VIRTIOFS_SOCKET_TIMEOUT",
     ] {
         if message.contains(code) {
             return code;
@@ -586,8 +552,8 @@ pub struct VerifiedProfile {
 
 pub struct VmPaths {
     pub overlay: PathBuf,
-    pub input_socket: PathBuf,
-    pub output_socket: PathBuf,
+    pub input_directory: PathBuf,
+    pub output_directory: PathBuf,
     pub control_socket: PathBuf,
 }
 
@@ -719,17 +685,19 @@ impl QemuPlan {
             )
             .into(),
         ]);
-        add_virtiofs(
+        add_virtio_9p(
             &mut arguments,
             "input",
-            &paths.input_socket,
+            &paths.input_directory,
             "aursmith-input",
+            true,
         );
-        add_virtiofs(
+        add_virtio_9p(
             &mut arguments,
             "output",
-            &paths.output_socket,
+            &paths.output_directory,
             "aursmith-output",
+            false,
         );
         arguments.extend([
             "-device".into(),
@@ -765,12 +733,25 @@ impl QemuPlan {
     }
 }
 
-fn add_virtiofs(arguments: &mut Vec<OsString>, id: &str, socket: &Path, tag: &str) {
+fn add_virtio_9p(
+    arguments: &mut Vec<OsString>,
+    id: &str,
+    directory: &Path,
+    tag: &str,
+    readonly: bool,
+) {
+    let mut fsdev = format!(
+        "local,id={id},path={},security_model=mapped-xattr,multidevs=remap",
+        directory.display()
+    );
+    if readonly {
+        fsdev.push_str(",readonly=on");
+    }
     arguments.extend([
-        "-chardev".into(),
-        format!("socket,id={id},path={}", socket.display()).into(),
+        "-fsdev".into(),
+        fsdev.into(),
         "-device".into(),
-        format!("vhost-user-fs-pci,chardev={id},tag={tag}").into(),
+        format!("virtio-9p-pci,fsdev={id},mount_tag={tag}").into(),
     ]);
 }
 
@@ -856,8 +837,8 @@ mod tests {
     fn paths(root: &Path) -> VmPaths {
         VmPaths {
             overlay: root.join("overlay.qcow2"),
-            input_socket: root.join("input.sock"),
-            output_socket: root.join("output.sock"),
+            input_directory: root.join("input"),
+            output_directory: root.join("output"),
             control_socket: root.join("control.sock"),
         }
     }
@@ -879,6 +860,14 @@ mod tests {
                 .any(|value| value.contains("size=1024M,share=on"))
         );
         assert!(!args.iter().any(|value| value.contains("guestfwd")));
+        assert!(
+            args.iter()
+                .any(|value| value.contains("id=input") && value.contains("readonly=on"))
+        );
+        assert!(
+            args.iter()
+                .any(|value| value.contains("id=output") && !value.contains("readonly=on"))
+        );
     }
 
     #[test]

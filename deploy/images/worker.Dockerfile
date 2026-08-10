@@ -9,7 +9,7 @@ RUN cargo build --locked --release -p aursmith-worker -p aursmithctl
 FROM archlinux:base@sha256:345a872f6c95e082d4b8c050af637eebb57402c6e2177b411c3acf7df84eb33b
 ARG AURSMITH_SOURCE_GIT_COMMIT
 RUN pacman -Syu --noconfirm --needed \
-      ca-certificates git gnupg openssh rsync qemu-base qemu-system-x86 qemu-img virtiofsd \
+      ca-certificates git gnupg openssh rsync qemu-base qemu-system-x86 qemu-img \
     && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/* \
     && useradd --uid 10001 --create-home --home-dir /var/lib/aursmith --shell /bin/sh aursmith \
     && install -d -o aursmith -g aursmith \

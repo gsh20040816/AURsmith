@@ -87,11 +87,11 @@ Builder Worker 的 Journal 保存完整签名 JobSpec。执行循环以条件更
 
 Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`、`initramfs-linux.img` 和 `profile-envelope.json`。Envelope 由 Controller Ed25519 密钥签署，内容摘要由三个文件的 Manifest、已安装包清单、创建时间和可选的官方仓库镜像确定，不采用无法实现的“包含自身摘要再求哈希”。旧 Profile 未声明镜像时仍按原摘要读取；新 Profile 一旦声明镜像，修改地址就必须产生新摘要。Builder 在启动 VM 前验证签名、文件类型、大小和 SHA-256；Profile 的任何单字节变化都会拒绝任务。
 
-每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出分别由两个 virtiofsd 进程提供，输入为只读，输出为独立可写目录；控制通道使用 virtio-serial。Build 与 ProfileFixture 明确传入 `-nic none`。Fetch 使用 QEMU user networking 的 `restrict=on`，并且只有一条指向固定 Publisher source proxy IP:端口的 `guestfwd`，Guest 不能任意访问局域网或互联网。
+每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出通过 QEMU 内置 virtio-9p 的 `mapped-xattr` 模式提供，输入 `fsdev` 额外固定 `readonly=on`，输出只指向该 Attempt 的独立目录；不启动需要 root 或额外 capability 的宿主文件共享 daemon。控制通道使用 virtio-serial。Build 与 ProfileFixture 明确传入 `-nic none`。Fetch 使用 QEMU user networking 的 `restrict=on`，并且只有一条指向固定 Publisher source proxy IP:端口的 `guestfwd`，Guest 不能任意访问局域网或互联网。
 
-Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，才把 runtime 原子移动到 completed 区。超时、QEMU/virtiofsd 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
+Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，删除 overlay 与控制 Socket 后，才把日志和输出原子移动到 completed 区。超时、QEMU 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
 
-Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日志、Guest 结构化错误和 makepkg 日志复制到小型 `failed/<attempt>` 诊断目录，再删除 overlay、virtiofs Socket 和临时输入；成功时日志随 completed 结果保存。这样不会为排错长期保留大型写时复制磁盘，也不会把 Guest 错误压缩成无法定位的 `VM_FAILED`。
+Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日志、Guest 结构化错误和 makepkg 日志复制到小型 `failed/<attempt>` 诊断目录，再删除 overlay、控制 Socket和临时输入；成功时日志随 completed 结果保存，overlay 同样先删除。这样不会为排错长期保留大型写时复制磁盘，也不会把 Guest 错误压缩成无法定位的 `VM_FAILED`。
 
 在 Builder 间 `TransferCapability` 传输尚未完成前，一个 ReleaseBatch 固定到第一个接单的 Builder。审计批准后的 Build Job 必须引用该节点上已经完成的 Fetch Attempt；Builder 再次验证 FetchResult、Source Manifest 和 completed 文件树后，才将 prepared source 复制进新的只读输入目录。这是显式的安全亲和策略：缺少原 Fetch Attempt 时任务保持不可调度，不允许 Build VM 重新联网获取源码。后续跨 Builder 调度只能通过同一摘要约束的 rsync Capability 扩展，不能绕过这条不变量。
 
@@ -99,7 +99,7 @@ Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行�
 
 JobSpec 同时固定直接运行、构建和检查依赖及其来源。Fetch Guest 只对 `official` 依赖使用 pacman 下载，并使用不可变 Profile 内已授权的 Arch HTTPS 镜像；包文件进入 prepared source、完整 Source Manifest 和解析后的名称/版本/摘要清单。AUR 依赖不会伪装成官方依赖下载。Controller 使用 Fetch 实际结果替换预估的依赖快照摘要。按 DAG 构建时，Builder 从同批次已成功 Build Attempt 中重新验证并复制直接 AUR 依赖产物。Build Guest 以 PID 1 身份先用 pacman 离线安装两类依赖，再降权执行 makepkg；依赖缺失时确定性失败，绝不临时添加网卡。BuildResult 通过 Profile 摘要间接固定镜像配置，控制面可从对应 Profile 清单还原该事实。
 
-Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段使用部署者选择的 Arch HTTPS 镜像安装完整且同步的 Arch 根文件系统，把同一 mirrorlist 写入 Guest，嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 virtiofs 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate；candidate 明确记录镜像地址。
+Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段使用部署者选择的 Arch HTTPS 镜像安装完整且同步的 Arch 根文件系统，把同一 mirrorlist 写入 Guest，嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 9p 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate；candidate 明确记录镜像地址。
 
 Profile 页面接受 profile-builder 生成的 `profile-candidate.json`，通过认证 API 得到 Controller 签名 Envelope 并提供下载；大体积 qcow2、内核和 initramfs 不经过浏览器，仍由管理员复制到 Builder Profile 卷。Builder 心跳发现对应摘要目录后才有资格接收 fixture Job，fixture 成功前 UI 和 API 都拒绝激活。
 

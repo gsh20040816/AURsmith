@@ -41,14 +41,14 @@ fn run() -> anyhow::Result<()> {
     mount(
         "aursmith-input",
         INPUT,
-        "virtiofs",
-        &["-o", "ro,nodev,nosuid"],
+        "9p",
+        &["-o", "trans=virtio,version=9p2000.L,ro,nodev,nosuid"],
     )?;
     mount(
         "aursmith-output",
         OUTPUT,
-        "virtiofs",
-        &["-o", "nodev,nosuid"],
+        "9p",
+        &["-o", "trans=virtio,version=9p2000.L,nodev,nosuid"],
     )?;
 
     let controller_key = controller_key()?;

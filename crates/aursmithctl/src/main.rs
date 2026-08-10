@@ -646,9 +646,6 @@ fn doctor(role: &str) -> anyhow::Result<()> {
         checks.push(
             json!({"check": "qemu-img", "ok": command_works("/usr/bin/qemu-img", "--version")}),
         );
-        checks.push(
-            json!({"check": "virtiofsd", "ok": command_works("/usr/lib/virtiofsd", "--version")}),
-        );
     }
     let ok = checks.iter().all(|check| check["ok"] == true);
     println!(

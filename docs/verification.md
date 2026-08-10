@@ -165,3 +165,13 @@
 - Rust 工作区 86 个测试、前端 3 个测试与生产构建、Compose 安全检查均通过；另用一次预期失败的 Docker 构建确认 `http://mirror.example.org` 在执行 pacman 前即被拒绝。随后实际设置 `AURSMITH_ARCH_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/archlinux` 构建当前源码的 Profile 镜像；pacman 从该镜像完成仓库同步和约 442 MiB 的包下载，profile-builder 成功生成 qcow2、内核与 initramfs，并导出包含 218 个已安装包的 candidate。
 - 导出的 `profile-candidate.json` 明确记录镜像地址，Profile 摘要为 `48c8ed63192a249bc69a12a6be6061a7cd662957e80a48b506705a653d5c79d3`；最终构建镜像内的 `repository-mirror` 也与 candidate 一致。本轮尚未把该 Profile 授权后启动 Fetch VM 下载一个真实官方依赖，因此 Guest 内 pacman 的运行时命中仍属于后续端到端验证范围。
 - 安全边界：该选项只影响 Profile 制作和 Fetch Guest 的官方依赖下载，Build Guest 仍固定 `-nic none`，不会因选择镜像而获得网络。
+
+## 2026-08-10：非特权 KVM Fetch→Build 复验
+
+- 验证对象：提交 `e2a4257` 之后、采用 QEMU virtio-9p 和 overlay 成功清理的待提交工作树；Profile 继续使用清华 Arch 镜像构建，摘要为 `e6561917eb5d627de6ae55d355d42f5a8855cb68c9f37f646fea12cab616bc0f`。
+- 根因：真实运行发现 Rust virtiofsd 1.14 在非 root、`cap_drop: ALL` 容器中以 `Permission denied` 退出；启动 Socket 文件还存在一个更早被观察到的就绪竞态。没有通过增加 root、privileged、capability 或 Docker Socket 掩盖问题，而是改用 QEMU 内置 9p `mapped-xattr`，继续对输入启用只读并保持 Attempt 输出目录隔离。
+- Fetch：Job `ac061190-8847-45c7-9244-b8811ab2f1b1`、Attempt `ce08fd35-0016-43d8-a1ba-cb3ef909996c` 在真实 KVM 中成功；Guest 再次验证 Controller 签名，Source Manifest 摘要为 `22f6a17734aea5df41ef3498c2bdf79fd5cb4d13e858b3c65cc5d428d0be957a`。
+- Build：Job `54c0fc91-fc4b-438c-be16-e78e51312046`、Attempt `b39ed7d7-19d8-483a-92ba-839d3fc6b6be` 只引用上述 Fetch 结果，在 `network=none` 的新 VM 中生成 `aursmith-fetch-fixture-1-1-any.pkg.tar.zst`；包为 1251 字节，SHA-256 为 `d6eb9572caeafaa60749c641889b2dab30c06c32009cd648d6318376bbbf2233`，实际读取 `.PKGINFO` 得到版本 `1-1`、架构 `any`。
+- 清理缺陷：首次成功复验发现 completed 目录仍包含 qcow2 overlay，随后改为结果验证成功后、原子接管前删除 overlay 和控制 Socket。使用修复后的 Worker 再次执行 Fetch Job `812b36c9-163f-42a2-92ae-c9d02a4223d0` 和 Build Job `c9acb9bf-596f-4e12-82d9-ba5930e5f6af`，两者成功；Build Attempt `7857d4f3-f425-4048-89d1-3ba73a60ea84` 生成 1252 字节、SHA-256 为 `30eaae8d9f82972b9c3c209862b8f6077cf8aa4cca88b329007be03f9bd25b79` 的包。随后实际检查全部 completed 目录，不再存在 overlay 或 Socket，也没有残留 QEMU/virtiofsd 进程。
+- 测试结束后已停止并删除临时 Worker、source proxy 和 Docker 网络；两个仅用于本轮 Profile 导出的 Docker volume 已删除且不可恢复，缓存目录已移动到桌面环境回收站，可恢复。
+- 边界：测试 PKGBUILD 不含外部 source 和官方依赖；代理 TCP 路径和镜像构建已实际运行，但 Fetch Guest 通过代理下载真实 source/官方依赖仍未在这条 fixture 中覆盖。
