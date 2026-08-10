@@ -847,6 +847,53 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
     let audit_report_sha256s = sqlx::query_scalar::<_, String>("SELECT DISTINCT audit_decisions.report_sha256 FROM audit_decisions JOIN jobs ON jobs.revision_id = audit_decisions.revision_id WHERE jobs.batch_id = ? ORDER BY audit_decisions.report_sha256")
         .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let evidence = build_release_evidence(&state.database, &batch_id).await?;
+    let mut evidence_files = Vec::new();
+    if let Some(current_release) = current_release_id(&state.database).await? {
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT envelope_json FROM release_authorizations WHERE release_id = ?",
+        )
+        .bind(current_release)
+        .fetch_optional(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+        if let Some(previous) = previous {
+            let envelope: SignedEnvelope =
+                serde_json::from_str(&previous).map_err(ApiError::internal)?;
+            let previous: ReleaseAuthorization = envelope
+                .verify("aursmith.release_authorization")
+                .map_err(ApiError::internal)?;
+            evidence_files.extend(previous.evidence_files);
+        }
+    }
+    let current_evidence = sqlx::query("SELECT job_evidence_files.path, job_evidence_files.sha256, job_evidence_files.size FROM job_evidence_files JOIN jobs ON jobs.id = job_evidence_files.job_id WHERE jobs.batch_id = ? AND jobs.kind = 'build' AND jobs.status = 'succeeded' ORDER BY job_evidence_files.path")
+        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    evidence_files.extend(current_evidence.into_iter().map(|entry| {
+        aursmith_protocol::ManifestEntry {
+            path: entry.get("path"),
+            sha256: entry.get("sha256"),
+            size: u64::try_from(entry.get::<i64, _>("size")).unwrap_or_default(),
+        }
+    }));
+    evidence_files.sort_by(|left, right| left.path.cmp(&right.path));
+    let unique_count = evidence_files
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if (!artifacts.is_empty() && evidence_files.is_empty())
+        || unique_count != evidence_files.len()
+        || evidence_files.iter().any(|entry| {
+            aursmith_protocol::validate_relative_path(&entry.path).is_err()
+                || !entry.path.starts_with("evidence/")
+                || entry.sha256.len() != 64
+                || entry.size == 0
+        })
+    {
+        return Err(ApiError::conflict(
+            "RELEASE_EVIDENCE_FILES_INVALID",
+            "Release 的证据文件清单为空、重复或元数据无效",
+        ));
+    }
     let release_id = Uuid::new_v4();
     let writer_epoch =
         u64::try_from(publisher.get::<i64, _>("writer_epoch")).map_err(ApiError::internal)?;
@@ -860,6 +907,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         revision_sha256s,
         audit_report_sha256s,
         artifacts,
+        evidence_files,
         removed_package_names: removed_package_names.into_iter().collect(),
         evidence,
         issued_at: now,
@@ -1200,7 +1248,7 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
                 "成功 Build Job 没有 Artifact 记录",
             ));
         }
-        let files = artifacts
+        let mut files = artifacts
             .into_iter()
             .map(|artifact| aursmith_protocol::ManifestEntry {
                 path: artifact.get("path"),
@@ -1208,6 +1256,28 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
                 size: u64::try_from(artifact.get::<i64, _>("size")).unwrap_or_default(),
             })
             .collect::<Vec<_>>();
+        let evidence_files = sqlx::query(
+            "SELECT path, sha256, size FROM job_evidence_files WHERE job_id = ? ORDER BY path",
+        )
+        .bind(&job_id)
+        .fetch_all(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+        if evidence_files.len() != 3 {
+            return Err(ApiError::conflict(
+                "EVIDENCE_FILES_MISSING",
+                "成功 Build Job 没有完整的 Profile、源码和构建记录证据",
+            ));
+        }
+        files.extend(
+            evidence_files
+                .into_iter()
+                .map(|entry| aursmith_protocol::ManifestEntry {
+                    path: entry.get("path"),
+                    sha256: entry.get("sha256"),
+                    size: u64::try_from(entry.get::<i64, _>("size")).unwrap_or_default(),
+                }),
+        );
         let transfer_id = Uuid::new_v4();
         let now = Utc::now();
         let expires_at = now + Duration::hours(1);
@@ -1695,6 +1765,9 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     } else {
         json!([])
     };
+    let job_kind = row.get::<String, _>("kind");
+    let evidence_files =
+        validate_evidence_files(&reply.data["evidence_files"], &job_kind, status, attempt_id)?;
     let mut advance_build_batch = false;
     let retry_scheduled =
         status == "failed" && generation < 2 && failure.is_some_and(infrastructure_failure);
@@ -1734,6 +1807,14 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             .bind(&job_id).bind(row.get::<String, _>("kind")).bind(document.to_string())
             .bind(hex::encode(Sha256::digest(bytes))).bind(Utc::now())
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
+    if status == "succeeded" && job_kind == "build" {
+        for entry in &evidence_files {
+            sqlx::query("INSERT OR REPLACE INTO job_evidence_files(job_id, path, sha256, size, created_at) VALUES (?, ?, ?, ?, ?)")
+                .bind(&job_id).bind(&entry.path).bind(&entry.sha256)
+                .bind(i64::try_from(entry.size).map_err(ApiError::internal)?)
+                .bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        }
     }
     if row.get::<String, _>("kind") == "profile_fixture" {
         let profile_sha: Option<String> = row.get("profile_sha256");
@@ -1984,6 +2065,52 @@ fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value
         }
     }
     Ok(value.clone())
+}
+
+fn validate_evidence_files(
+    value: &serde_json::Value,
+    job_kind: &str,
+    status: &str,
+    attempt_id: &str,
+) -> Result<Vec<aursmith_protocol::ManifestEntry>, ApiError> {
+    let entries = serde_json::from_value::<Vec<aursmith_protocol::ManifestEntry>>(value.clone())
+        .map_err(|_| ApiError::conflict("INVALID_EVIDENCE_FILES", "Worker 证据文件清单无效"))?;
+    if job_kind != "build" || status != "succeeded" {
+        if entries.is_empty() {
+            return Ok(entries);
+        }
+        return Err(ApiError::conflict(
+            "UNEXPECTED_EVIDENCE_FILES",
+            "只有成功 Build Job 可以返回证据文件",
+        ));
+    }
+    let expected = [
+        format!("evidence/{attempt_id}/profile.tar.zst"),
+        format!("evidence/{attempt_id}/source.tar.zst"),
+        format!("evidence/{attempt_id}/build-records.tar.zst"),
+    ];
+    if entries.len() != expected.len() {
+        return Err(ApiError::conflict(
+            "EVIDENCE_FILES_INCOMPLETE",
+            "Build Job 必须返回 Profile、源码和完整构建记录三个证据文件",
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    for entry in &entries {
+        aursmith_protocol::validate_relative_path(&entry.path).map_err(ApiError::internal)?;
+        if !expected.contains(&entry.path)
+            || !paths.insert(entry.path.clone())
+            || entry.sha256.len() != 64
+            || !entry.sha256.chars().all(|value| value.is_ascii_hexdigit())
+            || entry.size == 0
+        {
+            return Err(ApiError::conflict(
+                "INVALID_EVIDENCE_FILES",
+                "Build 证据文件路径、摘要或大小无效",
+            ));
+        }
+    }
+    Ok(entries)
 }
 
 async fn handle_uncertain_timeout(

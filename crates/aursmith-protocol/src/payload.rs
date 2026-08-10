@@ -228,6 +228,8 @@ pub struct ReleaseAuthorization {
     pub audit_report_sha256s: Vec<String>,
     pub artifacts: Vec<ArtifactRecord>,
     #[serde(default)]
+    pub evidence_files: Vec<ManifestEntry>,
+    #[serde(default)]
     pub removed_package_names: Vec<String>,
     #[serde(default)]
     pub evidence: ReleaseEvidence,
@@ -243,6 +245,8 @@ pub struct ReleaseManifest {
     pub repository_name: String,
     pub writer_epoch: u64,
     pub artifacts: Vec<ArtifactRecord>,
+    #[serde(default)]
+    pub evidence_files: Vec<ManifestEntry>,
     #[serde(default)]
     pub removed_package_names: Vec<String>,
     pub repository_database: ManifestEntry,

@@ -109,6 +109,16 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         gpg_sign(cli, &destination)?;
         package_paths.push(destination);
     }
+    let mut evidence_files = Vec::new();
+    for evidence in &authorization.evidence_files {
+        let source = entry.path().join(&evidence.path);
+        let destination = staging.join(&evidence.path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, &destination)?;
+        evidence_files.push(file_entry_with_path(&destination, evidence.path.clone())?);
+    }
     package_paths.sort();
     let database = staging.join(format!("{}.db.tar.gz", authorization.repository_name));
     let files_database = staging.join(format!("{}.files.tar.gz", authorization.repository_name));
@@ -141,6 +151,7 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         repository_name: authorization.repository_name,
         writer_epoch: authorization.writer_epoch,
         artifacts: authorization.artifacts,
+        evidence_files,
         removed_package_names: authorization.removed_package_names,
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
@@ -196,6 +207,26 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
         }
         validate_package_metadata(&path, artifact)?;
         package_names.insert(artifact.package_name.clone().unwrap_or_default());
+    }
+    if (!authorization.artifacts.is_empty() && authorization.evidence_files.is_empty())
+        || authorization.evidence_files.len() > 4096
+    {
+        bail!("Release 缺少证据文件或数量超过上限");
+    }
+    for evidence in &authorization.evidence_files {
+        aursmith_protocol::validate_relative_path(&evidence.path)?;
+        if !evidence.path.starts_with("evidence/") || !artifact_paths.insert(evidence.path.clone())
+        {
+            bail!("Release 证据文件路径无效：{}", evidence.path);
+        }
+        let path = root.join(&evidence.path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != evidence.size
+            || digest_file(&path)? != evidence.sha256
+        {
+            bail!("Release 证据文件 Manifest 不匹配：{}", evidence.path);
+        }
     }
     let mut removed = std::collections::BTreeSet::new();
     for package_name in &authorization.removed_package_names {
@@ -289,6 +320,14 @@ fn file_entry(path: &Path) -> anyhow::Result<ManifestEntry> {
     })
 }
 
+fn file_entry_with_path(path: &Path, manifest_path: String) -> anyhow::Result<ManifestEntry> {
+    Ok(ManifestEntry {
+        path: manifest_path,
+        sha256: digest_file(path)?,
+        size: fs::metadata(path)?.len(),
+    })
+}
+
 fn digest_file(path: &Path) -> anyhow::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -328,6 +367,7 @@ mod tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
+            evidence_files: vec![],
             removed_package_names: vec![],
             evidence: Default::default(),
             issued_at: Utc::now(),

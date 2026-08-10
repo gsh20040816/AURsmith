@@ -1331,6 +1331,21 @@ fn validate_release_authorization_for_publisher(
         }
         package_names.insert(artifact.package_name.clone().unwrap_or_default());
     }
+    if (!authorization.artifacts.is_empty() && authorization.evidence_files.is_empty())
+        || authorization.evidence_files.len() > 4096
+    {
+        bail!("Release 缺少证据文件或数量超过上限");
+    }
+    for entry in &authorization.evidence_files {
+        aursmith_protocol::validate_relative_path(&entry.path)?;
+        if !entry.path.starts_with("evidence/")
+            || !paths.insert(entry.path.clone())
+            || entry.sha256.len() != 64
+            || entry.size == 0
+        {
+            bail!("Release 证据文件元数据无效：{}", entry.path);
+        }
+    }
     let mut removed = std::collections::BTreeSet::new();
     for package_name in &authorization.removed_package_names {
         if package_name.is_empty()
@@ -1401,6 +1416,49 @@ async fn materialize_release_inbox(
         }
         std::fs::copy(source, &target)?;
         inspections.push(package_inspection::inspect_package(&target, artifact)?);
+    }
+    for evidence in &authorization.evidence_files {
+        aursmith_protocol::validate_relative_path(&evidence.path)?;
+        if !used_paths.insert(evidence.path.clone()) {
+            bail!("Release 包含重复证据路径：{}", evidence.path);
+        }
+        let mut source = None;
+        for row in &imports {
+            let manifest: Vec<aursmith_protocol::ManifestEntry> =
+                serde_json::from_str(row.get("manifest_json"))?;
+            if manifest.iter().any(|entry| entry == evidence) {
+                source =
+                    Some(PathBuf::from(row.get::<String, _>("directory")).join(&evidence.path));
+                break;
+            }
+        }
+        if source.is_none() {
+            let releases = worker
+                .repository_dir
+                .join(&worker.repository_arch)
+                .join("releases");
+            source = std::fs::read_dir(releases)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path().join(&evidence.path))
+                .find(|path| path.is_file());
+        }
+        let source = source.context("Release 证据文件没有已验证的 TransferCapability")?;
+        let metadata = std::fs::symlink_metadata(&source)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != evidence.size
+            || file_sha256(&source)? != evidence.sha256
+        {
+            bail!("Release 证据文件落地内容不匹配：{}", evidence.path);
+        }
+        let target = staging.join(&evidence.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, target)?;
     }
     std::fs::write(
         staging.join("artifact-inspections.json"),
@@ -1621,6 +1679,7 @@ fn verify_and_publish_release(
         || manifest.repository_name != authorization.repository_name
         || manifest.source_git_commit != authorization.source_git_commit
         || manifest.artifacts != authorization.artifacts
+        || manifest.evidence_files != authorization.evidence_files
         || manifest.removed_package_names != authorization.removed_package_names
     {
         bail!("ReleaseManifest 与 Controller 授权不一致");
@@ -1657,6 +1716,9 @@ fn verify_and_publish_release(
         .as_ref()
         .context("ReleaseManifest 缺少 ReleaseAuthorization")?;
     verify_manifest_entry(signed, authorization_entry)?;
+    for evidence in &manifest.evidence_files {
+        verify_manifest_entry(signed, evidence)?;
+    }
     if std::fs::read(signed.join(&authorization_entry.path))? != serde_json::to_vec(envelope)? {
         bail!("Signer 输出的 ReleaseAuthorization 与 Controller Envelope 不一致");
     }
@@ -1714,7 +1776,16 @@ fn verify_and_publish_release(
         release_files.push(name.clone());
         release_files.push(format!("{name}.sig"));
     }
+    release_files.extend(
+        manifest
+            .evidence_files
+            .iter()
+            .map(|entry| entry.path.clone()),
+    );
     for name in &release_files {
+        if let Some(parent) = staging.join(name).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         copy_regular_synced(&signed.join(name), &staging.join(name))?;
     }
     sync_directory(&staging)?;
@@ -1747,6 +1818,9 @@ fn activate_committed_release(
     }
     if let Some(authorization) = &manifest.release_authorization {
         verify_manifest_entry(committed, authorization)?;
+    }
+    for evidence in &manifest.evidence_files {
+        verify_manifest_entry(committed, evidence)?;
     }
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
@@ -2343,7 +2417,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
         Ok(Some(row)) => {
             let attempt_id = row.get::<String, _>("attempt_id");
             let status = row.get::<String, _>("status");
-            let (guest_result_json, evidence_logs) = if status == "succeeded" {
+            let (guest_result_json, evidence_logs, evidence_files) = if status == "succeeded" {
                 let Some(builder) = &worker.builder else {
                     return WorkerResponse::error(
                         "RESULT_UNAVAILABLE",
@@ -2351,9 +2425,15 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     );
                 };
                 match builder.completed_result_json(&attempt_id) {
-                    Ok(result) => match builder.attempt_logs(&attempt_id, true) {
-                        Ok(logs) => (Some(result), logs),
-                        Err(error) => {
+                    Ok(result) => match (
+                        builder.attempt_logs(&attempt_id, true),
+                        builder.completed_evidence_files(&attempt_id),
+                    ) {
+                        (Ok(logs), Ok(files)) => (Some(result), logs, files),
+                        (Err(error), _) => {
+                            return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
+                        }
+                        (_, Err(error)) => {
                             return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
                         }
                     },
@@ -2369,13 +2449,13 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     );
                 };
                 match builder.attempt_logs(&attempt_id, false) {
-                    Ok(logs) => (None, logs),
+                    Ok(logs) => (None, logs, Vec::new()),
                     Err(error) => {
                         return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
                     }
                 }
             } else {
-                (None, Vec::new())
+                (None, Vec::new(), Vec::new())
             };
             WorkerResponse::ok(
                 "JOB_STATUS",
@@ -2389,6 +2469,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     "failure_code": row.get::<Option<String>, _>("failure_code"),
                     "guest_result_json": guest_result_json,
                     "evidence_logs": evidence_logs,
+                    "evidence_files": evidence_files,
                 }),
             )
         }
@@ -2484,12 +2565,20 @@ mod transfer_tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
+            evidence_files: vec![aursmith_protocol::ManifestEntry {
+                path: "evidence/attempt/build-records.tar.zst".into(),
+                sha256: "e".repeat(64),
+                size: 1,
+            }],
             removed_package_names: vec![],
             evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
         };
         assert!(validate_release_authorization_for_publisher(&authorization).is_ok());
+        authorization.evidence_files[0].path = "../profile.tar.zst".into();
+        assert!(validate_release_authorization_for_publisher(&authorization).is_err());
+        authorization.evidence_files[0].path = "evidence/attempt/build-records.tar.zst".into();
         authorization.artifacts[0].path = "nested/fixture-1-1-any.pkg.tar.zst".into();
         assert!(validate_release_authorization_for_publisher(&authorization).is_err());
         authorization.artifacts.clear();

@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use aursmith_protocol::{ArtifactRecord, ReleaseAuthorization, SignedEnvelope};
+use aursmith_protocol::{ArtifactRecord, ManifestEntry, ReleaseAuthorization, SignedEnvelope};
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
@@ -36,6 +36,10 @@ fn main() -> anyhow::Result<()> {
     let name = package.file_name().context("软件包缺少文件名")?;
     fs::copy(package, directory.join(name))?;
     let bytes = fs::read(package)?;
+    let evidence_path = "evidence/fixture/build-records.tar.zst";
+    let evidence_bytes = b"aursmith release fixture evidence";
+    fs::create_dir_all(directory.join("evidence/fixture"))?;
+    fs::write(directory.join(evidence_path), evidence_bytes)?;
     let authorization = ReleaseAuthorization {
         release_id,
         batch_id: Uuid::new_v4(),
@@ -51,6 +55,11 @@ fn main() -> anyhow::Result<()> {
             package_name: Some(field("pkgname")?),
             package_version: Some(field("pkgver")?),
             architecture: Some(field("arch")?),
+        }],
+        evidence_files: vec![ManifestEntry {
+            path: evidence_path.into(),
+            sha256: hex::encode(Sha256::digest(evidence_bytes)),
+            size: evidence_bytes.len() as u64,
         }],
         removed_package_names: vec![],
         evidence: Default::default(),
