@@ -63,6 +63,8 @@ Controller 在写数据库前遍历最多 64 个 AUR pkgbase 的依赖闭包。�
 
 Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包同名会被拒绝；周期检查发现已有订阅进入官方仓库时，会暂停后续 AUR 更新、保留当前私有版本，并生成迁移告警和独立事件。
 
+每次成功刷新还会把上一份 package/revision 元数据与新快照比较。维护者变化、进入或离开 orphan 状态，以及规范化后的 source 域名集合变化分别写入 append-only 包事件；source 名称别名、本地补丁和 URL 大小写不会制造域名变化。AUR RPC 已找不到原 pkgbase 时，系统只报告“可能已删除、重命名或合并”，使用稳定告警 fingerprint 并保留当前 Release，不在缺少 AUR 合并证据时猜测具体目标。包详情 UI 同时展示 Revision、split outputs、依赖解析和这些生命周期事件。
+
 ## 发布安全
 
 受影响的依赖闭包组成一个 `ReleaseBatch`。系统完整暂存该批次，根据完整 Manifest 签名并验证，然后最后切换仓库数据库。失败批次不能修改当前 Release。

@@ -334,6 +334,14 @@ async fn apply_snapshot(
     let input_sha256 = revision_input_digest(snapshot, dependency_map)?;
     let now = Utc::now();
     let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+    let previous_package =
+        sqlx::query("SELECT maintainer, orphaned FROM package_bases WHERE name = ?")
+            .bind(&snapshot.package_base)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
+    let previous_metadata: Option<String> = sqlx::query_scalar("SELECT metadata_json FROM revisions WHERE package_base = ? ORDER BY created_at DESC LIMIT 1")
+        .bind(&snapshot.package_base).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?;
 
     sqlx::query(
         "INSERT INTO package_bases(name, version, description, maintainer, out_of_date_at, orphaned, vcs_kind, outputs_json, dependencies_json, optional_dependencies_json, provides_json, architectures_json, aur_last_modified, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET version = excluded.version, description = excluded.description, maintainer = excluded.maintainer, out_of_date_at = excluded.out_of_date_at, orphaned = excluded.orphaned, vcs_kind = excluded.vcs_kind, outputs_json = excluded.outputs_json, dependencies_json = excluded.dependencies_json, optional_dependencies_json = excluded.optional_dependencies_json, provides_json = excluded.provides_json, architectures_json = excluded.architectures_json, aur_last_modified = excluded.aur_last_modified, last_synced_at = excluded.last_synced_at",
@@ -355,6 +363,55 @@ async fn apply_snapshot(
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::internal)?;
+
+    if let Some(previous) = previous_package {
+        let previous_maintainer: Option<String> = previous.get("maintainer");
+        if previous_maintainer != package.maintainer {
+            append_event_in_transaction(
+                &mut transaction,
+                "package_base",
+                &snapshot.package_base,
+                "package_maintainer_changed",
+                json!({"before": previous_maintainer, "after": package.maintainer}),
+                actor,
+            )
+            .await?;
+        }
+        let was_orphaned = previous.get::<i64, _>("orphaned") != 0;
+        let is_orphaned = package.maintainer.is_none();
+        if was_orphaned != is_orphaned {
+            append_event_in_transaction(
+                &mut transaction,
+                "package_base",
+                &snapshot.package_base,
+                if is_orphaned {
+                    "package_became_orphan"
+                } else {
+                    "package_adopted"
+                },
+                json!({"orphaned": is_orphaned}),
+                actor,
+            )
+            .await?;
+        }
+    }
+    if let Some(previous_metadata) = previous_metadata {
+        let previous: UpstreamSnapshot =
+            serde_json::from_str(&previous_metadata).map_err(ApiError::internal)?;
+        let before = source_domains(&previous.sources);
+        let after = source_domains(&snapshot.sources);
+        if before != after {
+            append_event_in_transaction(
+                &mut transaction,
+                "package_base",
+                &snapshot.package_base,
+                "package_source_domains_changed",
+                json!({"before": before, "after": after}),
+                actor,
+            )
+            .await?;
+        }
+    }
 
     let subscription_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -826,6 +883,8 @@ pub async fn package_detail(
         .fetch_all(&state.database)
         .await
         .map_err(ApiError::internal)?;
+    let events = sqlx::query("SELECT event_type, payload_json, actor, created_at FROM events WHERE aggregate_type = 'package_base' AND aggregate_id = ? ORDER BY sequence DESC LIMIT 100")
+        .bind(&package_base).fetch_all(&state.database).await.map_err(ApiError::internal)?;
     Ok(Json(json!({
         "package_base": package.get::<String, _>("name"),
         "version": package.get::<String, _>("version"),
@@ -846,6 +905,11 @@ pub async fn package_detail(
             "name": row.get::<String, _>("dependency_name"), "kind": row.get::<String, _>("dependency_kind"),
             "target_package_base": row.get::<Option<String>, _>("target_package_base"), "state": row.get::<String, _>("provider_state"),
             "candidates": parse_json::<Value>(row.get("candidates_json")).unwrap_or_else(|_| json!([]))
+        })).collect::<Vec<_>>(),
+        "events": events.into_iter().map(|row| json!({
+            "type": row.get::<String,_>("event_type"),
+            "payload": serde_json::from_str::<Value>(row.get("payload_json")).unwrap_or(Value::Null),
+            "actor": row.get::<String,_>("actor"), "created_at": row.get::<String,_>("created_at")
         })).collect::<Vec<_>>()
     })))
 }
@@ -1257,10 +1321,37 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
             .map_err(ApiError::internal)?;
     let package = packages
         .into_iter()
-        .find(|package| package.package_base == package_base)
-        .ok_or_else(|| {
-            ApiError::conflict("AUR_PACKAGE_MISSING", "AUR 软件包可能已删除、重命名或合并")
-        })?;
+        .find(|package| package.package_base == package_base);
+    let Some(package) = package else {
+        let fingerprint = format!("aur-lifecycle-missing:{package_base}");
+        let already_open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM alerts WHERE fingerprint = ? AND state != 'resolved'",
+        )
+        .bind(&fingerprint)
+        .fetch_one(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+        sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
+            .bind(Uuid::new_v4().to_string()).bind(&fingerprint)
+            .bind(format!("AUR 软件包已不可见：{package_base}"))
+            .bind(json!({"package_base": package_base, "possible_causes": ["deleted", "renamed", "merged"]}).to_string())
+            .bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+        if already_open == 0 {
+            append_event(
+                &state.database,
+                "package_base",
+                package_base,
+                "package_missing_from_aur",
+                json!({"possible_causes": ["deleted", "renamed", "merged"]}),
+                actor,
+            )
+            .await?;
+        }
+        return Err(ApiError::conflict(
+            "AUR_PACKAGE_MISSING",
+            "AUR 软件包可能已删除、重命名或合并",
+        ));
+    };
     let snapshot_reply = transport::aur_snapshot(&state.config, &endpoint, package_base).await?;
     let snapshot: UpstreamSnapshot =
         serde_json::from_value(snapshot_reply.data).map_err(ApiError::internal)?;
@@ -1290,6 +1381,9 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
         .execute(&state.database).await.map_err(ApiError::internal)?;
     sqlx::query("UPDATE alerts SET state = 'resolved', resolved_at = ? WHERE fingerprint = ? AND state != 'resolved'")
         .bind(Utc::now()).bind(format!("aur-sync:{package_base}"))
+        .execute(&state.database).await.map_err(ApiError::internal)?;
+    sqlx::query("UPDATE alerts SET state = 'resolved', resolved_at = ? WHERE fingerprint = ? AND state != 'resolved'")
+        .bind(Utc::now()).bind(format!("aur-lifecycle-missing:{package_base}"))
         .execute(&state.database).await.map_err(ApiError::internal)?;
     Ok(result)
 }
@@ -1649,6 +1743,26 @@ fn vcs_kind(package_base: &str) -> Option<&'static str> {
         .find(|kind| package_base.ends_with(&format!("-{kind}")))
 }
 
+fn source_domains(sources: &[String]) -> BTreeSet<String> {
+    sources
+        .iter()
+        .filter_map(|source| {
+            let value = source
+                .rsplit_once("::")
+                .map(|(_, value)| value)
+                .unwrap_or(source);
+            let value = ["git+", "hg+", "svn+", "bzr+"]
+                .into_iter()
+                .find_map(|prefix| value.strip_prefix(prefix))
+                .unwrap_or(value);
+            url::Url::parse(value)
+                .ok()?
+                .host_str()
+                .map(|host| host.to_ascii_lowercase())
+        })
+        .collect()
+}
+
 fn validate_name(value: &str) -> Result<(), ApiError> {
     if value.is_empty()
         || value.len() > 128
@@ -1732,6 +1846,18 @@ mod tests {
             opt_depends: vec![],
             provides: vec![],
         }
+    }
+
+    #[test]
+    fn source_domain_change_ignores_local_sources_and_normalizes_vcs_prefixes() {
+        assert_eq!(
+            source_domains(&[
+                "archive::https://Downloads.Example.org/source.tar.zst".into(),
+                "git+https://git.example.org/project.git#branch=main".into(),
+                "local.patch".into(),
+            ]),
+            BTreeSet::from(["downloads.example.org".into(), "git.example.org".into(),])
+        );
     }
 
     fn snapshot() -> UpstreamSnapshot {

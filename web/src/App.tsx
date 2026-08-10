@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Alert, ApiError, ArchiveCopy, ArchiveInventory, Audit, AurPackage, BuildProfile, ClientBootstrap, ControlPlaneBackup, Doctor, Job, ProfileRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
+import { Alert, ApiError, ArchiveCopy, ArchiveInventory, Audit, AurPackage, BuildProfile, ClientBootstrap, ControlPlaneBackup, Doctor, Job, PackageDetail, ProfileRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -252,6 +252,7 @@ function PackagesView() {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [detail, setDetail] = useState<PackageDetail | null>(null);
   const refresh = () => void api.subscriptions().then((response) => setSubscriptions(response.items)).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
   const search = async (event: FormEvent) => {
@@ -282,6 +283,11 @@ function PackagesView() {
       setBusy("");
     }
   };
+  const showDetail = async (packageBase: string) => {
+    setBusy(`detail-${packageBase}`); setError("");
+    try { setDetail(await api.packageDetail(packageBase)); } catch (reason) { setError(messageOf(reason)); }
+    finally { setBusy(""); }
+  };
   return <>
     <header className="page-header compact"><div><p className="eyebrow">P01 / P02 / P03 / P04</p><h1>AUR 软件包</h1><p className="lede">搜索在 Publisher 上执行；订阅会固定完整 pkgbase Git commit，并展开隐式 AUR 依赖。</p></div></header>
     {error && <Notice kind="error">{error}</Notice>}
@@ -296,8 +302,9 @@ function PackagesView() {
       })}</div>}
     </section>
     <section className="table-panel"><div className="section-heading"><div><p className="eyebrow">订阅账本</p><h2>直接与隐式订阅</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>
-      {subscriptions.length === 0 ? <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未订阅软件包</strong><p>先部署并注册在线 Publisher，然后从上方搜索 AUR。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>pkgbase</th><th>来源</th><th>版本 / outputs</th><th>状态</th><th>引用</th><th /></tr></thead><tbody>{subscriptions.map((subscription) => <tr key={subscription.id}><td><strong>{subscription.package_base}</strong><small className="cell-note">{subscription.description}</small></td><td>{subscription.kind === "direct" ? "用户订阅" : "隐式依赖"}</td><td><code>{subscription.version ?? "等待同步"}</code><small className="cell-note">{subscription.outputs.join(" · ") || "—"}</small></td><td><span className={`state ${subscription.state}`}>{subscription.state}</span></td><td>{subscription.reference_count}</td><td><div className="row-actions">{subscription.kind === "direct" && <button className="text-button" onClick={() => void operate(`refresh-${subscription.id}`, () => api.refreshPackage(subscription.package_base))}>检查</button>}{subscription.kind === "direct" && subscription.state === "active" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.pauseSubscription(subscription.package_base))}>暂停</button>}{subscription.kind === "direct" && subscription.state === "paused" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.resumeSubscription(subscription.package_base))}>恢复</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(subscription.id, () => api.unsubscribe(subscription.package_base))}>退订</button>}</div></td></tr>)}</tbody></table></div>}
+      {subscriptions.length === 0 ? <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未订阅软件包</strong><p>先部署并注册在线 Publisher，然后从上方搜索 AUR。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>pkgbase</th><th>来源</th><th>版本 / outputs</th><th>状态</th><th>引用</th><th /></tr></thead><tbody>{subscriptions.map((subscription) => <tr key={subscription.id}><td><strong>{subscription.package_base}</strong><small className="cell-note">{subscription.description}</small></td><td>{subscription.kind === "direct" ? "用户订阅" : "隐式依赖"}</td><td><code>{subscription.version ?? "等待同步"}</code><small className="cell-note">{subscription.outputs.join(" · ") || "—"}</small></td><td><span className={`state ${subscription.state}`}>{subscription.state}</span></td><td>{subscription.reference_count}</td><td><div className="row-actions"><button className="text-button" onClick={() => void showDetail(subscription.package_base)}>详情</button>{subscription.kind === "direct" && <button className="text-button" onClick={() => void operate(`refresh-${subscription.id}`, () => api.refreshPackage(subscription.package_base))}>检查</button>}{subscription.kind === "direct" && subscription.state === "active" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.pauseSubscription(subscription.package_base))}>暂停</button>}{subscription.kind === "direct" && subscription.state === "paused" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.resumeSubscription(subscription.package_base))}>恢复</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(subscription.id, () => api.unsubscribe(subscription.package_base))}>退订</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(`purge-${subscription.id}`, () => api.purgeSubscription(subscription.package_base))}>清除</button>}</div></td></tr>)}</tbody></table></div>}
     </section>
+    {detail && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pkgbase 详情</p><h2>{detail.package_base} · {detail.version}</h2></div><button className="text-button" onClick={() => setDetail(null)}>关闭</button></div><p>{detail.description ?? "没有描述"} · {detail.maintainer ? `维护者 ${detail.maintainer}` : "孤儿包"}</p><h3>Revision 与 split outputs</h3><div className="finding-list">{detail.revisions.map((revision) => <div key={revision.id}><code>{revision.state}</code><strong>{revision.upstream_version} · {revision.aur_commit.slice(0, 12)}</strong><span>{revision.published_version ?? "尚未发布"}</span></div>)}</div><h3>依赖解析</h3><div className="finding-list">{detail.dependency_resolution.map((dependency) => <div key={`${dependency.kind}-${dependency.name}`}><code>{dependency.kind}</code><strong>{dependency.name}</strong><span>{dependency.target_package_base ?? dependency.state}</span></div>)}</div><h3>上游与人工事件</h3><div className="finding-list">{detail.events.length === 0 ? <p>尚无事件。</p> : detail.events.map((event, index) => <div key={`${event.type}-${index}`}><code>{event.type}</code><strong>{new Date(event.created_at).toLocaleString("zh-CN")}</strong><span>{JSON.stringify(event.payload)}</span></div>)}</div></section>}
   </>;
 }
 

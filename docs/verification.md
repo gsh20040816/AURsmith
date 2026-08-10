@@ -114,3 +114,10 @@
 - Archiver 输入测试使用测试 Controller 密钥签署 `ControlPlaneBackup`，确认 Backup ID、数据库摘要、Capability 文件集合和 Controller 公钥全部一致时才接受；替换为其他公钥会失败关闭。
 - Controller、backup-ssh 共用镜像以及修改后的 Archiver Worker 镜像均已通过真实 Docker build。Controller 镜像包含 OpenSSH server、rsync 和永久降权工具；Compose 安全检查确认 sidecar 仍为 `cap_drop: ALL`、只增加启动后永久降权所需能力、只读挂载导出卷且不获得 Controller 数据库写权限。
 - 未覆盖：本次没有配置一组真实 Controller/Archiver SSH key 完成跨容器 rsync 与 BackupArchiveReceipt 冒烟，也没有从 Archiver 副本执行停机恢复；因此独立归档的协议、文件校验、容器镜像和调度代码已验证，但跨设备端到端验收仍未完成。
+
+## 2026-08-10：AUR 生命周期事件与包详情
+
+- 成功刷新会在同一控制面事务中比较旧 package/revision 元数据，记录维护者、orphan 和 source 域名集合变化；域名单元测试确认 `git+` 前缀、source 别名和主机名大小写被规范化，本地 source 不被误认为网络域名。
+- AUR RPC 找不到原 pkgbase 时会打开稳定告警并只追加一次 `package_missing_from_aur` 事件，payload 明确保留 deleted/renamed/merged 三种可能；当前订阅和稳定 Release 不会因此被删除。
+- Web 包页面补齐详情入口，展示 split outputs、不可变 Revision、Provider/依赖解析和 append-only 事件，并补上与退订语义分开的“清除”操作。
+- 未覆盖：尚未对真实发生 AUR merge 的包验证上游是否提供可可靠固定的目标线索；VCS 历史重写和官方依赖 ABI 建议重建仍需要单独实现与验收。

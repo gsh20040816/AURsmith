@@ -82,6 +82,16 @@ export type Subscription = {
   maintainer: string | null;
   out_of_date: number | null;
 };
+export type PackageDetail = {
+  package_base: string;
+  version: string;
+  description: string | null;
+  maintainer: string | null;
+  outputs: string[];
+  revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; created_at: string }>;
+  dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
+  events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
+};
 export type Audit = {
   sha256: string;
   revision_id: string;
@@ -261,6 +271,13 @@ export const api = {
       `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/unsubscribe`,
       { method: "POST" }
     ),
+  purgeSubscription: (packageBase: string) =>
+    request<{ package_base: string; state: string }>(
+      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/purge`,
+      { method: "POST" }
+    ),
+  packageDetail: (packageBase: string) =>
+    request<PackageDetail>(`/api/v1/packages/${encodeURIComponent(packageBase)}`),
   refreshPackage: (packageBase: string) =>
     request<{ package_base: string; batch_id: string | null; batch_state: string }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/refresh`,
