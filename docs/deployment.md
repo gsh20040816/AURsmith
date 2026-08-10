@@ -62,6 +62,21 @@ Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自�
 
 不同宿主机部署时只需要复制对应 Stack 的 Compose、镜像和该角色的 secret，不要复制其他角色的数据卷或私钥。
 
+## Builder KVM 配置
+
+Builder Stack 必须设置 `KVM_GID` 和 `AURSMITH_FETCH_PROXY`。后者只能是 Publisher source proxy 的固定 `IP:端口`，不能填写域名、URL 或一组候选地址；这样 QEMU 参数不会在运行时进行不受控解析。容器只映射 `/dev/kvm`，不需要 privileged、TUN、Docker Socket 或 libvirt Socket。
+
+每个可用 Profile 放在 `/profiles/<profile_sha256>/`，包含：
+
+- `root.qcow2`；
+- `vmlinuz-linux`；
+- `initramfs-linux.img`；
+- `profile-envelope.json`。
+
+`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。Guest Agent 与 Profile 自动构建器仍在本阶段后续实现中；在它们完成并通过 fixture build 前，不能把手工准备的 Profile 标记为生产可用，也不能宣称已完成端到端 KVM 构建。
+
+已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`，并能在外部终止信号下退出。该检查只证明 KVM 设备和 QEMU 可用，不等同于 Guest 构建验收。
+
 ## Git 与发布
 
 - 日常开发直接进入 `main`，每个独立且验证通过的改动形成一个英文提交。

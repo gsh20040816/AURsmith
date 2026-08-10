@@ -37,6 +37,16 @@ Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包�
 
 受影响的依赖闭包组成一个 `ReleaseBatch`。系统完整暂存该批次，根据完整 Manifest 签名并验证，然后最后切换仓库数据库。失败批次不能修改当前 Release。
 
+## Builder KVM 执行内核
+
+Builder Worker 的 Journal 保存完整签名 JobSpec。执行循环以条件更新认领 queued Attempt，重启后会继续处理尚未认领的任务；同一 generation 的重放仍由 Journal 幂等规则约束。任务分为 Fetch、Build 和 ProfileFixture 三种，协议字段带默认值仅用于同一 major 版本内读取早期 Build 任务。
+
+Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`、`initramfs-linux.img` 和 `profile-envelope.json`。Envelope 由 Controller Ed25519 密钥签署，内容摘要由三个文件的 Manifest、已安装包清单和创建时间确定，不采用无法实现的“包含自身摘要再求哈希”。Builder 在启动 VM 前验证签名、文件类型、大小和 SHA-256；Profile 的任何单字节变化都会拒绝任务。
+
+每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出分别由两个 virtiofsd 进程提供，输入为只读，输出为独立可写目录；控制通道使用 virtio-serial。Build 与 ProfileFixture 明确传入 `-nic none`。Fetch 使用 QEMU user networking 的 `restrict=on`，并且只有一条指向固定 Publisher source proxy IP:端口的 `guestfwd`，Guest 不能任意访问局域网或互联网。
+
+Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，才把 runtime 原子移动到 completed 区。超时、QEMU/virtiofsd 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
+
 ## 审计流水线与 Agent 边界
 
 每个 Revision 首先形成包含全部 AUR Git 跟踪文件、相对差异、文件摘要、source 声明和覆盖说明的不可变 `AuditBundle`。确定性扫描会阻断路径逃逸、摘要不一致、私网 source URL 等确定性违规，并将动态下载、混淆、安装钩子、权限修改等不确定信号交给 Agent 判断。当前 Fetch VM 尚未补入完整上游源码前，覆盖说明必须明确写为“完整 AUR 包装层、上游仅清单”，不能将其描述成完整源码审计。

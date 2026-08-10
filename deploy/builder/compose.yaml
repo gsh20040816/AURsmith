@@ -20,6 +20,9 @@ services:
       AURSMITH_WORKER_DATABASE: sqlite:///var/lib/aursmith/runtime/worker.db
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
+      AURSMITH_PROFILES_DIR: /profiles
+      AURSMITH_JOBS_DIR: /jobs
+      AURSMITH_FETCH_PROXY: ${AURSMITH_FETCH_PROXY:?必须设置 Publisher source proxy 的固定 IP:端口}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
       - worker-run:/run/aursmith

@@ -15,6 +15,7 @@
 - ADR-011：官方包晋升检查使用 Arch 官方仓库 JSON 接口，由 Publisher 发起。发现晋升时暂停 AUR 自动更新而不删除当前包，用户确认客户端迁移后再清理。
 - ADR-012：Agent Runner 只实现 Codex CLI 与 Claude Code 两种固定适配器，不保留任意自定义命令入口。两者都支持自定义 provider 标签、模型和 Base URL；真实 API key 只进入独立凭据网关的 Docker secret，Runner 使用内部 Base URL 和占位认证值。这样保留自建兼容服务能力，同时避免模型通过 CLI 工具读取真实 key。
 - ADR-013：Agent 凭据网关替代通用正向代理。它为 low/high 层分别固定唯一 HTTPS upstream 和认证方式，剥离调用方认证头并注入 secret，不能由请求选择目标主机。Runner 网络为内部网络，只有网关具有 provider 外网。
+- ADR-014：KVM Profile 身份采用“文件 Manifest、已安装包清单和创建时间”的确定性内容摘要，Envelope 再对该声明签名。拒绝让 payload 包含自身哈希的循环定义。Fetch VM 只用 `restrict=on` 的单一 guestfwd 到固定 source proxy，Build VM 固定 `-nic none`。
 
 ## 已拒绝
 

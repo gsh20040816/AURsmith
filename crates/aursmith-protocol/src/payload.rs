@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    Fetch,
+    #[default]
+    Build,
+    ProfileFixture,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub cpu_count: u16,
@@ -24,6 +33,8 @@ pub struct JobSpec {
     pub job_id: Uuid,
     pub attempt: AttemptRef,
     pub required_role: WorkerRole,
+    #[serde(default)]
+    pub kind: JobKind,
     pub revision_sha256: String,
     pub source_manifest_sha256: Option<String>,
     pub dependency_snapshot_sha256: Option<String>,
@@ -32,6 +43,29 @@ pub struct JobSpec {
     pub limits: ResourceLimits,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildProfileSpec {
+    pub profile_sha256: String,
+    pub root_image: ManifestEntry,
+    pub kernel: ManifestEntry,
+    pub initramfs: ManifestEntry,
+    pub installed_packages: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestJob {
+    pub schema_version: u16,
+    pub kind: JobKind,
+    pub job_id: Uuid,
+    pub attempt: AttemptRef,
+    pub revision_sha256: String,
+    pub source_manifest_sha256: Option<String>,
+    pub dependency_snapshot_sha256: Option<String>,
+    pub expected_outputs: Vec<String>,
+    pub allow_check: bool,
 }
 
 impl JobSpec {
@@ -62,6 +96,27 @@ pub struct BuildResult {
     pub provenance: BTreeMap<String, String>,
     pub log_sha256: String,
     pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchResult {
+    pub job_id: Uuid,
+    pub attempt: AttemptRef,
+    pub revision_sha256: String,
+    pub source_manifest_sha256: String,
+    pub sources: Vec<ManifestEntry>,
+    pub resolved_pkgver: Option<String>,
+    pub dependency_snapshot_sha256: String,
+    pub log_sha256: String,
+    pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
+pub enum GuestResult {
+    Fetch(FetchResult),
+    Build(BuildResult),
+    ProfileFixture(BuildResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +181,7 @@ mod tests {
                 generation: 0,
             },
             required_role: WorkerRole::Builder,
+            kind: JobKind::Build,
             revision_sha256: "a".repeat(64),
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,

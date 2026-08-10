@@ -1,6 +1,6 @@
 use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
-use aursmith_protocol::{JobSpec, ResourceLimits, SignedEnvelope};
+use aursmith_protocol::{JobKind, JobSpec, ResourceLimits, SignedEnvelope};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sqlx::Row;
@@ -182,6 +182,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         job_id: parsed_job_id,
         attempt: attempt.clone(),
         required_role: parse_role(&role)?,
+        kind: JobKind::Build,
         revision_sha256: job
             .get::<Option<String>, _>("revision_sha256")
             .unwrap_or_else(|| "0".repeat(64)),
@@ -232,7 +233,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id WHERE jobs.status = 'uncertain' ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') ORDER BY jobs.updated_at LIMIT 1",
     )
     .fetch_optional(&state.database)
     .await
@@ -240,17 +241,58 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let Some(row) = row else { return Ok(()) };
     let job_id: String = row.get("id");
     let endpoint: String = row.get("endpoint");
-    if transport::query(&state.config, &endpoint, &job_id)
-        .await
-        .is_ok()
-    {
-        sqlx::query("UPDATE jobs SET status = 'dispatched', failure_code = NULL, updated_at = ? WHERE id = ?")
-            .bind(Utc::now())
-            .bind(job_id)
-            .execute(&state.database)
-            .await
-            .map_err(ApiError::internal)?;
+    let reply = transport::query(&state.config, &endpoint, &job_id).await?;
+    let remote_status = reply.data["status"].as_str().unwrap_or("unknown");
+    let (status, failure) = match remote_status {
+        "queued" => ("dispatched", None),
+        "running" => ("running", None),
+        "succeeded" => ("succeeded", None),
+        "failed" => (
+            "failed",
+            reply.data["failure_code"]
+                .as_str()
+                .or(Some("BUILDER_FAILED")),
+        ),
+        "cancelled" => ("cancelled", None),
+        _ => return Ok(()),
+    };
+    let attempt_id = reply.data["attempt_id"].as_str().unwrap_or_default();
+    let generation = reply.data["generation"].as_i64().unwrap_or(-1);
+    let accepted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attempts WHERE id = ? AND job_id = ? AND generation = ?",
+    )
+    .bind(attempt_id)
+    .bind(&job_id)
+    .bind(generation)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    if accepted == 0 {
+        tracing::warn!(
+            job_id,
+            attempt_id,
+            generation,
+            "拒绝迟到或未知 Attempt 结果"
+        );
+        return Ok(());
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("UPDATE attempts SET status = ?, result_sha256 = ? WHERE id = ?")
+        .bind(status)
+        .bind(reply.data["result_sha256"].as_str())
+        .bind(attempt_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE jobs SET status = ?, failure_code = ?, updated_at = ? WHERE id = ?")
+        .bind(status)
+        .bind(failure)
+        .bind(Utc::now())
+        .bind(&job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    transaction.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 

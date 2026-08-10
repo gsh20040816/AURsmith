@@ -1,4 +1,5 @@
 mod aur;
+mod builder;
 
 use anyhow::{Context, bail};
 use aursmith_domain::{JobStatus, WorkerRole, WorkerState};
@@ -11,7 +12,7 @@ use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
-use std::{path::Path, str::FromStr, sync::Arc};
+use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -45,6 +46,12 @@ struct Cli {
         default_value = "https://aur.archlinux.org/"
     )]
     aur_base_url: String,
+    #[arg(long, env = "AURSMITH_PROFILES_DIR", default_value = "/profiles")]
+    profiles_dir: String,
+    #[arg(long, env = "AURSMITH_JOBS_DIR", default_value = "/jobs")]
+    jobs_dir: String,
+    #[arg(long, env = "AURSMITH_FETCH_PROXY")]
+    fetch_proxy: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -71,6 +78,7 @@ struct Worker {
     database: SqlitePool,
     trusted_controller_key: Vec<u8>,
     aur: aur::AurClient,
+    builder: Option<builder::BuilderRuntime>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,7 +143,23 @@ async fn main() -> anyhow::Result<()> {
         database,
         trusted_controller_key,
         aur,
+        builder: if matches!(cli.role, RoleArg::Builder) {
+            Some(builder::BuilderRuntime::new(
+                cli.profiles_dir.into(),
+                cli.jobs_dir.into(),
+                cli.fetch_proxy,
+            ))
+        } else {
+            None
+        },
     });
+    if worker.builder.is_some() {
+        builder::spawn(
+            worker.database.clone(),
+            worker.trusted_controller_key.clone(),
+            worker.builder.clone().expect("已检查 Builder runtime"),
+        );
+    }
     prepare_socket(&cli.socket).await?;
     let listener = UnixListener::bind(&cli.socket)
         .with_context(|| format!("无法监听 Unix Socket {}", cli.socket))?;
@@ -169,10 +193,20 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         "CREATE TABLE IF NOT EXISTS attempts(\
          job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
          envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
-         result_sha256 TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
+         result_sha256 TEXT, spec_json TEXT, failure_code TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
     )
     .execute(&pool)
     .await?;
+    for statement in [
+        "ALTER TABLE attempts ADD COLUMN spec_json TEXT",
+        "ALTER TABLE attempts ADD COLUMN failure_code TEXT",
+    ] {
+        if let Err(error) = sqlx::query(statement).execute(&pool).await
+            && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error.into());
+        }
+    }
     sqlx::query(
         "INSERT INTO worker_state(key, value) VALUES ('state', 'online') ON CONFLICT(key) DO NOTHING",
     )
@@ -349,6 +383,10 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
     }
 
     let envelope_sha256 = hex::encode(Sha256::digest(&envelope.payload));
+    let spec_json = match serde_json::to_string(&envelope) {
+        Ok(value) => value,
+        Err(error) => return WorkerResponse::error("INVALID_ENVELOPE", error.to_string()),
+    };
     let existing = sqlx::query(
         "SELECT attempt_id, generation, envelope_sha256, status FROM attempts WHERE job_id = ? ORDER BY generation DESC LIMIT 1",
     )
@@ -384,13 +422,14 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
     }
 
     let inserted = sqlx::query(
-        "INSERT INTO attempts(job_id, attempt_id, generation, envelope_sha256, status, received_at) VALUES (?, ?, ?, ?, 'queued', ?)",
+        "INSERT INTO attempts(job_id, attempt_id, generation, envelope_sha256, status, received_at, spec_json) VALUES (?, ?, ?, ?, 'queued', ?, ?)",
     )
     .bind(spec.job_id.to_string())
     .bind(spec.attempt.attempt_id.to_string())
     .bind(i64::from(spec.attempt.generation))
     .bind(envelope_sha256)
     .bind(Utc::now())
+    .bind(spec_json)
     .execute(&worker.database)
     .await;
     match inserted {
@@ -409,7 +448,7 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
 
 async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
     let row = sqlx::query(
-        "SELECT attempt_id, generation, status, received_at, result_sha256 FROM attempts WHERE job_id = ? ORDER BY generation DESC LIMIT 1",
+        "SELECT attempt_id, generation, status, received_at, result_sha256, failure_code FROM attempts WHERE job_id = ? ORDER BY generation DESC LIMIT 1",
     )
     .bind(job_id)
     .fetch_optional(&worker.database)
@@ -424,6 +463,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                 "status": row.get::<String, _>("status"),
                 "received_at": row.get::<String, _>("received_at"),
                 "result_sha256": row.get::<Option<String>, _>("result_sha256"),
+                "failure_code": row.get::<Option<String>, _>("failure_code"),
             }),
         ),
         Ok(None) => WorkerResponse::error("JOB_NOT_FOUND", "Worker Journal 中没有该任务"),

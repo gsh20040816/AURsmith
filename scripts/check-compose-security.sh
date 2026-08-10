@@ -4,6 +4,7 @@ set -euo pipefail
 # 仅给 Compose 渲染提供无权限测试值，不连接真实 Worker。
 export KVM_GID="${KVM_GID:-996}"
 export AURSMITH_CONTROLLER_VERIFYING_KEY_HEX="${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000000}"
+export AURSMITH_FETCH_PROXY="${AURSMITH_FETCH_PROXY:-192.0.2.10:8080}"
 
 for stack in controller builder publisher archiver; do
   json="$(docker compose -f "deploy/${stack}/compose.yaml" config --format json)"

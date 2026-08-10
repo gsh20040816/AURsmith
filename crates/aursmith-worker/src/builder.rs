@@ -1,0 +1,659 @@
+use anyhow::{Context, bail};
+use aursmith_protocol::{
+    BuildProfileSpec, GuestResult, JobKind, JobSpec, ManifestEntry, SignedEnvelope,
+};
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqlitePool};
+use std::{
+    ffi::OsString,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
+use tokio::{process::Command, time::timeout};
+
+#[derive(Clone)]
+pub struct BuilderRuntime {
+    profiles_dir: PathBuf,
+    jobs_dir: PathBuf,
+    fetch_proxy: Option<SocketAddr>,
+}
+
+impl BuilderRuntime {
+    pub fn new(profiles_dir: PathBuf, jobs_dir: PathBuf, fetch_proxy: Option<SocketAddr>) -> Self {
+        Self {
+            profiles_dir,
+            jobs_dir,
+            fetch_proxy,
+        }
+    }
+}
+
+pub fn spawn(database: SqlitePool, controller_key: Vec<u8>, runtime: BuilderRuntime) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = execute_one(&database, &controller_key, &runtime).await {
+                tracing::warn!(%error, "Builder 执行任务失败");
+            }
+        }
+    });
+}
+
+async fn execute_one(
+    database: &SqlitePool,
+    controller_key: &[u8],
+    runtime: &BuilderRuntime,
+) -> anyhow::Result<()> {
+    let row = sqlx::query("SELECT job_id, attempt_id, spec_json FROM attempts WHERE status = 'queued' ORDER BY received_at LIMIT 1")
+        .fetch_optional(database).await?;
+    let Some(row) = row else { return Ok(()) };
+    let attempt_id: String = row.get("attempt_id");
+    let claimed = sqlx::query(
+        "UPDATE attempts SET status = 'running' WHERE attempt_id = ? AND status = 'queued'",
+    )
+    .bind(&attempt_id)
+    .execute(database)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
+    let result = execute_attempt(
+        controller_key,
+        runtime,
+        row.get::<String, _>("spec_json").as_str(),
+        &attempt_id,
+    )
+    .await;
+    let _ = fs::remove_dir_all(runtime.jobs_dir.join("staging").join(&attempt_id));
+    if result.is_err() {
+        let _ = fs::remove_dir_all(runtime.jobs_dir.join("runtime").join(&attempt_id));
+    }
+    match result {
+        Ok(result_sha256) => {
+            sqlx::query("UPDATE attempts SET status = 'succeeded', result_sha256 = ?, failure_code = NULL WHERE attempt_id = ? AND status = 'running'")
+                .bind(result_sha256).bind(&attempt_id).execute(database).await?;
+        }
+        Err(error) => {
+            let code = classify_failure(&error);
+            sqlx::query("UPDATE attempts SET status = 'failed', failure_code = ? WHERE attempt_id = ? AND status = 'running'")
+                .bind(code).bind(&attempt_id).execute(database).await?;
+            tracing::warn!(attempt_id, failure_code = code, %error, "Builder Attempt 失败");
+        }
+    }
+    Ok(())
+}
+
+async fn execute_attempt(
+    controller_key: &[u8],
+    runtime: &BuilderRuntime,
+    envelope_json: &str,
+    attempt_id: &str,
+) -> anyhow::Result<String> {
+    let envelope: SignedEnvelope = serde_json::from_str(envelope_json)?;
+    if envelope.verifying_key != controller_key {
+        bail!("UNTRUSTED_CONTROLLER")
+    }
+    let spec: JobSpec = envelope.verify("aursmith.job_spec")?;
+    if spec.attempt.attempt_id.to_string() != attempt_id {
+        bail!("ATTEMPT_MISMATCH")
+    }
+    let profile_sha = spec.profile_sha256.as_deref().context("PROFILE_MISSING")?;
+    let profile = VerifiedProfile::load(&runtime.profiles_dir.join(profile_sha), controller_key)?;
+    if profile.spec.profile_sha256 != profile_sha {
+        bail!("PROFILE_DIGEST_MISMATCH")
+    }
+    let staging = runtime.jobs_dir.join("staging").join(attempt_id);
+    verify_inputs(&staging.join("input"), &spec.inputs)?;
+    let work = runtime.jobs_dir.join("runtime").join(attempt_id);
+    if work.exists() {
+        fs::remove_dir_all(&work)?;
+    }
+    fs::create_dir_all(work.join("output"))?;
+    fs::write(work.join("job-envelope.json"), envelope_json.as_bytes())?;
+    let overlay = work.join("overlay.qcow2");
+    run_checked(
+        "/usr/bin/qemu-img",
+        &[
+            "create".into(),
+            "-f".into(),
+            "qcow2".into(),
+            "-F".into(),
+            "qcow2".into(),
+            "-b".into(),
+            profile.root_image.as_os_str().into(),
+            overlay.as_os_str().into(),
+        ],
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    let paths = VmPaths {
+        overlay,
+        input_socket: work.join("input.sock"),
+        output_socket: work.join("output.sock"),
+        control_socket: work.join("control.sock"),
+    };
+    let mut input_fs = start_virtiofsd(&paths.input_socket, &staging.join("input"), true).await?;
+    let mut output_fs = start_virtiofsd(&paths.output_socket, &work.join("output"), false).await?;
+    wait_for_socket(&paths.input_socket).await?;
+    wait_for_socket(&paths.output_socket).await?;
+    let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.fetch_proxy)?;
+    let mut qemu = Command::new(plan.executable)
+        .args(&plan.arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let status = timeout(
+        std::time::Duration::from_secs(spec.limits.timeout_seconds),
+        qemu.wait(),
+    )
+    .await;
+    let vm_ok = match status {
+        Ok(result) => result?.success(),
+        Err(_) => {
+            let _ = qemu.kill().await;
+            bail!("VM_TIMEOUT")
+        }
+    };
+    let _ = input_fs.kill().await;
+    let _ = output_fs.kill().await;
+    if !vm_ok {
+        fs::remove_dir_all(&work)?;
+        bail!("VM_FAILED")
+    }
+    let result_path = work.join("output/build-result.json");
+    let result = fs::read(&result_path).context("GUEST_RESULT_MISSING")?;
+    let guest_result: GuestResult =
+        serde_json::from_slice(&result).context("GUEST_RESULT_INVALID")?;
+    validate_guest_result(&guest_result, &spec, &work.join("output"))?;
+    let digest = hex::encode(Sha256::digest(&result));
+    let completed = runtime.jobs_dir.join("completed").join(attempt_id);
+    fs::create_dir_all(runtime.jobs_dir.join("completed"))?;
+    fs::rename(&work, &completed)?;
+    Ok(digest)
+}
+
+fn validate_guest_result(
+    result: &GuestResult,
+    spec: &JobSpec,
+    output: &Path,
+) -> anyhow::Result<()> {
+    if !matches!(
+        (spec.kind, result),
+        (JobKind::Fetch, GuestResult::Fetch(_))
+            | (JobKind::Build, GuestResult::Build(_))
+            | (JobKind::ProfileFixture, GuestResult::ProfileFixture(_))
+    ) {
+        bail!("GUEST_RESULT_KIND_MISMATCH");
+    }
+    match result {
+        GuestResult::Fetch(value) => {
+            validate_result_identity(value.job_id, &value.attempt, &value.revision_sha256, spec)?;
+            validate_output_entries(output, &value.sources)
+        }
+        GuestResult::Build(value) | GuestResult::ProfileFixture(value) => {
+            validate_result_identity(value.job_id, &value.attempt, &value.revision_sha256, spec)?;
+            let entries = value
+                .artifacts
+                .iter()
+                .map(|artifact| ManifestEntry {
+                    path: artifact.path.clone(),
+                    sha256: artifact.sha256.clone(),
+                    size: artifact.size,
+                })
+                .collect::<Vec<_>>();
+            validate_output_entries(output, &entries)
+        }
+    }
+}
+
+fn validate_result_identity(
+    job_id: uuid::Uuid,
+    attempt: &aursmith_domain::AttemptRef,
+    revision: &str,
+    spec: &JobSpec,
+) -> anyhow::Result<()> {
+    if job_id != spec.job_id || attempt != &spec.attempt || revision != spec.revision_sha256 {
+        bail!("GUEST_RESULT_IDENTITY_MISMATCH");
+    }
+    Ok(())
+}
+
+fn validate_output_entries(output: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
+    for entry in entries {
+        aursmith_protocol::validate_relative_path(&entry.path)?;
+        let path = output.join(&entry.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("GUEST_ARTIFACT_MISSING:{}", entry.path))?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != entry.size
+            || hex::encode(Sha256::digest(fs::read(path)?)) != entry.sha256
+        {
+            bail!("GUEST_ARTIFACT_MISMATCH:{}", entry.path);
+        }
+    }
+    Ok(())
+}
+
+fn verify_inputs(root: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
+    for entry in entries {
+        aursmith_protocol::validate_relative_path(&entry.path)?;
+        let path = root.join(&entry.path);
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("INPUT_MISSING:{}", entry.path))?;
+        if !metadata.file_type().is_file() || metadata.len() != entry.size {
+            bail!("INPUT_METADATA_MISMATCH:{}", entry.path)
+        }
+        if hex::encode(Sha256::digest(fs::read(path)?)) != entry.sha256 {
+            bail!("INPUT_DIGEST_MISMATCH:{}", entry.path)
+        }
+    }
+    Ok(())
+}
+
+async fn start_virtiofsd(
+    socket: &Path,
+    shared: &Path,
+    readonly: bool,
+) -> anyhow::Result<tokio::process::Child> {
+    let mut command = Command::new("/usr/lib/virtiofsd");
+    command
+        .arg(format!("--socket-path={}", socket.display()))
+        .arg(format!("--shared-dir={}", shared.display()))
+        .arg("--sandbox=none")
+        .arg("--announce-submounts")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if readonly {
+        command.arg("--readonly");
+    }
+    command.spawn().context("无法启动 virtiofsd")
+}
+
+async fn wait_for_socket(path: &Path) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        if path.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    bail!("VIRTIOFS_SOCKET_TIMEOUT")
+}
+
+async fn run_checked(
+    executable: &str,
+    arguments: &[OsString],
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    let output = timeout(deadline, Command::new(executable).args(arguments).output())
+        .await
+        .context("子进程超时")??;
+    if !output.status.success() {
+        bail!("子进程失败：{}", executable)
+    }
+    Ok(())
+}
+
+fn classify_failure(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    for code in [
+        "PROFILE_MISSING",
+        "PROFILE_DIGEST_MISMATCH",
+        "ATTEMPT_MISMATCH",
+        "VM_TIMEOUT",
+        "VM_FAILED",
+        "GUEST_RESULT_MISSING",
+        "GUEST_RESULT_INVALID",
+        "GUEST_RESULT_IDENTITY_MISMATCH",
+        "GUEST_RESULT_KIND_MISMATCH",
+        "VIRTIOFS_SOCKET_TIMEOUT",
+    ] {
+        if message.contains(code) {
+            return code;
+        }
+    }
+    if message.contains("INPUT_") {
+        "INPUT_INVALID"
+    } else {
+        "BUILDER_INFRASTRUCTURE"
+    }
+}
+
+pub struct VerifiedProfile {
+    pub spec: BuildProfileSpec,
+    pub root_image: PathBuf,
+    pub kernel: PathBuf,
+    pub initramfs: PathBuf,
+}
+
+pub struct VmPaths {
+    pub overlay: PathBuf,
+    pub input_socket: PathBuf,
+    pub output_socket: PathBuf,
+    pub control_socket: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct QemuPlan {
+    pub executable: &'static str,
+    pub arguments: Vec<OsString>,
+}
+
+impl VerifiedProfile {
+    pub fn load(directory: &Path, controller_key: &[u8]) -> anyhow::Result<Self> {
+        let envelope_path = directory.join("profile-envelope.json");
+        let envelope: SignedEnvelope = serde_json::from_slice(
+            &fs::read(&envelope_path)
+                .with_context(|| format!("无法读取 {}", envelope_path.display()))?,
+        )
+        .context("Profile 授权不是有效 JSON")?;
+        if envelope.verifying_key != controller_key {
+            bail!("Profile 不是由当前 Controller 授权");
+        }
+        let spec: BuildProfileSpec = envelope.verify("aursmith.build_profile")?;
+        let root_image = verify_entry(directory, &spec.root_image, "root.qcow2")?;
+        let kernel = verify_entry(directory, &spec.kernel, "vmlinuz-linux")?;
+        let initramfs = verify_entry(directory, &spec.initramfs, "initramfs-linux.img")?;
+        let manifest_sha = profile_content_digest(&spec)?;
+        if manifest_sha != spec.profile_sha256 {
+            bail!("Profile 摘要与签名 payload 不一致");
+        }
+        Ok(Self {
+            spec,
+            root_image,
+            kernel,
+            initramfs,
+        })
+    }
+}
+
+fn profile_content_digest(spec: &BuildProfileSpec) -> anyhow::Result<String> {
+    let content = serde_json::json!({
+        "root_image": spec.root_image,
+        "kernel": spec.kernel,
+        "initramfs": spec.initramfs,
+        "installed_packages": spec.installed_packages,
+        "created_at": spec.created_at,
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&content)?)))
+}
+
+fn verify_entry(
+    directory: &Path,
+    entry: &ManifestEntry,
+    expected: &str,
+) -> anyhow::Result<PathBuf> {
+    if entry.path != expected {
+        bail!("Profile 文件名必须是 {expected}");
+    }
+    let path = directory.join(expected);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("无法检查 Profile 文件 {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() != entry.size {
+        bail!("Profile 文件类型或大小不匹配：{expected}");
+    }
+    let digest = hex::encode(Sha256::digest(fs::read(&path)?));
+    if digest != entry.sha256 {
+        bail!("Profile 文件摘要不匹配：{expected}");
+    }
+    Ok(path)
+}
+
+impl QemuPlan {
+    pub fn for_job(
+        profile: &VerifiedProfile,
+        spec: &JobSpec,
+        paths: VmPaths,
+        fetch_proxy: Option<SocketAddr>,
+    ) -> anyhow::Result<Self> {
+        if spec.required_role != aursmith_domain::WorkerRole::Builder {
+            bail!("QEMU 计划只能用于 Builder Job");
+        }
+        if spec.limits.cpu_count == 0 || spec.limits.memory_mib < 512 {
+            bail!("VM 至少需要 1 个 CPU 和 512 MiB 内存");
+        }
+        if spec.kind == JobKind::Fetch && fetch_proxy.is_none() {
+            bail!("Fetch VM 必须配置唯一源码代理");
+        }
+        let memory = spec.limits.memory_mib.to_string();
+        let mut arguments: Vec<OsString> = [
+            "-nodefaults",
+            "-no-user-config",
+            "-machine",
+            "q35,accel=kvm",
+            "-cpu",
+            "host",
+            "-smp",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        arguments.push(spec.limits.cpu_count.to_string().into());
+        arguments.extend([
+            "-object".into(),
+            format!("memory-backend-memfd,id=mem,size={memory}M,share=on").into(),
+            "-numa".into(),
+            "node,memdev=mem".into(),
+            "-nographic".into(),
+            "-no-reboot".into(),
+            "-kernel".into(),
+            profile.kernel.as_os_str().into(),
+            "-initrd".into(),
+            profile.initramfs.as_os_str().into(),
+            "-append".into(),
+            "root=/dev/vda rw console=ttyS0 panic=1 init=/usr/local/bin/aursmith-guest-agent"
+                .into(),
+            "-drive".into(),
+            format!(
+                "file={},if=virtio,format=qcow2,cache=none,discard=unmap",
+                paths.overlay.display()
+            )
+            .into(),
+        ]);
+        add_virtiofs(
+            &mut arguments,
+            "input",
+            &paths.input_socket,
+            "aursmith-input",
+        );
+        add_virtiofs(
+            &mut arguments,
+            "output",
+            &paths.output_socket,
+            "aursmith-output",
+        );
+        arguments.extend([
+            "-device".into(),
+            "virtio-serial-pci".into(),
+            "-chardev".into(),
+            format!(
+                "socket,id=control,path={},server=on,wait=off",
+                paths.control_socket.display()
+            )
+            .into(),
+            "-device".into(),
+            "virtserialport,chardev=control,name=org.aursmith.control".into(),
+        ]);
+        match spec.kind {
+            JobKind::Fetch => {
+                let proxy = fetch_proxy.expect("前置校验保证存在 Fetch proxy");
+                arguments.extend([
+                    "-nic".into(),
+                    format!(
+                        "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:{proxy}"
+                    )
+                    .into(),
+                ]);
+            }
+            JobKind::Build | JobKind::ProfileFixture => {
+                arguments.extend(["-nic".into(), "none".into()]);
+            }
+        }
+        Ok(Self {
+            executable: "/usr/bin/qemu-system-x86_64",
+            arguments,
+        })
+    }
+}
+
+fn add_virtiofs(arguments: &mut Vec<OsString>, id: &str, socket: &Path, tag: &str) {
+    arguments.extend([
+        "-chardev".into(),
+        format!("socket,id={id},path={}", socket.display()).into(),
+        "-device".into(),
+        format!("vhost-user-fs-pci,chardev={id},tag={tag}").into(),
+    ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aursmith_domain::{AttemptRef, WorkerRole};
+    use aursmith_protocol::ResourceLimits;
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    fn entry(path: &str, bytes: &[u8]) -> ManifestEntry {
+        ManifestEntry {
+            path: path.into(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            size: u64::try_from(bytes.len()).unwrap(),
+        }
+    }
+
+    fn profile(root: &Path) -> VerifiedProfile {
+        VerifiedProfile {
+            spec: BuildProfileSpec {
+                profile_sha256: "a".repeat(64),
+                root_image: ManifestEntry {
+                    path: "root.qcow2".into(),
+                    sha256: "b".repeat(64),
+                    size: 1,
+                },
+                kernel: ManifestEntry {
+                    path: "vmlinuz-linux".into(),
+                    sha256: "c".repeat(64),
+                    size: 1,
+                },
+                initramfs: ManifestEntry {
+                    path: "initramfs-linux.img".into(),
+                    sha256: "d".repeat(64),
+                    size: 1,
+                },
+                installed_packages: vec![],
+                created_at: Utc::now(),
+            },
+            root_image: root.join("root.qcow2"),
+            kernel: root.join("vmlinuz-linux"),
+            initramfs: root.join("initramfs-linux.img"),
+        }
+    }
+
+    fn job(kind: JobKind) -> JobSpec {
+        let job_id = Uuid::new_v4();
+        JobSpec {
+            job_id,
+            attempt: AttemptRef {
+                job_id,
+                attempt_id: Uuid::new_v4(),
+                generation: 0,
+            },
+            required_role: WorkerRole::Builder,
+            kind,
+            revision_sha256: "e".repeat(64),
+            source_manifest_sha256: None,
+            dependency_snapshot_sha256: None,
+            profile_sha256: Some("a".repeat(64)),
+            inputs: vec![],
+            limits: ResourceLimits {
+                cpu_count: 2,
+                memory_mib: 1024,
+                disk_mib: 4096,
+                timeout_seconds: 600,
+            },
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::minutes(5),
+        }
+    }
+
+    fn paths(root: &Path) -> VmPaths {
+        VmPaths {
+            overlay: root.join("overlay.qcow2"),
+            input_socket: root.join("input.sock"),
+            output_socket: root.join("output.sock"),
+            control_socket: root.join("control.sock"),
+        }
+    }
+
+    #[test]
+    fn build_vm_has_no_network_device() {
+        let root = Path::new("/jobs/attempt");
+        let plan =
+            QemuPlan::for_job(&profile(root), &job(JobKind::Build), paths(root), None).unwrap();
+        let args: Vec<_> = plan
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect();
+        assert!(args.windows(2).any(|pair| pair == ["-nic", "none"]));
+        assert!(!args.iter().any(|value| value.contains("guestfwd")));
+    }
+
+    #[test]
+    fn fetch_vm_can_only_reach_the_fixed_proxy_forward() {
+        let root = Path::new("/jobs/attempt");
+        let proxy: SocketAddr = "192.0.2.10:8080".parse().unwrap();
+        let plan = QemuPlan::for_job(
+            &profile(root),
+            &job(JobKind::Fetch),
+            paths(root),
+            Some(proxy),
+        )
+        .unwrap();
+        let args: Vec<_> = plan
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect();
+        assert!(args.iter().any(|value| value.as_ref() == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:192.0.2.10:8080"));
+        assert!(!args.windows(2).any(|pair| pair == ["-nic", "none"]));
+    }
+
+    #[test]
+    fn signed_profile_rejects_tampered_root_image() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("root.qcow2"), b"root").unwrap();
+        fs::write(directory.path().join("vmlinuz-linux"), b"kernel").unwrap();
+        fs::write(directory.path().join("initramfs-linux.img"), b"initramfs").unwrap();
+        let mut spec = BuildProfileSpec {
+            profile_sha256: String::new(),
+            root_image: entry("root.qcow2", b"root"),
+            kernel: entry("vmlinuz-linux", b"kernel"),
+            initramfs: entry("initramfs-linux.img", b"initramfs"),
+            installed_packages: vec!["base-devel=1".into()],
+            created_at: Utc::now(),
+        };
+        spec.profile_sha256 = profile_content_digest(&spec).unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let envelope = SignedEnvelope::sign("aursmith.build_profile", &spec, &signing_key).unwrap();
+        fs::write(
+            directory.path().join("profile-envelope.json"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            VerifiedProfile::load(directory.path(), signing_key.verifying_key().as_bytes()).is_ok()
+        );
+        fs::write(directory.path().join("root.qcow2"), b"evil").unwrap();
+        assert!(
+            VerifiedProfile::load(directory.path(), signing_key.verifying_key().as_bytes())
+                .is_err()
+        );
+    }
+}

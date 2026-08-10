@@ -1,5 +1,5 @@
 use aursmith_domain::{AttemptRef, WorkerRole};
-use aursmith_protocol::{JobSpec, ResourceLimits, SignedEnvelope};
+use aursmith_protocol::{JobKind, JobSpec, ResourceLimits, SignedEnvelope};
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
@@ -75,6 +75,7 @@ impl RunningWorker {
                 generation,
             },
             required_role: WorkerRole::Builder,
+            kind: JobKind::Build,
             revision_sha256: "a".repeat(64),
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
@@ -141,6 +142,7 @@ async fn worker_rejects_self_signed_untrusted_controller() {
             generation: 0,
         },
         required_role: WorkerRole::Builder,
+        kind: JobKind::Build,
         revision_sha256: "b".repeat(64),
         source_manifest_sha256: None,
         dependency_snapshot_sha256: None,
