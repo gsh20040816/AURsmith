@@ -73,6 +73,15 @@ if jq -e '.services.signer.secrets[]? | select(.source == "repository_gpg_public
   echo "Signer 不需要挂载仓库 GPG 公钥 secret" >&2
   exit 1
 fi
+if [[ "$(jq -r '.services.pacoloco.user // ""' <<<"${publisher_json}")" != "65532:65532" ]] \
+  || [[ "$(jq -r '.services.pacoloco.read_only // false' <<<"${publisher_json}")" != "true" ]]; then
+  echo "pacoloco 必须以固定无特权用户和只读根文件系统运行" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services.pacoloco.volumes[]? | select(.target == "/var/cache/pacoloco" and .type == "volume")] | length' <<<"${publisher_json}")" != "1" ]]; then
+  echo "pacoloco 只能把持久写入放入独立缓存卷" >&2
+  exit 1
+fi
 
 controller_json="$(docker compose -f deploy/controller/compose.yaml config --format json)"
 if [[ "$(jq -r '.services.web.build.dockerfile // ""' <<<"${controller_json}")" != "deploy/images/web.Dockerfile" ]]; then

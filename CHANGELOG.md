@@ -17,6 +17,7 @@
 - 实际 pacman 安装、升级、服务端回滚及客户端显式降级流程。
 - Web 控制台、认证 SSE、告警、设置、Doctor、备份、Job 日志和 Release 签名证据。
 - 完整 Profile、Source/License 和未截断构建日志作为独立证据文件，经授权传输、签名 Release Manifest 与 ArchiveReceipt 归档。
+- Publisher 内置无特权 pacoloco，稳定仓库地址提供 `/arch-cache/`，命中率进入 Worker Doctor 和 Controller 指标。
 
 ### 已验证
 

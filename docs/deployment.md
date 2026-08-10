@@ -68,6 +68,8 @@ Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自�
 
 Publisher Stack 自带最小 `source-proxy` 服务。跨设备部署时设置 `AURSMITH_SOURCE_PROXY_BIND=<Publisher 管理网 IP>:3128`，并在宿主防火墙上只允许 Builder 地址访问；默认 `127.0.0.1:3128` 只适合角色同机。代理只允许 80/443，拒绝 loopback、私网、link-local、运营商 NAT、文档网段、组播和其他保留地址，不提供磁盘缓存。
 
+Publisher Stack 还自带独立 pacoloco。它只缓存 Arch 官方仓库，缓存卷为 `pacoloco-cache`，不应与 Publisher staging 或公开仓库卷合并。外部 Arch 上游由 Publisher Compose 的 `AURSMITH_ARCH_MIRROR` 构建参数配置，必须是无凭据和参数的 HTTPS Base URL。公开仓库 Caddy 把 `https://<稳定仓库域名>/arch-cache/` 转发为 pacoloco 的 `archlinux` 仓库；首次部署可连续请求同一 `core.db`，再在 Doctor 中确认 requests、misses 和 hits 递增。
+
 Publisher Worker 在 Compose 内固定使用 `AURSMITH_SOURCE_PROXY_URL=http://source-proxy:3128` 执行 Doctor。该地址只用于 Publisher 自检，不替代 Builder 的 `AURSMITH_FETCH_PROXY=<Publisher 管理网 IP>:3128`；跨设备时仍需显式配置 Builder 看到的地址并由宿主防火墙限制来源。
 
 Builder Stack 必须设置 `KVM_GID` 和 `AURSMITH_FETCH_PROXY`，后者填写上述 Publisher 代理的固定 `IP:端口`。不能填写域名、URL 或一组候选地址；这样 QEMU 参数不会在运行时进行不受控解析。容器只映射 `/dev/kvm`，不需要 privileged、TUN、Docker Socket 或 libvirt Socket。
@@ -79,7 +81,7 @@ Builder Stack 必须设置 `KVM_GID` 和 `AURSMITH_FETCH_PROXY`，后者填写�
 - `initramfs-linux.img`；
 - `profile-envelope.json`。
 
-`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。构建前可通过 `AURSMITH_ARCH_MIRROR` 选择 Arch 镜像，地址必须是无凭据、查询参数和片段的 HTTPS Base URL。该值同时用于构建 Profile 根文件系统，并写入 Guest 的 `/etc/pacman.d/mirrorlist`，因此 Fetch Guest 后续下载官方依赖时使用同一镜像；正式 Build Guest 仍然没有网卡。
+`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。构建前可通过 Builder Stack 的 `AURSMITH_ARCH_MIRROR` 选择 Arch 镜像，地址必须是无凭据、查询参数和片段的 HTTPS Base URL。该值同时用于构建 Profile 根文件系统，并写入 Guest 的 `/etc/pacman.d/mirrorlist`，因此 Fetch Guest 后续下载官方依赖时使用同一镜像；正式 Build Guest 仍然没有网卡。若使用内置缓存，应填写 `https://<稳定仓库域名>/arch-cache`；Publisher Stack 的同名变量则配置 pacoloco 自己访问的外部上游，二者不能形成循环。
 
 下面示例使用清华大学开源软件镜像站构建并导出 base candidate；未设置变量时使用 `https://geo.mirror.pkgbuild.com`：
 

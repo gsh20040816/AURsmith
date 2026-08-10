@@ -277,3 +277,9 @@
 - 断网、只读根文件系统、`cap_drop: ALL` 的实际 Signer 容器处理了含嵌套证据的测试 Release。输入和输出证据 SHA-256 一致，GPG 签名的 Release Manifest 列出同一清单；Publisher Worker 随后实际验签、提交并通过 `release-files` 返回该嵌套路径。
 - Archiver 恢复测试调用生产 rsync `--link-dest` 快照路径，签名 ArchiveReceipt 的递归文件集合包含 `evidence/attempt/source.tar.zst`，并从不可变 Release 目录逐字节恢复 `complete source bytes`。
 - 最终执行 `bash scripts/test-all.sh`：全仓库 108 个 Rust 测试、前端 TypeScript 检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。容器测试所用临时 GPG 密钥和测试包只用于本地验证，不属于仓库发布密钥。
+
+## 2026-08-11：pacoloco 与缓存指标
+
+- 使用上游 1.8 镜像的固定 digest 构建 AURsmith 派生镜像，强制 UID/GID 65532、只读根文件系统、`cap_drop: ALL`、`no-new-privileges` 和独立缓存卷；命名卷首次挂载后实际确认该用户可写缓存。
+- Caddy 配置验证通过。在临时 Docker 网络中经正式 `/arch-cache/core/os/x86_64/core.db` 路由连续请求两次，pacoloco `/metrics` 实际返回 requests 2、miss 1、hit 1。
+- Publisher Worker 只允许无凭据、无参数的内部 HTTP `/metrics` URL，解析并聚合请求、命中、未命中、错误、缓存字节和包数量；单元测试覆盖多 repo 聚合和外部 HTTPS/内嵌凭据拒绝。Controller 指标从活动 Publisher 的签名状态快照读取该全局统计。

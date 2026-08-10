@@ -60,6 +60,8 @@ struct Cli {
     aur_base_url: String,
     #[arg(long, env = "AURSMITH_SOURCE_PROXY_URL")]
     source_proxy_url: Option<String>,
+    #[arg(long, env = "AURSMITH_PACOLOCO_METRICS_URL")]
+    pacoloco_metrics_url: Option<String>,
     #[arg(long, env = "AURSMITH_PROFILES_DIR", default_value = "/profiles")]
     profiles_dir: String,
     #[arg(long, env = "AURSMITH_JOBS_DIR", default_value = "/jobs")]
@@ -121,6 +123,7 @@ struct Worker {
     trusted_controller_key: Vec<u8>,
     aur: aur::AurClient,
     source_proxy_url: Option<String>,
+    pacoloco_metrics_url: Option<String>,
     builder: Option<builder::BuilderRuntime>,
     transfer_endpoints: BTreeMap<String, String>,
     transfer_ssh_identity_file: Option<PathBuf>,
@@ -261,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
         trusted_controller_key,
         aur,
         source_proxy_url: cli.source_proxy_url,
+        pacoloco_metrics_url: cli.pacoloco_metrics_url,
         builder: if matches!(cli.role, RoleArg::Builder) {
             Some(builder::BuilderRuntime::new(
                 cli.profiles_dir.into(),
@@ -2137,10 +2141,72 @@ async fn publisher_doctor(worker: &Worker) -> WorkerResponse {
             }
         }
     };
+    let pacoloco = match pacoloco_metrics(worker).await {
+        Some(value) => serde_json::json!({"ok": true, "metrics": value}),
+        None if worker.pacoloco_metrics_url.is_none() => {
+            serde_json::json!({"ok": false, "message": "pacoloco 未配置"})
+        }
+        None => serde_json::json!({"ok": false, "message": "pacoloco 指标不可达"}),
+    };
     WorkerResponse::ok(
         "PUBLISHER_DOCTOR",
-        serde_json::json!({"checks": {"aur": aur, "source_proxy": source_proxy}}),
+        serde_json::json!({"checks": {"aur": aur, "source_proxy": source_proxy, "pacoloco": pacoloco}}),
     )
+}
+
+async fn pacoloco_metrics(worker: &Worker) -> Option<serde_json::Value> {
+    let url = worker.pacoloco_metrics_url.as_deref()?;
+    let parsed = validate_internal_metrics_url(url).ok()?;
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?
+        .get(parsed)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    Some(parse_pacoloco_metrics(&response))
+}
+
+fn parse_pacoloco_metrics(response: &str) -> serde_json::Value {
+    let counter = |name: &str| -> u64 {
+        response
+            .lines()
+            .filter(|line| line.starts_with(name))
+            .filter_map(|line| line.split_whitespace().last()?.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .fold(0_u64, |total, value| total.saturating_add(value as u64))
+    };
+    serde_json::json!({
+        "requests_total": counter("pacoloco_cache_requests_total"),
+        "hits_total": counter("pacoloco_cache_hits_total"),
+        "misses_total": counter("pacoloco_cache_miss_total"),
+        "errors_total": counter("pacoloco_cache_errors_total"),
+        "size_bytes": counter("pacoloco_cache_size_bytes"),
+        "packages_total": counter("pacoloco_cache_packages_total"),
+    })
+}
+
+fn validate_internal_metrics_url(value: &str) -> anyhow::Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(value).context("pacoloco metrics URL 无效")?;
+    if parsed.scheme() != "http"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/metrics"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("pacoloco metrics URL 必须是无凭据和参数的内部 HTTP /metrics URL");
+    }
+    Ok(parsed)
 }
 
 fn validate_source_proxy_url(value: &str) -> anyhow::Result<reqwest::Url> {
@@ -2187,6 +2253,11 @@ async fn status(worker: &Worker) -> WorkerResponse {
                 WorkerRole::Publisher => &worker.repository_dir,
                 WorkerRole::Archiver => &worker.archive_dir,
             };
+            let pacoloco = if worker.role == WorkerRole::Publisher {
+                pacoloco_metrics(worker).await
+            } else {
+                None
+            };
             WorkerResponse::ok(
                 "STATUS",
                 serde_json::json!({
@@ -2202,6 +2273,7 @@ async fn status(worker: &Worker) -> WorkerResponse {
                     "cgroup_v2": Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
                     "kvm_available": worker.role != WorkerRole::Builder || Path::new("/dev/kvm").exists(),
                     "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
+                    "pacoloco": pacoloco,
                     "time": Utc::now(),
                 }),
             )
@@ -2522,6 +2594,24 @@ mod transfer_tests {
     }
 
     #[test]
+    fn pacoloco_metrics_are_aggregated_without_accepting_external_urls() {
+        let metrics = parse_pacoloco_metrics(
+            "pacoloco_cache_requests_total{repo=\"core\"} 5\n\
+             pacoloco_cache_hits_total{repo=\"core\"} 3\n\
+             pacoloco_cache_hits_total{repo=\"extra\"} 2\n\
+             pacoloco_cache_miss_total{repo=\"core\"} 2\n\
+             pacoloco_cache_size_bytes{repo=\"core\"} 4096\n",
+        );
+        assert_eq!(metrics["requests_total"], 5);
+        assert_eq!(metrics["hits_total"], 5);
+        assert_eq!(metrics["misses_total"], 2);
+        assert_eq!(metrics["size_bytes"], 4096);
+        assert!(validate_internal_metrics_url("http://pacoloco:9129/metrics").is_ok());
+        assert!(validate_internal_metrics_url("https://example.org/metrics").is_err());
+        assert!(validate_internal_metrics_url("http://user:secret@pacoloco/metrics").is_err());
+    }
+
+    #[test]
     fn export_materialization_verifies_digest_and_path() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
@@ -2649,6 +2739,7 @@ mod transfer_tests {
             trusted_controller_key: vec![0; 32],
             aur: aur::AurClient::new("https://aur.archlinux.org/").unwrap(),
             source_proxy_url: None,
+            pacoloco_metrics_url: None,
             builder: None,
             transfer_endpoints: BTreeMap::new(),
             transfer_ssh_identity_file: None,

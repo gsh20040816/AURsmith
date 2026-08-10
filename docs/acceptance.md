@@ -26,7 +26,7 @@
 | B01 | 已验证 | 非 privileged Builder 容器内真实 KVM Fetch→Build | 无 |
 | B02 | 部分验证 | Build VM `-nic none` 实际验证；Publisher Doctor 经 source proxy 转发 Arch HTTPS 冒烟 | Fetch Guest 内真实 source/官方依赖下载尚未在同一 KVM 用例验证 |
 | B03 | 已验证 | JobSpec、签名 Profile、完整 source tree/License、完整 Build/Fetch/QEMU/namcap 日志、依赖、GuestResult 和 Artifact 均由摘要绑定并随 Release 传输 | 第一版会重复压缩相同 Profile，后续可按内容寻址优化空间 |
-| B04 | 部分验证 | 统计、迟滞、建议、Profile 授权/激活/回滚代码与测试 | 尚未跑“真实统计→重建 Profile→KVM fixture→命中”的完整闭环；pacoloco 命中率未接入 |
+| B04 | 已验证 | 依赖统计、两周期加入/三周期移除迟滞、Profile 授权/fixture/激活/回滚有测试；无特权 pacoloco 经 Caddy 连续请求实际产生 1 miss、1 hit，指标进入 Publisher 心跳和 Controller API | Profile 的实际节省时间需在用户工作负载积累 20 次后评估 |
 | B05 | 已验证 | HTTPS 镜像进入 Profile 摘要；清华镜像实际构建 Profile | Fetch Guest 命中该镜像下载真实依赖仍属于 B02 缺口 |
 | W01 | 已验证 | 四套 Compose、无裸机服务、静态安全检查和真实容器启动 | 无 |
 | W02 | 已验证 | Builder/Publisher/Archiver 独立 Stack 与静态端点 | 无 |

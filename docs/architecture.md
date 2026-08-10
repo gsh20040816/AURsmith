@@ -15,7 +15,7 @@
 
 Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docker Socket、libvirt Socket、TUN 或 privileged 权限。受限联网的 Fetch Guest 通过 Publisher 代理获取源码；全新的 Build Guest 不带网卡，只接收不可变且已经审计的输入。
 
-第一版 Publisher 提供独立的无特权 Squid source-proxy 容器。QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。它不与 Publisher Worker 或仓库共享可写卷，也不承担 pacoloco 的性能缓存职责。
+第一版 Publisher 提供两个职责分离的网络服务。无特权 Squid source-proxy 供 Fetch VM 获取 AUR source，QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。pacoloco 只缓存 Arch 官方仓库文件，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。仓库 Caddy 在 `/arch-cache/` 下反向代理 pacoloco；部署者可以把该稳定 HTTPS 地址写入新 Profile，Fetch Guest 随后沿同一镜像下载官方依赖，Build Guest 仍然无网。
 
 控制流使用固定 host key 和 forced command 的 OpenSSH。大文件使用 rsync 在 Builder 与 Publisher、Publisher 与 Archiver 之间直接传输，并由短期有效的 Controller 签名 `TransferCapability` 授权。
 
@@ -53,7 +53,7 @@ Controller 每 24 小时或按管理员请求执行一次控制面一致性备�
 
 每个 verified 控制面备份还会进入独立归档调度。Controller 根据自身 Ed25519 公钥确定一个稳定、非秘密的传输源 UUID，签发同时绑定 Backup ID、Archiver UUID、两份文件摘要和期限的 TransferCapability，并把最小导出目录只读暴露给同 Stack 的 `backup-ssh`。该 SSH sidecar 与 Worker 一样禁止 Shell、PTY 和转发，只允许 rsync sender 读取数据库和备份 Envelope。Archiver 通过静态 UUID→SSH 端点主动拉取，既复验 Capability 文件集合，又验证内部 `ControlPlaneBackup` 确由当前 Controller 签署，随后保存到 `control-plane-backups/<Backup ID>` 并返回自身签名的 `BackupArchiveReceipt`。Controller 只有核对 Receipt 身份、Backup ID 和完整文件集合后才标记独立归档完成并清理临时导出。
 
-Doctor 不通过付费模型请求伪造“Agent 可用”。每个 Agent Runner 的 `/healthz` 只验证 Codex/Claude Code 固定 CLI 文件、adapter/provider/model 配置，以及到凭据网关的 TCP；凭据网关在启动时已经验证 API key secret 和 provider HTTPS URL。Controller 实际请求三个低成本和一个高成本 Runner 的健康端点。Publisher 的 `publisher-doctor` 同时执行无结果也合法的 AUR RPC 查询，并经配置的 source proxy 请求公开 Arch HTTPS 文件；它不执行 PKGBUILD，也不给 Build VM 网络。
+Doctor 不通过付费模型请求伪造“Agent 可用”。每个 Agent Runner 的 `/healthz` 只验证 Codex/Claude Code 固定 CLI 文件、adapter/provider/model 配置，以及到凭据网关的 TCP；凭据网关在启动时已经验证 API key secret 和 provider HTTPS URL。Controller 实际请求三个低成本和一个高成本 Runner 的健康端点。Publisher 的 `publisher-doctor` 同时执行无结果也合法的 AUR RPC 查询、经配置的 source proxy 请求公开 Arch HTTPS 文件，并读取 pacoloco `/metrics`；它不执行 PKGBUILD，也不给 Build VM 网络。
 
 离线恢复命令先核对当前 Controller 公钥、Envelope、固定文件名、大小、摘要和 SQLite 完整性，再复制到目标文件系统复验。替换前把原数据库及 WAL/SHM 一并移动到带 UTC 时间和 Backup ID 的 `recovery` 目录，恢复中途失败时尝试放回原数据库。恢复要求先停止 Controller；在线 API 不提供数据库替换能力。
 
@@ -114,6 +114,8 @@ Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日�
 Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。Controller 把完整 split outputs 和当前包的 `check()` 策略冻结进签名 JobSpec；Guest 要求实际 `.PKGINFO` 包名集合精确相等。默认执行 `check()`，只有 UI 中按包显式禁用才加入 `--nocheck`，结果同时写入 provenance。构建产物随后由 Guest 使用固定 argv 执行 namcap，报告摘要也进入 provenance。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
 
 JobSpec 同时固定直接运行、构建和检查依赖及其来源。Fetch Guest 只对 `official` 依赖使用 pacman 下载，并使用不可变 Profile 内已授权的 Arch HTTPS 镜像；包文件进入 prepared source、完整 Source Manifest 和解析后的名称/版本/摘要清单。AUR 依赖不会伪装成官方依赖下载。Controller 使用 Fetch 实际结果替换预估的依赖快照摘要。按 DAG 构建时，Builder 从同批次已成功 Build Attempt 中重新验证并复制直接 AUR 依赖产物。Build Guest 以 PID 1 身份先用 pacman 离线安装两类依赖，再降权执行 makepkg；依赖缺失时确定性失败，绝不临时添加网卡。BuildResult 通过 Profile 摘要间接固定镜像配置，控制面可从对应 Profile 清单还原该事实。
+
+pacoloco 暴露的请求、命中、未命中、错误、缓存字节和包数量由 Publisher Worker 读取并进入签名身份心跳，Controller 指标 API 展示当前活动 Publisher 的累计值。Profile 优化仍以每个 Fetch 的依赖出现频率、下载字节和耗时为决策依据；全局缓存命中率用于解释网络收益，不把无法精确归属到单包的全局计数伪造成逐包命中。
 
 Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段使用部署者选择的 Arch HTTPS 镜像安装完整且同步的 Arch 根文件系统，把同一 mirrorlist 写入 Guest，嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 9p 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate；candidate 明确记录镜像地址。
 

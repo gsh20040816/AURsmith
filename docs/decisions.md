@@ -50,6 +50,7 @@
 - ADR-046：Agent Doctor 禁止通过真实审计请求探测，以免健康检查产生模型费用或把空 fixture 当安全结论。Runner 只检查 CLI、非秘密配置和凭据网关 TCP；Publisher Doctor 负责 AUR 与 source proxy 的实际网络路径。Doctor 失败必须展示具体子检查，不静默降级成“已配置”。
 - ADR-047：第一版日志证据直接进入现有 `job_evidence` 与签名 ReleaseAuthorization，不为日志再引入对象存储。每文件内嵌内容限制 128 KiB、控制响应限制 1 MiB、ReleaseEvidence 限制 16 MiB，同时保存完整大小和摘要；超大日志在控制消息中明确省略，原始字节仍进入 Build 证据归档。失败 Job 证据保留在控制面，成功 Job 证据随 Release 归档。
 - ADR-048：每个成功 Build 生成三个独立的 zstd tar 证据文件：完整签名 Profile、完整 Fetch 输出与 source tree、完整 Build 日志和签名 JobSpec。Controller 只接受绑定 Attempt UUID 的固定三路径清单，并把它们加入原 Artifact `TransferCapability`；Publisher 与 Signer 不解包这些不可信归档，只校验普通文件、大小和 SHA-256。GPG 签名的 Release Manifest 绑定全部证据摘要，Archiver 的目录 Manifest 和 ArchiveReceipt 再绑定实际文件集合。第一版优先保证灾备完整性，跨 Release 的 Profile 内容寻址去重作为后续存储优化。
+- ADR-049：pacoloco 作为 Publisher Stack 的独立无特权缓存服务，固定上游镜像版本和镜像 digest。Caddy 只在 `/arch-cache/` 暴露它，默认仓库读取不依赖缓存健康状态。Publisher Worker 只读取无凭据的内部 `/metrics`，把全局累计命中率写入 Worker 心跳；Profile 优化不把全局计数错误分摊给单个依赖。
 
 ## 已拒绝
 

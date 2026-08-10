@@ -554,6 +554,12 @@ async fn metrics_status(
         .fetch_one(&state.database).await.map_err(ApiError::internal)?;
     let dependencies = sqlx::query("SELECT COUNT(*) AS observations, COALESCE(SUM(cache_hit), 0) AS cache_hits, COALESCE(SUM(download_bytes), 0) AS download_bytes, COALESCE(SUM(download_milliseconds), 0) AS download_milliseconds FROM dependency_observations")
         .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    let pacoloco_status: Option<String> = sqlx::query_scalar("SELECT status_json FROM workers WHERE role = 'publisher' AND state = 'online' AND status_json IS NOT NULL ORDER BY last_seen_at DESC LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let pacoloco = pacoloco_status
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|value| value.get("pacoloco").cloned())
+        .unwrap_or(Value::Null);
     let archives = sqlx::query("SELECT COUNT(*) AS copies, COALESCE(SUM(CASE WHEN state = 'verified' THEN 1 ELSE 0 END), 0) AS verified, COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0) AS failed FROM archive_copies")
         .fetch_one(&state.database).await.map_err(ApiError::internal)?;
     Ok(Json(json!({
@@ -561,6 +567,7 @@ async fn metrics_status(
         "stage_durations": stages.into_iter().map(|row| json!({"kind": row.get::<String,_>("kind"), "count": row.get::<i64,_>("count"), "average_milliseconds": row.get::<Option<i64>,_>("average_milliseconds")})).collect::<Vec<_>>(),
         "agent": {"calls": agent.get::<i64,_>("calls"), "failures": agent.get::<i64,_>("failures"), "cost_microusd": agent.get::<i64,_>("cost_microusd")},
         "dependencies": {"observations": dependencies.get::<i64,_>("observations"), "cache_hits": dependencies.get::<i64,_>("cache_hits"), "download_bytes": dependencies.get::<i64,_>("download_bytes"), "download_milliseconds": dependencies.get::<i64,_>("download_milliseconds")},
+        "pacoloco": pacoloco,
         "archives": {"copies": archives.get::<i64,_>("copies"), "verified": archives.get::<i64,_>("verified"), "failed": archives.get::<i64,_>("failed")},
         "generated_at": Utc::now(),
     })))
