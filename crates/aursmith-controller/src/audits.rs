@@ -440,6 +440,7 @@ mod tests {
             agent_monthly_cost_limit_microusd: 5_000_000,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
+            repository_base_url: "https://repo.test".into(),
         };
         AppState::new(
             database,

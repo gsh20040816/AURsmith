@@ -238,6 +238,14 @@ pub struct ReleaseManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRollbackAuthorization {
+    pub release_id: Uuid,
+    pub writer_epoch: u64,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveReceipt {
     pub release_id: Uuid,
     pub archive_worker: Uuid,

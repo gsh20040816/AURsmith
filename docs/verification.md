@@ -69,3 +69,11 @@
 - Receipt：Archiver 使用首次启动后保存在 Journal 的 Ed25519 身份密钥签署 ArchiveReceipt，Receipt SHA-256 为 `1bbdeb0c0f8d7156b80475533915e155ad903390ad15983d322d43a4880b0374`。再次提交相同 Capability 返回 `IDEMPOTENT_ARCHIVE` 和同一 Receipt。
 - 结果：归档与 Publisher 的 `release-manifest.json` SHA-256 均为 `cd443f23412dc70a73ce1f256e4a7f39e0cd50df9d2bee1bdf16b7a25abfaef9`；快照包含包、包签名、db/files 数据库及签名、ReleaseAuthorization 和签名 Manifest。
 - 边界：尚未执行第二个不同 Release 的硬链接 inode 去重验证、Controller 自动调度 Receipt 对账、每周库存巡检或从归档恢复控制面数据。
+
+## 2026-08-10：既有签名 Release 回滚
+
+- 输入：复制包含两个已签名 Release 的真实 Publisher 仓库，通过测试 Controller 分别签发五分钟有效、绑定 writer epoch 的 ReleaseRollbackAuthorization。
+- 回滚：Publisher 对目标 Release 的 Manifest、db/files 数据库、全部包及分离签名重新执行 GPG 验证，未调用 Signer、repo-add 或 Builder。仓库 DB 链接从较新 Release `ba886982-3484-47e4-9e06-caed2f5d5955` 原子切换到旧 Release `9ee7eedf-6fc2-4715-b624-95d6c9750f6d`，返回 Manifest SHA-256 `b6141c81d2d98e7f69ce97e9247161fbbc1bf0efd277bfa804cedd13f6ba7b98`。
+- 恢复当前版本：随后使用相同流程切回较新 Release，确认 DB 链接重新指向 `releases/ba886982-3484-47e4-9e06-caed2f5d5955/aursmith.db.tar.gz`；两个不可变目录均未被修改或删除。
+- 客户端语义：Controller API 根据目标 Release 的 Artifact 清单生成逐包 HTTPS `pacman -U` 命令；UI 明确显示服务端回滚不会自动降低客户端已安装版本。
+- 边界：尚未在独立 Arch 客户端实际执行生成的 `pacman -U` 命令。

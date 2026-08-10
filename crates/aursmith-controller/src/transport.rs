@@ -67,6 +67,15 @@ pub async fn authorize_release(
     invoke(config, endpoint, "authorize-release", Some(body)).await
 }
 
+pub async fn authorize_rollback(
+    config: &Config,
+    endpoint: &str,
+    envelope: &SignedEnvelope,
+) -> Result<WorkerReply, ApiError> {
+    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
+    invoke(config, endpoint, "authorize-rollback", Some(body)).await
+}
+
 pub async fn query_release(
     config: &Config,
     endpoint: &str,

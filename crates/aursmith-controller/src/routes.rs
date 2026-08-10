@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/requirements", get(requirements))
+        .route("/api/v1/client-bootstrap", get(client_bootstrap))
         .route("/api/v1/workers", get(list_workers).post(register_worker))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
@@ -103,6 +104,10 @@ pub fn router(state: AppState) -> Router {
             get(crate::packages::list_batches),
         )
         .route("/api/v1/releases", get(crate::packages::list_releases))
+        .route(
+            "/api/v1/releases/{id}/rollback",
+            post(crate::packages::rollback_release),
+        )
         .route("/api/v1/archives", get(crate::packages::list_archives))
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -115,6 +120,45 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "service": "controller", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+async fn client_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let value: String = sqlx::query_scalar(
+        "SELECT value_json FROM system_settings WHERE key = 'repository_gpg_fingerprint'",
+    )
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| {
+        ApiError::conflict(
+            "REPOSITORY_KEY_NOT_READY",
+            "请先注册并验证 Publisher 仓库 GPG 指纹",
+        )
+    })?;
+    let fingerprint: String = serde_json::from_str(&value).map_err(ApiError::internal)?;
+    let base = state.config.repository_base_url.trim_end_matches('/');
+    let repository_config =
+        format!("[aursmith]\nSigLevel = Required DatabaseRequired\nServer = {base}/$arch");
+    Ok(Json(json!({
+        "repository_config": repository_config,
+        "gpg_fingerprint": fingerprint,
+        "gpg_key_url": format!("{base}/x86_64/aursmith-repository-key.asc"),
+        "commands": [
+            format!("curl --fail --output /tmp/aursmith-repository-key.asc '{base}/x86_64/aursmith-repository-key.asc'"),
+            "sudo pacman-key --add /tmp/aursmith-repository-key.asc".to_owned(),
+            format!("sudo pacman-key --lsign-key {fingerprint}"),
+            "sudo pacman -Syu".to_owned(),
+        ],
+        "warnings": [
+            "执行导入前必须人工核对页面显示的完整 GPG 指纹。",
+            "AURsmith 仓库必须放在官方仓库之后。",
+            "内部 CA 证书需由管理员通过首次设置页面导出并安装。",
+        ]
+    })))
 }
 
 async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -331,6 +375,24 @@ async fn register_worker(
             "Worker 报告的名称、角色或协议与注册请求不一致",
         ));
     }
+    let repository_fingerprint = if role == "publisher" {
+        Some(
+            remote.data["repository_gpg_fingerprint"]
+                .as_str()
+                .filter(|value| {
+                    value.len() == 40
+                        && value.chars().all(|character| character.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    ApiError::conflict(
+                        "GPG_FINGERPRINT_MISSING",
+                        "Publisher 没有报告有效仓库 GPG 指纹",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let now = Utc::now();
     let labels_json = serde_json::to_string(&request.labels).map_err(ApiError::internal)?;
     sqlx::query(
@@ -355,6 +417,10 @@ async fn register_worker(
             ApiError::internal(error)
         }
     })?;
+    if let Some(fingerprint) = repository_fingerprint {
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('repository_gpg_fingerprint', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
+            .bind(json!(fingerprint).to_string()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+    }
     append_event(
         &state.database,
         "worker",
@@ -738,6 +804,7 @@ mod tests {
             agent_monthly_cost_limit_microusd: 5_000_000,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
+            repository_base_url: "https://repo.test".into(),
         };
         router(AppState::new(
             database,

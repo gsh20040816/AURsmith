@@ -23,6 +23,10 @@ ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当�
 
 Release 提交后，Controller 从 Publisher 读取只含路径、大小和摘要的 Release 文件清单，签发绑定 Publisher、Archiver、writer epoch 和 Release ID 的 TransferCapability。Archiver 使用静态 Publisher UUID→SSH 地址及独立只读拉取密钥直接拉取，按完整文件集合复验后通过 `rsync --link-dest` 创建不可变快照。每个 Worker 首次启动还会在本地 Journal 生成持久化 Ed25519 身份密钥；Controller 注册时固定公钥，ArchiveReceipt 必须由对应 Archiver 签署并与 Release Manifest 及 Capability 文件集合完全一致。Controller 只有在 Receipt 验证通过后才调用源端导出清理，清理失败会保留待重试状态，不能通过提前删除释放空间。
 
+服务端回滚使用短期 ReleaseRollbackAuthorization，只允许当前 writer epoch 的 Publisher 激活已经存在的不可变 Release。Publisher 在切换前重新验证 Manifest、包、db/files 数据库和全部 GPG 签名，不重新构建、运行 repo-add 或调用 Signer。Controller 单独保存当前 Release 指针，并从目标 Release Artifact 清单生成客户端 `pacman -U` 命令；服务端操作不会被描述成客户端自动降级。
+
+Publisher 启动时从只读 secret 导入仓库 GPG 公钥，计算完整指纹并通过 Worker 身份响应交给 Controller 固定，同时把公钥作为普通只读下载文件发布到仓库。客户端引导 API 只在 Publisher 指纹已经注册后提供 pacman 配置和导入命令，页面始终要求用户在本地签名前人工核对完整指纹；AURsmith 仓库配置明确放在官方仓库之后。
+
 ## 状态模型
 
 `Revision`、`Job`、`Attempt`、`Artifact`、`Release` 和 `ArchiveCopy` 是相互独立的聚合。已提交的 Release 不会因为 ArchiveCopy 等待或失败而退回未发布状态。任务采用至少一次投递，Attempt token 用于保证结果接收幂等并拒绝迟到结果。

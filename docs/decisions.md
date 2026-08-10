@@ -24,6 +24,8 @@
 - ADR-020：Worker UUID 由本地 Journal 首次生成并持久化，Controller 注册必须以远端报告值为准，不能在两端各自生成不相关 ID。Artifact 传输采用源端最小 export 目录、固定 rsync sender forced command 和目标端 partial+摘要复验；Publisher 的 Builder 端点来自静态 UUID 映射，不增加服务发现或自研传输协议。
 - ADR-021：ReleaseAuthorization 始终描述完整仓库集合。新批次按 `pkgname` 覆盖上一稳定 Release 的对应 Artifact，未变化包从已签名 hot set 按摘要复用；Signer 每次重新生成完整 db/files 数据库。Publisher 只持仓库公钥，公开顺序固定为不可变 Release、包 hot set、数据库签名、files 链接和最后的 db 链接。
 - ADR-022：ArchiveCopy 复用 TransferCapability 与 forced-command rsync，但使用 `release_id` 而不是 Build Attempt 绑定聚合。Archiver 主动拉取并用 `--link-dest` 建立快照；Receipt 由 Archiver Journal 中持久化的 Ed25519 身份密钥签署，Controller 在 Worker 注册和每次心跳时固定并核对身份公钥。源端 export 只在目标导入或 ArchiveReceipt 验证后由 Controller 触发幂等清理。
+- ADR-023：服务端回滚只激活既有签名 Release，不复制数据库、不重新签名且不改变历史 Release。Controller 将服务端当前指针和客户端降级分开建模，后者始终以显式 `pacman -U` 命令交给用户执行。
+- ADR-024：仓库公钥可以由 Publisher 公开下载，但私钥仍只存在于断网 Signer。Controller 不自行猜测指纹，而是在固定 Publisher 身份时保存其 GPG 完整指纹；客户端引导必须要求人工核对后才执行 `pacman-key --lsign-key`。
 
 ## 已拒绝
 

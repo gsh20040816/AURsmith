@@ -91,6 +91,7 @@ enum WorkerCommand {
     AuthorizeImport { envelope_file: PathBuf },
     CompleteExport { envelope_file: PathBuf },
     AuthorizeRelease { envelope_file: PathBuf },
+    AuthorizeRollback { envelope_file: PathBuf },
     QueryRelease { release_id: String },
     ReleaseFiles { release_id: String },
 }
@@ -146,6 +147,11 @@ async fn main() -> anyhow::Result<()> {
                     let bytes = tokio::fs::read(&envelope_file).await?;
                     let envelope: Value = serde_json::from_slice(&bytes)?;
                     json!({"command": "authorize_release", "envelope": envelope})
+                }
+                WorkerCommand::AuthorizeRollback { envelope_file } => {
+                    let bytes = tokio::fs::read(&envelope_file).await?;
+                    let envelope: Value = serde_json::from_slice(&bytes)?;
+                    json!({"command": "authorize_rollback", "envelope": envelope})
                 }
                 WorkerCommand::QueryRelease { release_id } => {
                     json!({"command": "query_release", "release_id": release_id})
@@ -448,6 +454,7 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         ["authorize-export"]
         | ["authorize-import"]
         | ["authorize-release"]
+        | ["authorize-rollback"]
         | ["complete-export"] => {
             let mut bytes = Vec::new();
             tokio::io::stdin()
@@ -462,6 +469,7 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
                     "authorize-export" => "authorize_export",
                     "authorize-import" => "authorize_import",
                     "complete-export" => "complete_export",
+                    "authorize-rollback" => "authorize_rollback",
                     _ => "authorize_release",
                 },
                 "envelope": envelope

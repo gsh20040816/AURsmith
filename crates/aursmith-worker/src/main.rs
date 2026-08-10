@@ -4,8 +4,8 @@ mod builder;
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
-    ArchiveReceipt, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, SignedEnvelope,
-    TransferCapability,
+    ArchiveReceipt, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest,
+    ReleaseRollbackAuthorization, SignedEnvelope, TransferCapability,
 };
 use chrono::Utc;
 use clap::Parser;
@@ -130,6 +130,7 @@ struct Worker {
     jobs_dir: PathBuf,
     archive_dir: PathBuf,
     identity_signing_key: SigningKey,
+    repository_gpg_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +152,7 @@ enum WorkerCommand {
     AuthorizeRelease { envelope: SignedEnvelope },
     QueryRelease { release_id: String },
     ReleaseFiles { release_id: String },
+    AuthorizeRollback { envelope: SignedEnvelope },
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +202,17 @@ async fn main() -> anyhow::Result<()> {
         serde_json::from_str(&cli.transfer_endpoints_json)
             .context("AURSMITH_TRANSFER_ENDPOINTS_JSON 不是字符串映射")?;
     let aur = aur::AurClient::new(&cli.aur_base_url)?;
+    let repository_public_key = cli.repository_gpg_public_key_file.clone();
+    let repository_gpg_fingerprint = if matches!(cli.role, RoleArg::Publisher) {
+        Some(initialize_publisher_gpg(
+            &cli.publisher_gpg_home,
+            repository_public_key
+                .as_deref()
+                .context("Publisher 必须配置仓库 GPG 公钥")?,
+        )?)
+    } else {
+        None
+    };
     let worker = Arc::new(Worker {
         name: cli.name,
         role: cli.role.into(),
@@ -228,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
         jobs_dir,
         archive_dir: cli.archive_dir,
         identity_signing_key,
+        repository_gpg_fingerprint,
     });
     if worker.builder.is_some() {
         builder::spawn(
@@ -237,11 +251,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if worker.role == WorkerRole::Publisher {
-        let public_key = cli
-            .repository_gpg_public_key_file
-            .as_deref()
-            .context("Publisher 必须配置仓库 GPG 公钥")?;
-        initialize_publisher_gpg(&worker.publisher_gpg_home, public_key)?;
+        publish_repository_public_key(
+            &worker,
+            repository_public_key
+                .as_deref()
+                .context("Publisher 必须配置仓库 GPG 公钥")?,
+        )?;
         spawn_publisher(worker.clone());
     }
     prepare_socket(&cli.socket).await?;
@@ -394,6 +409,7 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         WorkerCommand::AuthorizeRelease { envelope } => authorize_release(worker, envelope).await,
         WorkerCommand::QueryRelease { release_id } => query_release(worker, &release_id).await,
         WorkerCommand::ReleaseFiles { release_id } => release_files(worker, &release_id).await,
+        WorkerCommand::AuthorizeRollback { envelope } => authorize_rollback(worker, envelope).await,
     }
 }
 
@@ -1107,6 +1123,39 @@ async fn query_release(worker: &Worker, release_id: &str) -> WorkerResponse {
     }
 }
 
+async fn authorize_rollback(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher
+        || envelope.verifying_key != worker.trusted_controller_key
+    {
+        return WorkerResponse::error("UNTRUSTED_ROLLBACK", "回滚授权角色或签名无效");
+    }
+    let authorization: ReleaseRollbackAuthorization =
+        match envelope.verify("aursmith.release_rollback_authorization") {
+            Ok(value) => value,
+            Err(error) => return WorkerResponse::error("INVALID_ROLLBACK", error.to_string()),
+        };
+    if authorization.expires_at < Utc::now() || authorization.writer_epoch != worker.writer_epoch {
+        return WorkerResponse::error("INVALID_ROLLBACK", "回滚授权已过期或 writer epoch 不匹配");
+    }
+    let committed = worker
+        .repository_dir
+        .join(&worker.repository_arch)
+        .join("releases")
+        .join(authorization.release_id.to_string());
+    match activate_committed_release(worker, &committed) {
+        Ok(manifest) if manifest.release_id == authorization.release_id => WorkerResponse::ok(
+            "RELEASE_ROLLED_BACK",
+            serde_json::json!({
+                "release_id": manifest.release_id,
+                "manifest_sha256": file_sha256(&committed.join("release-manifest.json")).unwrap_or_default(),
+                "artifacts": manifest.artifacts,
+            }),
+        ),
+        Ok(_) => WorkerResponse::error("ROLLBACK_MISMATCH", "Release 目录与授权 ID 不匹配"),
+        Err(error) => WorkerResponse::error("ROLLBACK_FAILED", error.to_string()),
+    }
+}
+
 async fn release_files(worker: &Worker, release_id: &str) -> WorkerResponse {
     if worker.role != WorkerRole::Publisher || uuid::Uuid::parse_str(release_id).is_err() {
         return WorkerResponse::error("INVALID_RELEASE", "Release ID 或 Worker 角色无效");
@@ -1150,7 +1199,7 @@ fn directory_manifest(root: &Path) -> anyhow::Result<Vec<aursmith_protocol::Mani
         .collect()
 }
 
-fn initialize_publisher_gpg(home: &Path, public_key: &Path) -> anyhow::Result<()> {
+fn initialize_publisher_gpg(home: &Path, public_key: &Path) -> anyhow::Result<String> {
     std::fs::create_dir_all(home)?;
     let metadata = std::fs::symlink_metadata(public_key)?;
     if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 1024 * 1024 {
@@ -1169,7 +1218,37 @@ fn initialize_publisher_gpg(home: &Path, public_key: &Path) -> anyhow::Result<()
     if !status.success() {
         bail!("无法导入仓库 GPG 公钥");
     }
-    Ok(())
+    let output = std::process::Command::new("/usr/bin/gpg")
+        .arg("--homedir")
+        .arg(home)
+        .args(["--batch", "--with-colons", "--fingerprint"])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("无法读取仓库 GPG 指纹");
+    }
+    String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| line.split(':').collect::<Vec<_>>().get(9).copied())
+        .find(|value| {
+            value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .map(str::to_owned)
+        .context("仓库 GPG 公钥没有有效指纹")
+}
+
+fn publish_repository_public_key(worker: &Worker, public_key: &Path) -> anyhow::Result<()> {
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
+    std::fs::create_dir_all(&arch_root)?;
+    let target = arch_root.join("aursmith-repository-key.asc");
+    if target.exists() {
+        if file_sha256(public_key)? != file_sha256(&target)? {
+            bail!("公开仓库已经存在不同 GPG 公钥");
+        }
+        return Ok(());
+    }
+    copy_regular_synced(public_key, &target)?;
+    sync_directory(&arch_root)
 }
 
 fn spawn_publisher(worker: Arc<Worker>) {
@@ -1275,10 +1354,11 @@ fn verify_and_publish_release(
     let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
     if committed.exists() {
         let existing = committed.join("release-manifest.json");
-        if file_sha256(&existing)? == manifest_sha256 {
-            return Ok(manifest_sha256);
+        if file_sha256(&existing)? != manifest_sha256 {
+            bail!("公开 Release ID 已存在不同 Manifest");
         }
-        bail!("公开 Release ID 已存在不同 Manifest");
+        activate_committed_release(worker, &committed)?;
+        return Ok(manifest_sha256);
     }
     let staging = releases_root.join(format!(".{release_id}.staging"));
     if staging.exists() {
@@ -1309,42 +1389,86 @@ fn verify_and_publish_release(
     std::fs::rename(&staging, &committed)?;
     sync_directory(&releases_root)?;
 
+    activate_committed_release(worker, &committed)?;
+    Ok(manifest_sha256)
+}
+
+fn activate_committed_release(
+    worker: &Worker,
+    committed: &Path,
+) -> anyhow::Result<ReleaseManifest> {
+    let manifest_path = committed.join("release-manifest.json");
+    verify_gpg_signature(
+        &worker.publisher_gpg_home,
+        &manifest_path,
+        &committed.join("release-manifest.json.sig"),
+    )?;
+    let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    if manifest.writer_epoch != worker.writer_epoch {
+        bail!("Release writer epoch 与当前 Publisher 不一致");
+    }
+    verify_signed_entry(worker, committed, &manifest.repository_database)?;
+    verify_signed_entry(worker, committed, &manifest.repository_files)?;
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
-    for name in &package_names {
-        copy_new_or_verify(&committed.join(name), &arch_root.join(name))?;
-        let hot_signature = arch_root.join(format!("{name}.sig"));
+    for artifact in &manifest.artifacts {
+        let entry = aursmith_protocol::ManifestEntry {
+            path: artifact.path.clone(),
+            sha256: artifact.sha256.clone(),
+            size: artifact.size,
+        };
+        verify_signed_entry(worker, committed, &entry)?;
+        copy_new_or_verify(
+            &committed.join(&artifact.path),
+            &arch_root.join(&artifact.path),
+        )?;
+        let hot_signature = arch_root.join(format!("{}.sig", artifact.path));
         if hot_signature.exists() {
             verify_gpg_signature(
                 &worker.publisher_gpg_home,
-                &arch_root.join(name),
+                &arch_root.join(&artifact.path),
                 &hot_signature,
             )?;
         } else {
-            copy_regular_synced(&committed.join(format!("{name}.sig")), &hot_signature)?;
+            copy_regular_synced(
+                &committed.join(format!("{}.sig", artifact.path)),
+                &hot_signature,
+            )?;
         }
     }
+    let release_id = manifest.release_id;
+    let repository_name = &manifest.repository_name;
     atomic_release_link(
         &arch_root,
-        &format!("{}.db.sig", authorization.repository_name),
-        &format!("releases/{release_id}/{database_name}.sig"),
+        &format!("{repository_name}.db.sig"),
+        &format!(
+            "releases/{release_id}/{}.sig",
+            manifest.repository_database.path
+        ),
     )?;
     atomic_release_link(
         &arch_root,
-        &format!("{}.files.sig", authorization.repository_name),
-        &format!("releases/{release_id}/{files_name}.sig"),
+        &format!("{repository_name}.files.sig"),
+        &format!(
+            "releases/{release_id}/{}.sig",
+            manifest.repository_files.path
+        ),
     )?;
     atomic_release_link(
         &arch_root,
-        &format!("{}.files", authorization.repository_name),
-        &format!("releases/{release_id}/{files_name}"),
+        &format!("{repository_name}.files"),
+        &format!("releases/{release_id}/{}", manifest.repository_files.path),
     )?;
     atomic_release_link(
         &arch_root,
-        &format!("{}.db", authorization.repository_name),
-        &format!("releases/{release_id}/{database_name}"),
+        &format!("{repository_name}.db"),
+        &format!(
+            "releases/{release_id}/{}",
+            manifest.repository_database.path
+        ),
     )?;
     sync_directory(&arch_root)?;
-    Ok(manifest_sha256)
+    Ok(manifest)
 }
 
 fn verify_signed_entry(
@@ -1561,6 +1685,7 @@ async fn status(worker: &Worker) -> WorkerResponse {
                 "protocol_major": PROTOCOL_MAJOR,
                 "writer_epoch": worker.writer_epoch,
                 "identity_signing_key_hex": hex::encode(worker.identity_signing_key.verifying_key().as_bytes()),
+                "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
                 "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
                 "time": Utc::now(),
             }),

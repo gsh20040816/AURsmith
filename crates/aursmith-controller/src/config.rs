@@ -19,6 +19,7 @@ pub struct Config {
     pub agent_monthly_cost_limit_microusd: i64,
     pub repository_name: String,
     pub source_git_commit: String,
+    pub repository_base_url: String,
 }
 
 impl Config {
@@ -76,6 +77,8 @@ impl Config {
                 .unwrap_or_else(|_| "aursmith".into()),
             source_git_commit: env::var("AURSMITH_SOURCE_GIT_COMMIT")
                 .unwrap_or_else(|_| "development".into()),
+            repository_base_url: env::var("AURSMITH_REPOSITORY_BASE_URL")
+                .unwrap_or_else(|_| "https://repo.aursmith.lan".into()),
         })
     }
 

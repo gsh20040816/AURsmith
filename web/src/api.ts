@@ -130,6 +130,13 @@ export type ArchiveCopy = {
   created_at: string;
   updated_at: string;
 };
+export type ClientBootstrap = {
+  repository_config: string;
+  gpg_fingerprint: string;
+  gpg_key_url: string;
+  commands: string[];
+  warnings: string[];
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -153,7 +160,14 @@ export const api = {
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
   profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
+  rollbackRelease: (id: string) => request<{
+    release_id: string;
+    server_rolled_back: boolean;
+    client_auto_downgrade: false;
+    pacman_commands: string[];
+  }>(`/api/v1/releases/${encodeURIComponent(id)}/rollback`, { method: "POST" }),
   archives: () => request<{ items: ArchiveCopy[] }>("/api/v1/archives"),
+  clientBootstrap: () => request<ClientBootstrap>("/api/v1/client-bootstrap"),
   activateProfile: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>

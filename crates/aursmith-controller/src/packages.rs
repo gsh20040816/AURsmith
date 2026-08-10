@@ -5,6 +5,7 @@ use crate::{
     transport,
 };
 use aursmith_domain::{AuditFile, DependencyGraph, FindingSeverity, scan_aur_wrapper};
+use aursmith_protocol::{ReleaseRollbackAuthorization, SignedEnvelope};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -12,7 +13,7 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1048,6 +1049,77 @@ pub async fn list_archives(
         "created_at": row.get::<String,_>("created_at"),
         "updated_at": row.get::<String,_>("updated_at"),
     })).collect::<Vec<_>>() })))
+}
+
+pub async fn rollback_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(release_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let release_uuid = Uuid::parse_str(&release_id)
+        .map_err(|_| ApiError::bad_request("INVALID_RELEASE", "Release ID 无效"))?;
+    let row = sqlx::query("SELECT releases.manifest_sha256, releases.writer_epoch, workers.endpoint FROM releases JOIN release_authorizations ON release_authorizations.release_id = releases.id JOIN workers ON workers.id = release_authorizations.publisher_worker_id WHERE releases.id = ? AND releases.state = 'committed' AND workers.state = 'online'")
+        .bind(&release_id).fetch_optional(&state.database).await.map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::conflict("RELEASE_NOT_ROLLBACKABLE", "Release 不存在、未提交或 Publisher 不在线"))?;
+    let now = Utc::now();
+    let authorization = ReleaseRollbackAuthorization {
+        release_id: release_uuid,
+        writer_epoch: u64::try_from(row.get::<i64, _>("writer_epoch"))
+            .map_err(ApiError::internal)?,
+        issued_at: now,
+        expires_at: now + Duration::minutes(5),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.release_rollback_authorization",
+        &authorization,
+        &state.signing_key,
+    )
+    .map_err(ApiError::internal)?;
+    let reply =
+        transport::authorize_rollback(&state.config, row.get("endpoint"), &envelope).await?;
+    if reply.data["release_id"].as_str() != Some(release_id.as_str())
+        || reply.data["manifest_sha256"].as_str()
+            != Some(row.get::<String, _>("manifest_sha256").as_str())
+    {
+        return Err(ApiError::conflict(
+            "ROLLBACK_RESULT_MISMATCH",
+            "Publisher 回滚结果与 Controller 记录不一致",
+        ));
+    }
+    let artifact_paths = sqlx::query_scalar::<_, String>("SELECT artifacts.path FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 WHERE release_artifacts.release_id = ? ORDER BY artifacts.path")
+        .bind(&release_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let commands = artifact_paths
+        .into_iter()
+        .map(|path| {
+            let url = format!(
+                "{}/x86_64/releases/{}/{}",
+                state.config.repository_base_url.trim_end_matches('/'),
+                release_id,
+                path
+            );
+            format!("sudo pacman -U '{}'", url.replace('\'', "'\\''"))
+        })
+        .collect::<Vec<_>>();
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('current_release_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
+        .bind(json!(release_id).to_string()).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    append_event_in_transaction(
+        &mut transaction,
+        "release",
+        &release_id,
+        "release_rolled_back",
+        json!({"client_downgrade_required": true}),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "release_id": release_id,
+        "server_rolled_back": true,
+        "client_auto_downgrade": false,
+        "pacman_commands": commands,
+    })))
 }
 
 pub async fn refresh_package(
