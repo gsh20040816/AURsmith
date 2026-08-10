@@ -25,7 +25,7 @@
 | A04 | 已验证 | 覆盖范围、选读文件和“不证明全部源码安全”写入报告 | 无 |
 | B01 | 已验证 | 非 privileged Builder 容器内真实 KVM Fetch→Build | 无 |
 | B02 | 部分验证 | Build VM `-nic none` 实际验证；Publisher Doctor 经 source proxy 转发 Arch HTTPS 冒烟 | Fetch Guest 内真实 source/官方依赖下载尚未在同一 KVM 用例验证 |
-| B03 | 部分验证 | JobSpec、签名 Profile Envelope、source/dependency/artifact 摘要、完整 GuestResult、审计、Agent 报告及有界 build/fetch/QEMU/namcap 日志进入证据链 | Profile qcow2、完整 Source/License 文件包及超过有界内容的完整日志字节尚未随 Release 归档 |
+| B03 | 已验证 | JobSpec、签名 Profile、完整 source tree/License、完整 Build/Fetch/QEMU/namcap 日志、依赖、GuestResult 和 Artifact 均由摘要绑定并随 Release 传输 | 第一版会重复压缩相同 Profile，后续可按内容寻址优化空间 |
 | B04 | 部分验证 | 统计、迟滞、建议、Profile 授权/激活/回滚代码与测试 | 尚未跑“真实统计→重建 Profile→KVM fixture→命中”的完整闭环；pacoloco 命中率未接入 |
 | B05 | 已验证 | HTTPS 镜像进入 Profile 摘要；清华镜像实际构建 Profile | Fetch Guest 命中该镜像下载真实依赖仍属于 B02 缺口 |
 | W01 | 已验证 | 四套 Compose、无裸机服务、静态安全检查和真实容器启动 | 无 |
@@ -35,7 +35,7 @@
 | W05 | 已验证 | 多 Builder 调度、单 writer epoch、单主 Archiver | 无人值守 Publisher failover 明确延期 |
 | R01 | 已验证 | Publisher 路径/元数据/ELF/capability 检查，断网 Signer 与 GPG | capability 包尚未走完整 Publisher→Signer E2E |
 | R02 | 已验证 | 完整 Release、repo-add、签名和数据库最后原子切换实际验证 | 空仓库签名 E2E 尚未执行，但真实 pacman 已能读取空 DB |
-| R03 | 部分验证 | Release/控制面备份、Receipt、库存和恢复内核已有实现；签名授权已携带 Audit、Agent、Profile、provenance 与有界日志证据 | Profile/Source/License 大文件包尚未归档；未做跨设备控制面恢复演练 |
+| R03 | 已验证 | 签名 Release 保存 Audit、Agent、provenance、完整 Profile/Source/License/日志证据；ArchiveReceipt 绑定递归文件集合，rsync 快照恢复测试逐字节通过；控制面备份恢复测试通过 | 跨物理设备恢复仍应在实际部署后按手册演练 |
 | R04 | 已验证 | 服务端签名 Release 回滚和真实客户端 `pacman -U` 降级 | 自动客户端降级明确延期 |
 | U01 | 已验证 | 搜索、包、审计、构建、Worker、Profile、Release、归档、告警、设置页面；Job 可查看成功/失败有界日志，Release 可展开签名证据文档 | 不要求第一版实现复杂日志搜索 |
 | U02 | 部分验证 | 单管理员认证、一次性初始化、GPG/pacman 引导和稳定 URL | 内部 CA 证书导出/轮换仍主要依赖部署配置 |
@@ -43,9 +43,6 @@
 | O01 | 已验证 | 包装 makepkg、repo-add、pacman、QEMU、OpenSSH、rsync、GnuPG、Caddy | 无 |
 | O02 | 已验证 | 全过程直接在 main 使用独立英文提交；Release 记录源码 commit；首个预发布版本使用本地 annotated tag 管理 | 仓库无 remote，未执行 push；正式 v0.1.0 尚未发布 |
 
-## 第一版阻塞项
+## 第一版部署验收项
 
-当前只把以下项目视为完成第一版前必须继续实现：
-
-1. B03/R03：现有签名证据已包含 Revision、AuditBundle、Agent 报告、签名 Profile Envelope、构建 provenance 和有界原始日志；继续通过受限传输加入 Profile qcow2、完整 Source/License 文件包及需要长期保存的超限日志。暂时不能取得的内容必须列为缺失，不能伪装已归档。
-B04 的性能闭环、跨设备恢复演练和外部通知冒烟很重要，但第一版可以在代码主路径、风险边界和手工操作说明完整时作为部署验收项，不继续扩展为高可用或复杂观测系统。
+B03/R03 的代码阻塞已经关闭。真实 provider key、跨物理设备恢复、内部 CA 生命周期、外部通知和热点 Profile 性能收益仍依赖用户部署环境，必须在首次部署时由 Doctor 与恢复手册验收；它们不应被误写成当前开发机已经验证，也不继续扩展为高可用或复杂观测系统。

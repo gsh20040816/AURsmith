@@ -242,7 +242,7 @@
 - Signer 原样复制 Controller 的 `authorization.json`，把它作为 ManifestEntry 写入 GPG 签名的 Release Manifest。Publisher 在公开前复验文件摘要，并把文件字节与数据库中保存的 Controller Envelope 比较；归档文件枚举会自动包含它。
 - Web Release 页面通过管理员认证 API 读取并验证当前 Controller 签名后，显示证据类型、身份和摘要；API 不向未登录用户暴露 Agent 输出。
 - 定向验证执行 `cargo test -p aursmith-protocol -p aursmith-controller -p aursmith-signer -p aursmith-worker`：65 个测试通过。随后执行 `bash scripts/test-all.sh`，全仓库 99 个 Rust 测试、前端类型检查、6 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
-- 未覆盖：本轮未重新运行完整 Publisher→Signer→Archiver 容器链；当前结构化证据只保存日志摘要和 GuestResult，不包含全部原始日志字节、完整上游源码或 License bundle。因此不能据此把 B03/R03 标为已完成。
+- 该轮当时未覆盖大型证据文件；后续“完整 Release 大文件证据与恢复”验证已补齐，旧结论不再代表当前状态。
 
 ## 2026-08-10：Git VCS 历史重写门禁
 
@@ -268,4 +268,12 @@
 - Controller 拒绝未知或重复路径、无效摘要、超过 1 MiB 的日志响应、Base64/UTF-8 不一致和完整小日志摘要不匹配。成功和失败 Job 都写入 `job_evidence`；ReleaseEvidence 额外收集本批次实际 Profile 的 Controller 签名 Envelope 和包清单。
 - 新增管理员 Job evidence API，构建页可以查看成功或失败的日志/provenance；Release 页面从证据摘要继续展开完整结构化文档。日志内容仍按不可信文本展示，不作为 HTML 执行。
 - 单元测试覆盖日志摘要、128 KiB 截断、路径逃逸和完整内容摘要校验；前端 8 个用例中分别覆盖失败 Job 日志查看和 Release 证据展开。最终执行 `bash scripts/test-all.sh`：全仓库 106 个 Rust 测试、前端类型检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
-- 边界：当前归档保存有界日志内容和完整日志摘要，不保存超过上限的全部字节；Profile qcow2、完整 source tree 和 License bundle 尚未进入 Archiver，B03/R03 因此仍为部分验证。
+- 该轮只验证了有界在线日志；后续“完整 Release 大文件证据与恢复”验证已把原始字节补入归档。
+
+## 2026-08-11：完整 Release 大文件证据与恢复
+
+- Builder 对每个成功 Build 生成 `profile.tar.zst`、`source.tar.zst` 和 `build-records.tar.zst`。单元测试实际生成包含 1 MiB 文件的 zstd tar，再由 bsdtar 列出并验证固定三文件 Manifest；最终 Arch Worker 镜像也以 UID 10001 实际完成压缩和读取。
+- Controller migration `0026_release_evidence_files.sql` 保存固定 Attempt 路径、完整大小和 SHA-256。缺少任一归档时 ReleaseBatch 不能进入 Artifact 传输；证据与包共用 Controller 签名的 TransferCapability，Publisher 只接受摘要完全匹配的已验证导入。
+- 断网、只读根文件系统、`cap_drop: ALL` 的实际 Signer 容器处理了含嵌套证据的测试 Release。输入和输出证据 SHA-256 一致，GPG 签名的 Release Manifest 列出同一清单；Publisher Worker 随后实际验签、提交并通过 `release-files` 返回该嵌套路径。
+- Archiver 恢复测试调用生产 rsync `--link-dest` 快照路径，签名 ArchiveReceipt 的递归文件集合包含 `evidence/attempt/source.tar.zst`，并从不可变 Release 目录逐字节恢复 `complete source bytes`。
+- 最终执行 `bash scripts/test-all.sh`：全仓库 108 个 Rust 测试、前端 TypeScript 检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。容器测试所用临时 GPG 密钥和测试包只用于本地验证，不属于仓库发布密钥。

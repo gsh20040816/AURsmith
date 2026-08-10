@@ -16,6 +16,7 @@
 - Publisher 检查、断网 Signer、GPG、repo-add、完整 Release 原子发布、Archiver Receipt 与库存巡检。
 - 实际 pacman 安装、升级、服务端回滚及客户端显式降级流程。
 - Web 控制台、认证 SSE、告警、设置、Doctor、备份、Job 日志和 Release 签名证据。
+- 完整 Profile、Source/License 和未截断构建日志作为独立证据文件，经授权传输、签名 Release Manifest 与 ArchiveReceipt 归档。
 
 ### 已验证
 
@@ -24,7 +25,6 @@
 
 ### 已知限制
 
-- 尚未把 Profile qcow2、完整 source tree/License bundle 和超限日志全文传输到 Archiver；结构化 Profile/Source Manifest、摘要和有界日志已归档。
 - 真实 Codex/Claude provider 调用需要部署者 API key，本次没有产生付费模型调用。
 - Fetch VM 内真实外部 source 与官方依赖下载尚未在同一 KVM 用例中验证。
 - 尚无 Git remote，因此该预发布版本只创建本地 annotated tag，不包含 push 或托管平台 Release。

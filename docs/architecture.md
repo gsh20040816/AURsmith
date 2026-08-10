@@ -89,7 +89,11 @@ Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publish
 
 Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.PKGINFO`：路径逃逸、重复条目、设备文件、FIFO、Socket，以及缺失或重复的 `.PKGINFO`、`.BUILDINFO`、`.MTREE` 会失败关闭；包名、版本和架构必须与 BuildResult 一致。INSTALL 脚本、pacman hook、systemd 单元、setuid/setgid 文件和内核模块作为风险事实记录，不因类别本身宣称恶意。对可执行文件和共享库候选，Publisher 通过 bsdtar 按单文件安全提取到临时文件，再以固定 argv 运行 readelf 并记录每个 ELF 的 `DT_NEEDED`。file capability 不通过需要特权的实际解包恢复，而是从归档的 pax `LIBARCHIVE.xattr.security.capability` 头识别并绑定路径。结构化 `artifact-inspections.json` 随 Signer 输入进入断网边界，Signer核对报告数量和大小，并把其摘要写入 GPG 签名的 Release Manifest；因此 Archiver 会与 Release 一起保存这份发布前检查证据。
 
-Controller 在 Attempt 对账事务中保存完整 GuestResult 和有界诊断日志，而不是只保留最终 Artifact 行。Builder 对 QEMU stdout/stderr、fetch、build、namcap 和 Guest 错误文件记录完整大小与 SHA-256；每个普通日志最多内嵌前 128 KiB UTF-8/Base64 内容，超过 64 MiB 的异常日志明确记录省略原因，不能让不可信输出撑爆控制消息。创建 ReleaseAuthorization 时，系统收集 ReleaseBatch、参与 Revision、AuditBundle、成功 Agent 报告、Controller 签名 Profile Envelope 和 Job 证据，形成版本化 `ReleaseEvidence`；每条记录都有基于规范 JSON 的 SHA-256。证据最多 10000 条、序列化后最多 16 MiB，超限时阻止发布并要求人工拆分，不能静默截断。`authorization.json` 由 Controller Ed25519 签名，Signer 原样复制并将其文件摘要写入 GPG 签名的 Release Manifest，Publisher 逐字节复验，因此 Archiver 的 Release 文件集合自动包含这份证据。管理员可以从 Job 页面查看成功或失败日志，从 Release 页面展开归档证据。当前证据仍不等于完整 Source/License 文件包或 Profile qcow2 本体；这些大文件必须另行通过受限传输补齐。
+Controller 在 Attempt 对账事务中保存完整 GuestResult 和有界诊断日志，而不是只保留最终 Artifact 行。Builder 对 QEMU stdout/stderr、fetch、build、namcap 和 Guest 错误文件记录完整大小与 SHA-256；每个普通日志最多内嵌前 128 KiB UTF-8/Base64 内容，超过 64 MiB 的异常日志明确记录省略原因，不能让不可信输出撑爆控制消息。创建 ReleaseAuthorization 时，系统收集 ReleaseBatch、参与 Revision、AuditBundle、成功 Agent 报告、Controller 签名 Profile Envelope 和 Job 证据，形成版本化 `ReleaseEvidence`；每条记录都有基于规范 JSON 的 SHA-256。结构化证据最多 10000 条、序列化后最多 16 MiB，超限时阻止发布并要求人工拆分，不能静默截断。
+
+成功 Build 还会在退出 KVM 后生成三个独立的只读证据归档。`profile.tar.zst` 保存 `root.qcow2`、内核、initramfs、已安装包清单和 Controller 签名的 Profile Envelope；`source.tar.zst` 保存对应 Fetch Attempt 的完整 `prepared` source tree、Source Manifest、Fetch 日志和 QEMU 记录，因而同时保留上游源码及其中的许可证文件；`build-records.tar.zst` 保存未截断的 Build/QEMU/namcap 日志、GuestResult 和签名 JobSpec。逻辑路径固定为 `evidence/<attempt-id>/...`，Controller 只接受这三个文件并记录完整大小和 SHA-256。它们与软件包共用一次性 `TransferCapability` 直接从 Builder 传到 Publisher，不经过 Controller。
+
+Publisher 和断网 Signer 不解包证据归档，只验证授权路径、普通文件类型、大小和摘要。Signer 将证据复制到不可变 Release，并把清单写入 GPG 签名的 Release Manifest；Publisher 逐项复验后才原子提交。`release-files` 递归返回证据文件，Archiver 再以完整目录 Manifest、rsync 快照和签名 ArchiveReceipt 绑定实际字节。管理员可以从 Job 页面查看有界在线日志，从 Release 或归档恢复完整原始证据。
 
 ## Builder KVM 执行内核
 

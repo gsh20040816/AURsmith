@@ -45,10 +45,11 @@
 - ADR-041：Publisher 的 ELF 检查使用固定路径 readelf，只对归档中经过安全路径与普通文件验证的候选逐个提取到有界临时文件。file capability 直接检查 pax 扩展头，不要求 Publisher 以 root 或获得 `CAP_SETFCAP` 来恢复 xattr。两类结果都是风险与溯源事实，不单独作为恶意判定。
 - ADR-042：Job 自动重试以明确 failure code 白名单和 Attempt generation 为准，最多重试两次。`uncertain` 必须等待三十分钟再查询 Worker Journal；不能因一次 SSH 错误立即生成可能重复执行的新 Attempt。确定性输入、Profile、身份和审计错误永不进入自动重试白名单。
 - ADR-043：第一版实时进度使用认证 SSE 加 SQLite 增量快照，不引入 Redis、Kafka 或 WebSocket 服务。SSE 只作为“状态已变化”通知，页面随后读取 JSON API，避免连接丢帧后浏览器与控制面状态分叉。
-- ADR-044：Release 证据索引直接进入 Controller 签名的 ReleaseAuthorization，不新建独立证据服务或对象存储。Signer 把原始授权纳入 GPG 签名的 Release Manifest，Publisher 逐字节复验，Archiver 因而自动保存相同证据。内嵌内容限制为 10000 条和 16 MiB，适合结构化审计与 provenance；大型源码、License bundle 和原始日志以后使用单独的受限文件传输，未完成前 B03/R03 不能标记为全部完成。
+- ADR-044：Release 证据索引直接进入 Controller 签名的 ReleaseAuthorization，不新建独立证据服务或对象存储。Signer 把原始授权纳入 GPG 签名的 Release Manifest，Publisher 逐字节复验，Archiver 因而自动保存相同证据。内嵌内容限制为 10000 条和 16 MiB，适合结构化审计与 provenance；大型源码、Profile 和原始日志使用独立证据文件并复用受限文件传输。
 - ADR-045：Git VCS 历史重写以真实 commit 祖先关系判定，不能用版本字符串倒退或“commit 只要变化就可疑”的近似规则。网络检查只在 Publisher 上运行，固定已验证公共 IP 并禁用危险 Git 协议和重定向。重写审批绑定 previous/current commit 对，批准一次不会形成永久信任。
 - ADR-046：Agent Doctor 禁止通过真实审计请求探测，以免健康检查产生模型费用或把空 fixture 当安全结论。Runner 只检查 CLI、非秘密配置和凭据网关 TCP；Publisher Doctor 负责 AUR 与 source proxy 的实际网络路径。Doctor 失败必须展示具体子检查，不静默降级成“已配置”。
-- ADR-047：第一版日志证据直接进入现有 `job_evidence` 与签名 ReleaseAuthorization，不为日志再引入对象存储。每文件内嵌内容限制 128 KiB、控制响应限制 1 MiB、ReleaseEvidence 限制 16 MiB，同时保存完整大小和摘要；超大日志明确省略而不是截断后冒充完整。失败 Job 证据保留在控制面，成功 Job 证据随 Release 归档。
+- ADR-047：第一版日志证据直接进入现有 `job_evidence` 与签名 ReleaseAuthorization，不为日志再引入对象存储。每文件内嵌内容限制 128 KiB、控制响应限制 1 MiB、ReleaseEvidence 限制 16 MiB，同时保存完整大小和摘要；超大日志在控制消息中明确省略，原始字节仍进入 Build 证据归档。失败 Job 证据保留在控制面，成功 Job 证据随 Release 归档。
+- ADR-048：每个成功 Build 生成三个独立的 zstd tar 证据文件：完整签名 Profile、完整 Fetch 输出与 source tree、完整 Build 日志和签名 JobSpec。Controller 只接受绑定 Attempt UUID 的固定三路径清单，并把它们加入原 Artifact `TransferCapability`；Publisher 与 Signer 不解包这些不可信归档，只校验普通文件、大小和 SHA-256。GPG 签名的 Release Manifest 绑定全部证据摘要，Archiver 的目录 Manifest 和 ArchiveReceipt 再绑定实际文件集合。第一版优先保证灾备完整性，跨 Release 的 Profile 内容寻址去重作为后续存储优化。
 
 ## 已拒绝
 
