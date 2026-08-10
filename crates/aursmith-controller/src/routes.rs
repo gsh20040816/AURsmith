@@ -5,18 +5,23 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
-    response::IntoResponse,
+    response::{
+        IntoResponse, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     sync::Arc,
 };
 use tower_http::{
@@ -52,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/requirements", get(requirements))
         .route("/api/v1/settings", get(settings).put(update_settings))
+        .route("/api/v1/events", get(events))
         .route("/api/v1/client-bootstrap", get(client_bootstrap))
         .route("/api/v1/doctor", get(doctor_status))
         .route("/api/v1/metrics", get(metrics_status))
@@ -151,6 +157,70 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "service": "controller", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+async fn events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let database = state.database.clone();
+    let stream = stream::unfold(
+        (
+            database,
+            String::new(),
+            tokio::time::interval(std::time::Duration::from_secs(2)),
+        ),
+        |(database, mut previous, mut timer)| async move {
+            loop {
+                timer.tick().await;
+                let snapshot = live_snapshot(&database).await.unwrap_or_else(
+                    |error| json!({"kind": "controller_error", "message": error.to_string()}),
+                );
+                let serialized = snapshot.to_string();
+                if serialized != previous {
+                    previous = serialized.clone();
+                    return Some((
+                        Ok(Event::default().data(serialized)),
+                        (database, previous, timer),
+                    ));
+                }
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("aursmith"),
+    ))
+}
+
+async fn live_snapshot(database: &SqlitePool) -> Result<Value, sqlx::Error> {
+    let event_sequence: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events")
+        .fetch_one(database)
+        .await?;
+    let jobs_updated_at: Option<String> = sqlx::query_scalar("SELECT MAX(updated_at) FROM jobs")
+        .fetch_one(database)
+        .await?;
+    let releases_updated_at: Option<String> =
+        sqlx::query_scalar("SELECT MAX(COALESCE(committed_at, created_at)) FROM releases")
+            .fetch_one(database)
+            .await?;
+    let archives_updated_at: Option<String> =
+        sqlx::query_scalar("SELECT MAX(updated_at) FROM archive_copies")
+            .fetch_one(database)
+            .await?;
+    let open_alerts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE state IN ('open', 'acknowledged')")
+            .fetch_one(database)
+            .await?;
+    Ok(json!({
+        "event_sequence": event_sequence,
+        "jobs_updated_at": jobs_updated_at,
+        "releases_updated_at": releases_updated_at,
+        "archives_updated_at": archives_updated_at,
+        "open_alerts": open_alerts
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1358,5 +1428,20 @@ mod tests {
             .unwrap();
         let response = app.oneshot(activate).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn live_snapshot_changes_with_jobs_and_alerts() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let before = live_snapshot(&database).await.unwrap();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO jobs(id, required_role, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', 'queued', 1, 'fetch', '[]', '[]', '[]', ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, 'live-test', 'warning', 'open', '测试', '{}', ?)")
+            .bind(Uuid::new_v4().to_string()).bind(now).execute(&database).await.unwrap();
+        let after = live_snapshot(&database).await.unwrap();
+        assert!(before["jobs_updated_at"].is_null());
+        assert!(after["jobs_updated_at"].is_string());
+        assert_eq!(after["open_alerts"], 1);
     }
 }

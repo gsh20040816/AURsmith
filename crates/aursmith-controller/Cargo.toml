@@ -15,6 +15,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
 serde.workspace = true

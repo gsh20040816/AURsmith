@@ -44,6 +44,7 @@
 - ADR-040：Agent 的调用和成本预算允许通过认证 Web API 在运行时覆盖，调度器直接读取持久化值；provider、Base URL、模型和 API key 不做热更新，继续由 Compose 环境与 Docker secret 管理。这样设置页可处理日常限额，又不会把 provider 凭据复制进 Controller 数据库或浏览器。
 - ADR-041：Publisher 的 ELF 检查使用固定路径 readelf，只对归档中经过安全路径与普通文件验证的候选逐个提取到有界临时文件。file capability 直接检查 pax 扩展头，不要求 Publisher 以 root 或获得 `CAP_SETFCAP` 来恢复 xattr。两类结果都是风险与溯源事实，不单独作为恶意判定。
 - ADR-042：Job 自动重试以明确 failure code 白名单和 Attempt generation 为准，最多重试两次。`uncertain` 必须等待三十分钟再查询 Worker Journal；不能因一次 SSH 错误立即生成可能重复执行的新 Attempt。确定性输入、Profile、身份和审计错误永不进入自动重试白名单。
+- ADR-043：第一版实时进度使用认证 SSE 加 SQLite 增量快照，不引入 Redis、Kafka 或 WebSocket 服务。SSE 只作为“状态已变化”通知，页面随后读取 JSON API，避免连接丢帧后浏览器与控制面状态分叉。
 
 ## 已拒绝
 

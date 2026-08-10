@@ -228,3 +228,10 @@
 - 界面：任务 API 和构建页新增阶段、Attempt 数量和下次重试时间，用户可以区分排队、退避、状态不确定和确定性失败。
 - 测试：真实 SQLite migration 上连续模拟 generation 0、1、2 三次不可达，前两次回到 queued 且具有退避时间，第三次进入 failed 并只创建一个去重告警。全量测试还覆盖 migration、旧 Journal 幂等和迟到 Attempt。
 - 边界：同一 ReleaseBatch 的 Build 因 Fetch 产物亲和性仍不能任意切换到其他 Builder；原 Worker 永久丢失时会在重试耗尽后告警，而不是绕过签名传输规则到其他节点重新联网构建。
+
+## 2026-08-10：认证 SSE 实时进度
+
+- 后端：新增只接受管理员会话 cookie 的 `/api/v1/events`。流比较 append-only event sequence、Job/Release/Archive 更新时间和未解决告警数，状态未变化不重复发送；十五秒 keep-alive 由 Axum 生成。
+- 前端：登录成功后建立同源 EventSource，侧栏显示“实时连接正常/重试中”；收到变化帧后增加版本号，构建页重新读取 `/jobs` 权威状态。页面不从 SSE payload 拼装业务对象，因此断线重连不会漏掉最终状态。
+- 测试：SQLite 测试确认添加 Job 与告警会改变实时快照；TypeScript 与生产构建验证浏览器端 EventSource 生命周期。jsdom 没有 EventSource 时页面安全跳过连接，不用假对象伪造实时成功。
+- 边界：第一版只让高频构建页自动刷新，其他页面仍保留手工刷新按钮；SSE 是状态变化流，不是逐行构建日志传输。Worker 当前保存 build/fetch/QEMU 日志，按需日志流 API 仍是后续缺口。

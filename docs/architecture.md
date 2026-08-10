@@ -47,6 +47,8 @@ Controller 定期通过已经固定 host key 的 Worker `status` 命令获取角
 
 `/api/v1/metrics` 汇总任务状态、成功 Attempt 的阶段平均耗时、Agent 调用/失败/成本、依赖下载与缓存命中，以及归档副本状态。第一版由认证后的 Web UI 消费该 JSON，不另行引入 Prometheus、Redis 或消息系统。
 
+`/api/v1/events` 使用与普通 API 相同的管理员会话认证，并以 SSE 发送控制面增量快照。Controller 每两秒比较事件序号、Job/Release/Archive 更新时间和未解决告警数，只有状态变化时才发送 data frame；每十五秒发送 keep-alive 注释。浏览器断线使用 EventSource 原生重连，构建页收到变化后重新读取权威 JSON，不把 SSE 数据本身当作可写状态或完整日志存储。
+
 Controller 每 24 小时或按管理员请求执行一次控制面一致性备份。备份使用 SQLite `VACUUM INTO` 从 WAL 数据库生成单文件快照，随后执行 `PRAGMA integrity_check`、计算 SHA-256，并用 Controller Ed25519 身份签署版本化 `ControlPlaneBackup`。数据库文件和签名 Envelope 先在同一文件系统暂存、同步，再以目录 rename 提交；失败记录不会冒充 verified。控制面数据库保存密码哈希和业务状态但不保存 GPG、SSH、CA 或 Agent API 私钥，因此这些 secret 仍必须按首次向导要求另行离线备份。
 
 每个 verified 控制面备份还会进入独立归档调度。Controller 根据自身 Ed25519 公钥确定一个稳定、非秘密的传输源 UUID，签发同时绑定 Backup ID、Archiver UUID、两份文件摘要和期限的 TransferCapability，并把最小导出目录只读暴露给同 Stack 的 `backup-ssh`。该 SSH sidecar 与 Worker 一样禁止 Shell、PTY 和转发，只允许 rsync sender 读取数据库和备份 Envelope。Archiver 通过静态 UUID→SSH 端点主动拉取，既复验 Capability 文件集合，又验证内部 `ControlPlaneBackup` 确由当前 Controller 签署，随后保存到 `control-plane-backups/<Backup ID>` 并返回自身签名的 `BackupArchiveReceipt`。Controller 只有核对 Receipt 身份、Backup ID 和完整文件集合后才标记独立归档完成并清理临时导出。
