@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
             package_version: Some(field("pkgver")?),
             architecture: Some(field("arch")?),
         }],
+        removed_package_names: vec![],
         issued_at: Utc::now(),
         expires_at: Utc::now() + Duration::minutes(10),
     };

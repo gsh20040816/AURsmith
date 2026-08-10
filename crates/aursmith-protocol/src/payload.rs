@@ -227,6 +227,8 @@ pub struct ReleaseAuthorization {
     pub revision_sha256s: Vec<String>,
     pub audit_report_sha256s: Vec<String>,
     pub artifacts: Vec<ArtifactRecord>,
+    #[serde(default)]
+    pub removed_package_names: Vec<String>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -239,6 +241,8 @@ pub struct ReleaseManifest {
     pub repository_name: String,
     pub writer_epoch: u64,
     pub artifacts: Vec<ArtifactRecord>,
+    #[serde(default)]
+    pub removed_package_names: Vec<String>,
     pub repository_database: ManifestEntry,
     pub repository_files: ManifestEntry,
     #[serde(default)]

@@ -111,11 +111,16 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
     }
     package_paths.sort();
     let database = staging.join(format!("{}.db.tar.gz", authorization.repository_name));
-    let mut repo_arguments = vec![database.as_os_str().to_owned()];
-    repo_arguments.extend(package_paths.iter().map(|path| path.as_os_str().to_owned()));
-    run_checked("/usr/bin/repo-add", &repo_arguments)?;
-    gpg_sign(cli, &database)?;
     let files_database = staging.join(format!("{}.files.tar.gz", authorization.repository_name));
+    if package_paths.is_empty() {
+        create_empty_repository_database(&database)?;
+        create_empty_repository_database(&files_database)?;
+    } else {
+        let mut repo_arguments = vec![database.as_os_str().to_owned()];
+        repo_arguments.extend(package_paths.iter().map(|path| path.as_os_str().to_owned()));
+        run_checked("/usr/bin/repo-add", &repo_arguments)?;
+    }
+    gpg_sign(cli, &database)?;
     gpg_sign(cli, &files_database)?;
     let inspection_source = entry.path().join("artifact-inspections.json");
     let inspection_bytes = fs::read(&inspection_source)?;
@@ -134,6 +139,7 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         repository_name: authorization.repository_name,
         writer_epoch: authorization.writer_epoch,
         artifacts: authorization.artifacts,
+        removed_package_names: authorization.removed_package_names,
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
         artifact_inspections: Some(file_entry(&inspection_destination)?),
@@ -160,10 +166,11 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
     {
         bail!("仓库名称无效");
     }
-    if authorization.artifacts.is_empty() {
-        bail!("Release 不包含软件包");
+    if authorization.artifacts.is_empty() && authorization.removed_package_names.is_empty() {
+        bail!("Release 既不包含软件包，也没有清除操作");
     }
     let mut artifact_paths = std::collections::BTreeSet::new();
+    let mut package_names = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         aursmith_protocol::validate_relative_path(&artifact.path)?;
         let file_name = Path::new(&artifact.path)
@@ -185,8 +192,34 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
             bail!("Artifact Manifest 不匹配：{}", artifact.path);
         }
         validate_package_metadata(&path, artifact)?;
+        package_names.insert(artifact.package_name.clone().unwrap_or_default());
+    }
+    let mut removed = std::collections::BTreeSet::new();
+    for package_name in &authorization.removed_package_names {
+        if package_name.is_empty()
+            || !package_name
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || "@._+-".contains(value))
+            || !removed.insert(package_name)
+            || package_names.contains(package_name)
+        {
+            bail!("Release 清除目标无效：{package_name}");
+        }
     }
     Ok(())
+}
+
+fn create_empty_repository_database(path: &Path) -> anyhow::Result<()> {
+    run_checked(
+        "/usr/bin/bsdtar",
+        &[
+            "-czf".into(),
+            path.as_os_str().into(),
+            "--format=gnutar".into(),
+            "-T".into(),
+            "/dev/null".into(),
+        ],
+    )
 }
 
 fn validate_package_metadata(path: &Path, artifact: &ArtifactRecord) -> anyhow::Result<()> {
@@ -292,9 +325,24 @@ mod tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
+            removed_package_names: vec![],
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };
         assert!(validate_authorization(&authorization, root.path()).is_err());
+    }
+
+    #[test]
+    fn empty_repository_database_is_a_readable_archive() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("aursmith.db.tar.gz");
+        create_empty_repository_database(&database).unwrap();
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["-tf"])
+            .arg(&database)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(fs::metadata(database).unwrap().len() > 0);
     }
 }

@@ -1183,7 +1183,7 @@ async fn authorize_release(worker: &Worker, envelope: SignedEnvelope) -> WorkerR
         };
     if authorization.writer_epoch != worker.writer_epoch
         || authorization.expires_at < Utc::now()
-        || authorization.artifacts.is_empty()
+        || (authorization.artifacts.is_empty() && authorization.removed_package_names.is_empty())
     {
         return WorkerResponse::error(
             "INVALID_RELEASE",
@@ -1264,7 +1264,11 @@ async fn authorize_release(worker: &Worker, envelope: SignedEnvelope) -> WorkerR
 fn validate_release_authorization_for_publisher(
     authorization: &ReleaseAuthorization,
 ) -> anyhow::Result<()> {
+    if authorization.artifacts.is_empty() && authorization.removed_package_names.is_empty() {
+        bail!("Release 没有软件包或清除目标");
+    }
     let mut paths = std::collections::BTreeSet::new();
+    let mut package_names = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         aursmith_protocol::validate_relative_path(&artifact.path)?;
         let file_name = Path::new(&artifact.path)
@@ -1281,6 +1285,19 @@ fn validate_release_authorization_for_publisher(
             || artifact.architecture.is_none()
         {
             bail!("Release Artifact 元数据无效：{}", artifact.path);
+        }
+        package_names.insert(artifact.package_name.clone().unwrap_or_default());
+    }
+    let mut removed = std::collections::BTreeSet::new();
+    for package_name in &authorization.removed_package_names {
+        if package_name.is_empty()
+            || !package_name
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || "@._+-".contains(value))
+            || !removed.insert(package_name)
+            || package_names.contains(package_name)
+        {
+            bail!("Release 清除目标无效：{package_name}");
         }
     }
     Ok(())
@@ -1561,6 +1578,7 @@ fn verify_and_publish_release(
         || manifest.repository_name != authorization.repository_name
         || manifest.source_git_commit != authorization.source_git_commit
         || manifest.artifacts != authorization.artifacts
+        || manifest.removed_package_names != authorization.removed_package_names
     {
         bail!("ReleaseManifest 与 Controller 授权不一致");
     }
@@ -2323,11 +2341,17 @@ mod transfer_tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
+            removed_package_names: vec![],
             issued_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
         };
         assert!(validate_release_authorization_for_publisher(&authorization).is_ok());
         authorization.artifacts[0].path = "nested/fixture-1-1-any.pkg.tar.zst".into();
+        assert!(validate_release_authorization_for_publisher(&authorization).is_err());
+        authorization.artifacts.clear();
+        authorization.removed_package_names = vec!["fixture".into()];
+        assert!(validate_release_authorization_for_publisher(&authorization).is_ok());
+        authorization.removed_package_names = vec!["../fixture".into()];
         assert!(validate_release_authorization_for_publisher(&authorization).is_err());
     }
 

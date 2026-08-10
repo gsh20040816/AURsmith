@@ -747,7 +747,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
 
-    let batch = sqlx::query("SELECT id FROM release_batches WHERE state = 'artifacts_ready' AND NOT EXISTS (SELECT 1 FROM releases WHERE releases.batch_id = release_batches.id) ORDER BY created_at LIMIT 1")
+    let batch = sqlx::query("SELECT id, state, graph_json FROM release_batches WHERE state IN ('artifacts_ready', 'queued_removal') AND NOT EXISTS (SELECT 1 FROM releases WHERE releases.batch_id = release_batches.id) ORDER BY created_at LIMIT 1")
         .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
     let Some(batch) = batch else {
         return Ok(());
@@ -758,16 +758,69 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     };
     let batch_id: String = batch.get("id");
+    let batch_state: String = batch.get("state");
+    let removed_package_names = if batch_state == "queued_removal" {
+        let graph: serde_json::Value =
+            serde_json::from_str(batch.get("graph_json")).map_err(ApiError::internal)?;
+        let package_bases: Vec<String> = serde_json::from_value(
+            graph
+                .get("remove")
+                .cloned()
+                .ok_or_else(|| ApiError::internal("清除批次缺少 remove 清单"))?,
+        )
+        .map_err(ApiError::internal)?;
+        if package_bases.is_empty() {
+            return Err(ApiError::conflict(
+                "REMOVAL_TARGET_MISSING",
+                "清除批次没有软件包目标",
+            ));
+        }
+        let mut outputs = BTreeSet::new();
+        for package_base in package_bases {
+            let snapshots: Vec<String> =
+                sqlx::query_scalar("SELECT metadata_json FROM revisions WHERE package_base = ?")
+                    .bind(&package_base)
+                    .fetch_all(&state.database)
+                    .await
+                    .map_err(ApiError::internal)?;
+            if snapshots.is_empty() {
+                return Err(ApiError::conflict(
+                    "REMOVAL_METADATA_MISSING",
+                    format!("清除目标 {package_base} 没有 Revision 元数据"),
+                ));
+            }
+            for snapshot in snapshots {
+                let value: serde_json::Value =
+                    serde_json::from_str(&snapshot).map_err(ApiError::internal)?;
+                outputs.extend(
+                    value["outputs"]
+                        .as_array()
+                        .ok_or_else(|| ApiError::internal("Revision 元数据缺少 outputs"))?
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned)),
+                );
+            }
+        }
+        outputs
+    } else {
+        BTreeSet::new()
+    };
     let artifact_rows = sqlx::query("SELECT artifacts.path, artifacts.sha256, artifacts.size, artifacts.package_name, artifacts.package_version, artifacts.architecture FROM artifacts JOIN jobs ON jobs.id = artifacts.job_id WHERE jobs.batch_id = ? AND jobs.kind = 'build' AND jobs.status = 'succeeded' ORDER BY artifacts.path")
         .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    if artifact_rows.is_empty() {
+    if artifact_rows.is_empty() && batch_state != "queued_removal" {
         return Err(ApiError::conflict(
             "ARTIFACTS_MISSING",
             "ReleaseBatch 没有可发布 Artifact",
         ));
     }
-    let previous_rows = sqlx::query("SELECT artifacts.path, artifacts.sha256, artifacts.size, artifacts.package_name, artifacts.package_version, artifacts.architecture FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 JOIN releases ON releases.id = release_artifacts.release_id WHERE releases.id = (SELECT id FROM releases WHERE state = 'committed' ORDER BY committed_at DESC LIMIT 1) ORDER BY artifacts.path")
-        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let previous_rows = if let Some(current_release_id) =
+        current_release_id(&state.database).await?
+    {
+        sqlx::query("SELECT artifacts.path, artifacts.sha256, artifacts.size, artifacts.package_name, artifacts.package_version, artifacts.architecture FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 WHERE release_artifacts.release_id = ? ORDER BY artifacts.path")
+            .bind(current_release_id).fetch_all(&state.database).await.map_err(ApiError::internal)?
+    } else {
+        Vec::new()
+    };
     let parse_artifact = |row: sqlx::sqlite::SqliteRow| -> Result<ArtifactRecord, ApiError> {
         Ok(ArtifactRecord {
             path: row.get("path"),
@@ -782,6 +835,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         .into_iter()
         .map(&parse_artifact)
         .collect::<Result<Vec<_>, _>>()?;
+    let previous_artifacts = remove_release_artifacts(previous_artifacts, &removed_package_names);
     let changed_artifacts = artifact_rows
         .into_iter()
         .map(parse_artifact)
@@ -804,6 +858,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         revision_sha256s,
         audit_report_sha256s,
         artifacts,
+        removed_package_names: removed_package_names.into_iter().collect(),
         issued_at: now,
         expires_at: now + Duration::hours(1),
     };
@@ -873,6 +928,29 @@ fn merge_release_artifacts(
         );
     }
     complete.into_values().collect()
+}
+
+fn remove_release_artifacts(
+    artifacts: Vec<ArtifactRecord>,
+    removed_package_names: &BTreeSet<String>,
+) -> Vec<ArtifactRecord> {
+    artifacts
+        .into_iter()
+        .filter(|artifact| {
+            artifact
+                .package_name
+                .as_ref()
+                .is_none_or(|name| !removed_package_names.contains(name))
+        })
+        .collect()
+}
+
+async fn current_release_id(database: &sqlx::SqlitePool) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar("SELECT COALESCE((SELECT json_extract(value_json, '$') FROM system_settings WHERE key = 'current_release_id'), (SELECT id FROM releases WHERE state = 'committed' ORDER BY committed_at DESC LIMIT 1))")
+        .fetch_optional(database)
+        .await
+        .map_err(ApiError::internal)
+        .map(Option::flatten)
 }
 
 async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
@@ -1672,6 +1750,38 @@ async fn load_batch_dependency_attempts(
 mod release_tests {
     use super::*;
 
+    fn state(database: sqlx::SqlitePool) -> AppState {
+        AppState::new(
+            database,
+            crate::config::Config {
+                bind_address: "127.0.0.1:0".into(),
+                database_url: "sqlite::memory:".into(),
+                setup_token: "测试初始化令牌-至少二十个字符".into(),
+                signing_key_file: "/不存在".into(),
+                ssh_identity_source_file: "/不存在".into(),
+                ssh_identity_file: "/不存在".into(),
+                ssh_known_hosts_file: "/不存在".into(),
+                secure_cookies: false,
+                session_hours: 1,
+                low_agent_endpoints: vec![],
+                high_agent_endpoint: String::new(),
+                agent_daily_call_limit: 300,
+                agent_monthly_call_limit: 3000,
+                agent_monthly_cost_limit_microusd: 5_000_000,
+                repository_name: "aursmith".into(),
+                source_git_commit: "test".into(),
+                repository_base_url: "https://repo.test".into(),
+                webhook_url: None,
+                webhook_hmac_secret_file: "/不存在".into(),
+                ntfy_url: None,
+                backup_dir: "/不存在".into(),
+                backup_export_dir: "/不存在".into(),
+                backup_export_socket: "/不存在".into(),
+            },
+            ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
+        )
+    }
+
     fn artifact(name: &str, version: &str) -> ArtifactRecord {
         ArtifactRecord {
             path: format!("{name}-{version}-x86_64.pkg.tar.zst"),
@@ -1695,6 +1805,27 @@ mod release_tests {
         assert_eq!(merged[1].package_name.as_deref(), Some("beta"));
     }
 
+    #[test]
+    fn removal_drops_all_selected_split_outputs_and_can_leave_empty_repository() {
+        let remaining = remove_release_artifacts(
+            vec![
+                artifact("demo-cli", "1"),
+                artifact("demo-lib", "1"),
+                artifact("other", "1"),
+            ],
+            &BTreeSet::from(["demo-cli".into(), "demo-lib".into()]),
+        );
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].package_name.as_deref(), Some("other"));
+        assert!(
+            remove_release_artifacts(
+                vec![artifact("demo-cli", "1")],
+                &BTreeSet::from(["demo-cli".into()])
+            )
+            .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn publication_backpressure_defaults_to_false_and_uses_persisted_value() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
@@ -1707,6 +1838,95 @@ mod release_tests {
         .await
         .unwrap();
         assert!(publication_backpressure(&database).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn new_release_uses_explicitly_rolled_back_release_as_base() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let old_batch = Uuid::new_v4().to_string();
+        let new_batch = Uuid::new_v4().to_string();
+        let old_release = Uuid::new_v4().to_string();
+        let new_release = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        for batch in [&old_batch, &new_batch] {
+            sqlx::query("INSERT INTO release_batches(id, state, graph_json, created_at, updated_at) VALUES (?, 'published', '{}', ?, ?)")
+                .bind(batch).bind(now).bind(now).execute(&database).await.unwrap();
+        }
+        sqlx::query("INSERT INTO releases(id, batch_id, state, manifest_sha256, source_git_commit, writer_epoch, committed_at, created_at) VALUES (?, ?, 'committed', ?, 'test', 1, ?, ?), (?, ?, 'committed', ?, 'test', 1, ?, ?)")
+            .bind(&old_release).bind(&old_batch).bind("a".repeat(64)).bind(now - Duration::hours(1)).bind(now - Duration::hours(1))
+            .bind(&new_release).bind(&new_batch).bind("b".repeat(64)).bind(now).bind(now)
+            .execute(&database).await.unwrap();
+        assert_eq!(
+            current_release_id(&database).await.unwrap(),
+            Some(new_release)
+        );
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('current_release_id', ?, ?)")
+            .bind(json!(old_release).to_string()).bind(now).execute(&database).await.unwrap();
+        assert_eq!(
+            current_release_id(&database).await.unwrap(),
+            Some(old_release)
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_removal_creates_an_empty_signed_authorization() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let state = state(database.clone());
+        let old_batch = Uuid::new_v4().to_string();
+        let removal_batch = Uuid::new_v4().to_string();
+        let old_release = Uuid::new_v4().to_string();
+        let old_job = Uuid::new_v4().to_string();
+        let worker = Uuid::new_v4().to_string();
+        let revision = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, writer_epoch, created_at, updated_at) VALUES (?, 'publisher', 'publisher', 'online', 'ssh://aursmith@publisher:2222', ?, 1, '[]', 1, ?, ?)")
+            .bind(&worker).bind("a".repeat(64)).bind(now).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO package_bases(name, version, outputs_json, dependencies_json, optional_dependencies_json, provides_json, architectures_json, last_synced_at) VALUES ('demo', '1-1', ?, '[]', '[]', '[]', '[\"any\"]', ?)")
+            .bind(json!(["demo-cli", "demo-lib"]).to_string()).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, upstream_version, input_sha256, audit_policy_version, state, metadata_json, created_at) VALUES (?, 'demo', ?, '1-1', ?, 'v1', 'published', ?, ?)")
+            .bind(&revision).bind("b".repeat(40)).bind("c".repeat(64))
+            .bind(json!({"outputs": ["demo-cli", "demo-lib"]}).to_string()).bind(now)
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO release_batches(id, state, graph_json, created_at, updated_at) VALUES (?, 'published', '{}', ?, ?), (?, 'queued_removal', ?, ?, ?)")
+            .bind(&old_batch).bind(now).bind(now).bind(&removal_batch)
+            .bind(json!({"remove": ["demo"]}).to_string()).bind(now).bind(now)
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'succeeded', 1, ?, 'build', '[]', '[]', '[]', ?, ?)")
+            .bind(&old_job).bind(&old_batch).bind(&revision).bind("c".repeat(64)).bind(now).bind(now)
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO releases(id, batch_id, state, manifest_sha256, source_git_commit, writer_epoch, committed_at, created_at) VALUES (?, ?, 'committed', ?, 'test', 1, ?, ?)")
+            .bind(&old_release).bind(&old_batch).bind("d".repeat(64)).bind(now).bind(now)
+            .execute(&database).await.unwrap();
+        for name in ["demo-cli", "demo-lib"] {
+            let digest = hex::encode(Sha256::digest(name.as_bytes()));
+            sqlx::query("INSERT INTO artifacts(sha256, job_id, path, size, package_name, package_version, architecture, provenance_json, created_at) VALUES (?, ?, ?, 1, ?, '1-1', 'any', '{}', ?)")
+                .bind(&digest).bind(&old_job).bind(format!("{name}-1-1-any.pkg.tar.zst")).bind(name).bind(now)
+                .execute(&database).await.unwrap();
+            sqlx::query("INSERT INTO release_artifacts(release_id, artifact_sha256) VALUES (?, ?)")
+                .bind(&old_release)
+                .bind(digest)
+                .execute(&database)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('current_release_id', ?, ?)")
+            .bind(json!(old_release).to_string()).bind(now).execute(&database).await.unwrap();
+
+        dispatch_release_one(&state).await.unwrap();
+
+        let envelope_json: String =
+            sqlx::query_scalar("SELECT envelope_json FROM release_authorizations")
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        let envelope: SignedEnvelope = serde_json::from_str(&envelope_json).unwrap();
+        let authorization: ReleaseAuthorization =
+            envelope.verify("aursmith.release_authorization").unwrap();
+        assert!(authorization.artifacts.is_empty());
+        assert_eq!(
+            authorization.removed_package_names,
+            ["demo-cli", "demo-lib"]
+        );
     }
 
     #[test]

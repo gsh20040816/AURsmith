@@ -196,3 +196,11 @@
 - 自动测试：Controller 测试在真实 SQLite migration 后创建含两个 split outputs 的 Revision，把策略设为禁用并完成 Fetch/Audit 前置状态，确认生成的 Build Job 固定两个输出且 `allow_check=0`；Guest 测试确认 `--nocheck` 只在禁用时出现，缺失 split output 会失败。前端测试还实际打开详情并提交禁用操作。全仓库 90 个 Rust 测试、TypeScript 检查、4 个前端测试、生产构建和 Compose 安全检查通过。
 - 纠正记录：前端命令第一次从仓库根目录运行，因那里没有 `package.json` 而得到 ENOENT；随后在 `web/` 目录重新执行并通过。该失败不是前端代码测试通过的证据，最终结论只采用纠正后的运行结果。
 - 边界：本轮没有重新制作 KVM Profile 并实际启动 Guest，因此 namcap 的固定调用、协议和结果处理已通过静态编译与单元测试，但真实 VM 中的 namcap 输出仍由下一次完整 KVM 构建复验。Publisher 对 ELF `DT_NEEDED` 与文件 capability 的独立解析仍未实现。
+
+## 2026-08-10：清除软件包与空仓库
+
+- 根因：清除 API 原先只创建 `queued_removal` 批次，没有任何调度器消费该状态，因此 UI 返回成功但仓库不会变化；这是业务流程断链，不是展示问题。
+- 修复：发布调度器现在接受清除批次，汇总目标 pkgbase 全部历史 Revision 的 split outputs，并从控制面当前激活 Release 删除这些名称，再冻结进 ReleaseAuthorization。测试还固定“服务端回滚后，新 Release 必须以显式回滚目标为基线”，不能按 committed_at 误选时间较新的停用 Release。Publisher 与 Signer 同时拒绝重复、非法或仍存在于最终 Artifact 集合中的清除名称。
+- 空仓库：如果清除最后一个包，Signer 为 db/files 各创建一个空 gzip tar，继续执行 GPG 签名、Manifest、原子发布和归档流程。没有 Artifact 且没有清除目标的普通空授权仍被拒绝。
+- 验证：单元测试覆盖同时清除两个 split outputs、保留其他包以及清除后为空；Signer 测试确认空数据库是可读归档。另在独立 Arch Linux 容器中，用真实 pacman 对该空数据库执行 `-Sy` 成功，随后 `-Sl aursmith` 正常返回空列表。第一次在宿主直接运行因 pacman 要求 root 被明确拒绝，改为一次性容器后通过；临时目录因 `/tmp` 不支持桌面回收站而在确认精确路径后删除。
+- 边界：本条尚未重新启动完整 Publisher/Signer Stack 执行一次带 GPG `DatabaseRequired` 的最后一包清除；已验证调度数据、签名端构造逻辑、空归档和 pacman 无签名解析，签名发布链继续依赖上一条已通过的真实 Release E2E。
