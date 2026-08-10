@@ -41,7 +41,7 @@
 | U02 | 部分验证 | 单管理员认证、一次性初始化、GPG/pacman 引导和稳定 URL | 内部 CA 证书导出/轮换仍主要依赖部署配置 |
 | U03 | 已验证 | Worker/磁盘/时钟、Agent/Fetch Doctor、告警、Webhook/ntfy、备份与库存页面 | 外部 Webhook/ntfy 未使用真实服务冒烟 |
 | O01 | 已验证 | 包装 makepkg、repo-add、pacman、QEMU、OpenSSH、rsync、GnuPG、Caddy | 无 |
-| O02 | 部分验证 | 全过程直接在 main 使用独立英文提交；Release 记录源码 commit | 第一版未完成，因此尚未创建正式版本号和签名 Git tag |
+| O02 | 已验证 | 全过程直接在 main 使用独立英文提交；Release 记录源码 commit；首个预发布版本使用本地 annotated tag 管理 | 仓库无 remote，未执行 push；正式 v0.1.0 尚未发布 |
 
 ## 第一版阻塞项
 
