@@ -1675,25 +1675,60 @@ async fn status(worker: &Worker) -> WorkerResponse {
             .fetch_one(&worker.database)
             .await;
     match (state, instance_id) {
-        (Ok(state), Ok(instance_id)) => WorkerResponse::ok(
-            "STATUS",
-            serde_json::json!({
-                "name": worker.name,
-                "instance_id": instance_id,
-                "role": role_name(worker.role),
-                "state": state,
-                "protocol_major": PROTOCOL_MAJOR,
-                "writer_epoch": worker.writer_epoch,
-                "identity_signing_key_hex": hex::encode(worker.identity_signing_key.verifying_key().as_bytes()),
-                "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
-                "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
-                "time": Utc::now(),
-            }),
-        ),
+        (Ok(state), Ok(instance_id)) => {
+            let storage_path = match worker.role {
+                WorkerRole::Builder => &worker.jobs_dir,
+                WorkerRole::Publisher => &worker.repository_dir,
+                WorkerRole::Archiver => &worker.archive_dir,
+            };
+            WorkerResponse::ok(
+                "STATUS",
+                serde_json::json!({
+                    "name": worker.name,
+                    "instance_id": instance_id,
+                    "role": role_name(worker.role),
+                    "state": state,
+                    "protocol_major": PROTOCOL_MAJOR,
+                    "writer_epoch": worker.writer_epoch,
+                    "identity_signing_key_hex": hex::encode(worker.identity_signing_key.verifying_key().as_bytes()),
+                    "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
+                    "storage": disk_usage(storage_path),
+                    "cgroup_v2": Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
+                    "kvm_available": worker.role != WorkerRole::Builder || Path::new("/dev/kvm").exists(),
+                    "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
+                    "time": Utc::now(),
+                }),
+            )
+        }
         (Err(error), _) | (_, Err(error)) => {
             WorkerResponse::error("JOURNAL_ERROR", error.to_string())
         }
     }
+}
+
+fn disk_usage(path: &Path) -> Option<serde_json::Value> {
+    let output = std::process::Command::new("/usr/bin/df")
+        .args(["-Pk", "--"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let fields = text.lines().last()?.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return None;
+    }
+    let total = fields[1].parse::<u64>().ok()?.saturating_mul(1024);
+    let available = fields[3].parse::<u64>().ok()?.saturating_mul(1024);
+    Some(serde_json::json!({
+        "path": path,
+        "total_bytes": total,
+        "available_bytes": available,
+        "available_percent": if total == 0 { 0 } else { available.saturating_mul(100) / total },
+    }))
 }
 
 async fn drain(worker: &Worker) -> WorkerResponse {

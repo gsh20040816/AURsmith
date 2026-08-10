@@ -158,6 +158,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "hmac",
  "http",
  "reqwest",
  "serde",

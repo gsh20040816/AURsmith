@@ -441,6 +441,9 @@ mod tests {
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            webhook_url: None,
+            webhook_hmac_secret_file: "/不存在".into(),
+            ntfy_url: None,
         };
         AppState::new(
             database,

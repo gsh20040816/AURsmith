@@ -41,6 +41,8 @@ export type Worker = {
   protocol_version: number;
   labels: string[];
   last_seen_at: string | null;
+  storage: { total_bytes: number; available_bytes: number; available_percent: number; path: string } | null;
+  clock_skew_seconds: number | null;
 };
 export type Job = {
   id: string;
@@ -154,6 +156,22 @@ export type ClientBootstrap = {
   commands: string[];
   warnings: string[];
 };
+export type Alert = {
+  id: string;
+  fingerprint: string;
+  severity: string;
+  state: "open" | "acknowledged" | "resolved";
+  title: string;
+  details: unknown;
+  opened_at: string;
+  acknowledged_at: string | null;
+  resolved_at: string | null;
+};
+export type Doctor = {
+  ready: boolean;
+  checked_at: string;
+  checks: Array<{ id: string; ok: boolean; message: string }>;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -186,6 +204,9 @@ export const api = {
   }>(`/api/v1/releases/${encodeURIComponent(id)}/rollback`, { method: "POST" }),
   archives: () => request<{ items: ArchiveCopy[] }>("/api/v1/archives"),
   clientBootstrap: () => request<ClientBootstrap>("/api/v1/client-bootstrap"),
+  alerts: () => request<{ items: Alert[] }>("/api/v1/alerts"),
+  acknowledgeAlert: (id: string) => request<{ id: string; state: string }>(`/api/v1/alerts/${encodeURIComponent(id)}/acknowledge`, { method: "POST" }),
+  doctor: () => request<Doctor>("/api/v1/doctor"),
   activateProfile: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>

@@ -27,18 +27,22 @@ services:
       AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
       AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
       AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
+      AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
+      AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
+      AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
       - setup_token
       - controller_signing_key
       - worker_ssh_key
       - worker_known_hosts
+      - webhook_hmac_secret
     volumes:
       - controller-data:/var/lib/aursmith
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
-    networks: [control, agent]
+    networks: [control, agent, egress]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]
       interval: 30s
@@ -135,6 +139,8 @@ secrets:
     file: ${AURSMITH_WORKER_SSH_KEY_FILE:-./secrets/worker_ssh_key}
   worker_known_hosts:
     file: ${AURSMITH_WORKER_KNOWN_HOSTS_FILE:-./secrets/worker_known_hosts}
+  webhook_hmac_secret:
+    file: ${AURSMITH_WEBHOOK_HMAC_SECRET_FILE:-./secrets/webhook_hmac_secret}
   low_agent_api_key:
     file: ${AURSMITH_LOW_AGENT_API_KEY_FILE:-./secrets/low_agent_api_key}
   high_agent_api_key:

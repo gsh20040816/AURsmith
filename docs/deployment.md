@@ -84,6 +84,14 @@ docker compose -f deploy/builder/compose.yaml --profile profile-build run --rm p
 
 已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`。实际生成的 base Profile 已冷启动到嵌入的 Guest Agent；在未提供 virtiofs 的负向测试中，Guest 在 0.8 秒左右明确报告输入挂载失败、执行 poweroff，QEMU 正常退出。这证明 direct-kernel、initramfs、根文件系统和 PID 1 链路可用，但不替代后续带输入的完整 fixture build 验收。
 
+## 告警通知
+
+Web UI 和 JSON 结构化日志始终可用。若要把告警投递到通用 Webhook，配置 `AURSMITH_WEBHOOK_URL`，并用 `openssl rand -hex 32` 生成 `deploy/controller/secrets/webhook_hmac_secret`。接收端必须对原始 HTTP body 计算 HMAC-SHA256，并与 `X-AURsmith-Signature` 中的 `sha256=` 十六进制值执行常量时间比较；不要先解析再重新序列化 JSON。即使未启用 Webhook，也要创建一个权限为仅部署账户可读的随机 secret 文件，以满足 Compose 的固定 secret 挂载。
+
+ntfy 使用 `AURSMITH_NTFY_URL=https://<服务器>/<主题>` 配置。第一版不把 ntfy token 放入 URL，也不支持 URL 内嵌用户名和密码；需要私有认证时应在受信任反向代理处为固定来源配置，或只使用 HMAC Webhook。通知失败不会改变构建、发布或归档状态，可在 `alert_notifications` 表和 Controller 结构化日志中查看三次尝试后的最后错误。
+
+Doctor 页面显示每个 Worker 的在线状态、数据卷可用百分比和时钟偏差。部署前应确保 Worker 主机启用时间同步；偏差超过 60 秒会告警。Publisher 可用空间低于 10% 时新任务和新 Release 被背压，恢复到 10% 以上后下次心跳自动解除。不要通过修改 SQLite 设置绕过容量保护。
+
 ## Git 与发布
 
 - 日常开发直接进入 `main`，每个独立且验证通过的改动形成一个英文提交。

@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiError, ArchiveCopy, Audit, AurPackage, BuildProfile, ClientBootstrap, Job, ProfileRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
+import { Alert, ApiError, ArchiveCopy, Audit, AurPackage, BuildProfile, ClientBootstrap, Doctor, Job, ProfileRecommendation, Release, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -113,7 +113,8 @@ export function App() {
         {view === "releases" && <ReleasesView />}
         {view === "archives" && <ArchivesView />}
         {view === "settings" && <ClientBootstrapView />}
-        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && view !== "profiles" && view !== "releases" && view !== "archives" && view !== "settings" && <PlannedView view={view} />}
+        {view === "alerts" && <AlertsView />}
+        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && view !== "profiles" && view !== "releases" && view !== "archives" && view !== "settings" && view !== "alerts" && <PlannedView view={view} />}
       </main>
     </div>
   );
@@ -135,6 +136,7 @@ function Dashboard() {
   const [requirements, setRequirements] = useState<Requirement[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [error, setError] = useState("");
+  const [doctor, setDoctor] = useState<Doctor | null>(null);
 
   useEffect(() => {
     void Promise.all([api.requirements(), api.workers()])
@@ -143,6 +145,11 @@ function Dashboard() {
         setWorkers(workerResponse.items);
       })
       .catch((reason) => setError(messageOf(reason)));
+    void api.doctor()
+      .then((response) => {
+        if (Array.isArray(response.checks)) setDoctor(response);
+      })
+      .catch(() => setDoctor(null));
   }, []);
 
   const onlineWorkers = workers.filter((worker) => worker.state === "online").length;
@@ -161,6 +168,7 @@ function Dashboard() {
       </header>
       {error && <Notice kind="error">{error}</Notice>}
       <ForgeRail />
+      {doctor && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">Doctor</p><h2>{doctor.ready ? "系统已具备运行条件" : "仍有检查未通过"}</h2></div><span className={`state ${doctor.ready ? "online" : "degraded"}`}>{doctor.ready ? "ready" : "attention"}</span></div><div className="finding-list">{doctor.checks.map((check) => <div key={check.id}><code>{check.ok ? "通过" : "失败"}</code><strong>{check.message}</strong></div>)}</div></section>}
       <section className="dashboard-grid">
         <div className="work-panel">
           <div className="section-heading">
@@ -221,8 +229,8 @@ function WorkersView() {
         {workers.length === 0 ? (
           <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未注册 Worker</strong><p>先部署对应 Compose Stack，再固定 SSH host key 并注册端点。</p></div></div>
         ) : (
-          <div className="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>端点</th><th>标签</th><th /></tr></thead><tbody>
-            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}</td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td><code>{worker.endpoint}</code></td><td>{worker.labels.join(" · ") || "—"}</td><td><div className="row-actions"><button className="text-button" onClick={() => void api.probeWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>探测</button>{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</div></td></tr>)}
+          <div className="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>端点</th><th>资源</th><th>标签</th><th /></tr></thead><tbody>
+            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}</td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td><code>{worker.endpoint}</code></td><td>{worker.storage ? `${worker.storage.available_percent}% 可用` : "等待探测"}<small className="cell-note">时钟 {worker.clock_skew_seconds ?? "?"} 秒</small></td><td>{worker.labels.join(" · ") || "—"}</td><td><div className="row-actions"><button className="text-button" onClick={() => void api.probeWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>探测</button>{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</div></td></tr>)}
           </tbody></table></div>
         )}
       </section>
@@ -349,6 +357,16 @@ function ClientBootstrapView() {
   const [error, setError] = useState("");
   useEffect(() => { void api.clientBootstrap().then(setBootstrap).catch((reason) => setError(messageOf(reason))); }, []);
   return <><header className="page-header compact"><div><p className="eyebrow">U02</p><h1>客户端接入</h1><p className="lede">先人工核对仓库 GPG 指纹，再把仓库配置加入 1～2 台 Arch 客户端。</p></div></header>{error && <Notice kind="error">{error}</Notice>}{bootstrap && <><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">完整指纹</p><h2><code>{bootstrap.gpg_fingerprint}</code></h2></div></div>{bootstrap.warnings.map((warning) => <p key={warning}>{warning}</p>)}</section><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pacman.conf</p><h2>仓库配置</h2></div></div><pre><code>{bootstrap.repository_config}</code></pre><div className="finding-list">{bootstrap.commands.map((command) => <div key={command}><code>{command}</code></div>)}</div></section></>}</>;
+}
+
+function AlertsView() {
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const refresh = () => void api.alerts().then((response) => setAlerts(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  const acknowledge = async (alert: Alert) => { setBusy(alert.id); setError(""); try { await api.acknowledgeAlert(alert.id); refresh(); } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); } };
+  return <><header className="page-header compact"><div><p className="eyebrow">U03</p><h1>告警</h1><p className="lede">相同故障按稳定 fingerprint 去重；恢复检测会保留历史并把状态改为 resolved。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{alerts.length === 0 ? <div className="empty-state"><span className="empty-symbol">✓</span><div><strong>没有告警记录</strong><p>Worker、磁盘、时钟、传输、发布和归档异常会显示在这里。</p></div></div> : alerts.map((alert) => <article className="audit-card" key={alert.id}><div className="audit-title"><div><p className="eyebrow">{alert.severity} · {alert.fingerprint}</p><h2>{alert.title}</h2></div><span className={`state ${alert.state}`}>{alert.state}</span></div><pre><code>{JSON.stringify(alert.details, null, 2)}</code></pre><p className="panel-note">首次发现：{new Date(alert.opened_at).toLocaleString("zh-CN")}</p>{alert.state === "open" && <button className="secondary-button" disabled={busy === alert.id} onClick={() => void acknowledge(alert)}>确认已知晓</button>}</article>)}</section></>;
 }
 
 function PlannedView({ view }: { view: View }) {

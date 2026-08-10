@@ -85,3 +85,11 @@
 - 次周期：把统计周期推进八天后重新评估，返回 `add`；实现同时保留前二十次构建只观察、三低周期/三十天移除和 AUR 依赖永不固化的领域测试。
 - 数据来源：Fetch Guest 已记录官方依赖下载总耗时，Controller 分摊到本次解析出的依赖观察；UI 展示最近二十次、月使用次数、预计节省和连续冷热周期。
 - 边界：该验证是控制面统计测试，尚未用一个真实高频依赖完成“建议→重建 Profile→KVM fixture→激活→后续构建命中”的完整性能闭环；pacoloco 命中率仍未接入代理指标。
+
+## 2026-08-10：运维健康、背压和告警界面
+
+- 验证对象：提交 `5d6be0d` 之后的运维工作树。
+- 自动测试：执行 `bash scripts/test-all.sh`；Rust workspace 共运行 68 个单元、领域、协议和 Journal 测试，全部通过；前端类型检查、1 个 Vitest、生产构建和四套 Compose 安全检查全部通过。
+- 回归：首次运行发现旧 Doctor mock 缺少 `checks` 时 Dashboard 崩溃；实现改为让核心 Dashboard 与可选 Doctor 请求独立加载，异常或旧响应不再阻断需求总账和 Worker 概览。
+- 覆盖：SQLite 迁移在空数据库实际执行；测试验证发布背压默认关闭且能读取持久化值，通知 URL 拒绝内嵌凭据和非 HTTP(S) scheme；Compose 检查继续确认无 privileged、Docker/libvirt Socket，Builder 只获得 `/dev/kvm`，Signer 断网且私钥不进入 Publisher。
+- 未覆盖：本条没有把真实磁盘压到 15%/10%，没有制造 20 GiB 未归档数据，也没有向外部 Webhook 或 ntfy 实际投递；因此这里只确认状态机、静态安全边界和 UI 构建，不声称外部通知端到端已经验收。

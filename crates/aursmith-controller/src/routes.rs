@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
@@ -49,6 +49,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/requirements", get(requirements))
         .route("/api/v1/client-bootstrap", get(client_bootstrap))
+        .route("/api/v1/doctor", get(doctor_status))
+        .route("/api/v1/metrics", get(metrics_status))
+        .route("/api/v1/alerts", get(list_alerts))
+        .route("/api/v1/alerts/{id}/acknowledge", post(acknowledge_alert))
         .route("/api/v1/workers", get(list_workers).post(register_worker))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
@@ -163,6 +167,124 @@ async fn client_bootstrap(
             "内部 CA 证书需由管理员通过首次设置页面导出并安装。",
         ]
     })))
+}
+
+async fn doctor_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let workers = sqlx::query("SELECT id, name, role, state, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY role, name")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let mut checks = Vec::new();
+    for role in ["builder", "publisher", "archiver"] {
+        let online = workers
+            .iter()
+            .filter(|row| {
+                row.get::<String, _>("role") == role && row.get::<String, _>("state") == "online"
+            })
+            .count();
+        checks.push(json!({"id": format!("worker-{role}"), "ok": online > 0, "message": format!("{role} 在线实例：{online}")}));
+    }
+    for row in &workers {
+        let status = row
+            .get::<Option<String>, _>("status_json")
+            .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+            .unwrap_or(Value::Null);
+        let available = status["storage"]["available_percent"].as_u64();
+        let skew = row.get::<Option<i64>, _>("clock_skew_seconds");
+        checks.push(json!({
+            "id": format!("worker-health-{}", row.get::<String,_>("id")),
+            "ok": row.get::<String,_>("state") == "online"
+                && available.is_none_or(|value| value >= 10)
+                && skew.is_none_or(|value| value.unsigned_abs() <= 60),
+            "message": format!("{}：状态 {}，可用空间 {}%，时钟偏差 {} 秒", row.get::<String,_>("name"), row.get::<String,_>("state"), available.map(|value| value.to_string()).unwrap_or_else(|| "未知".into()), skew.map(|value| value.to_string()).unwrap_or_else(|| "未知".into())),
+        }));
+    }
+    let profile_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM build_profiles WHERE state = 'active' AND last_verified_at IS NOT NULL")
+        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    checks.push(json!({"id": "active-profile", "ok": profile_count > 0, "message": format!("已验证活跃 Profile：{profile_count}")}));
+    let fingerprint_ready: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system_settings WHERE key = 'repository_gpg_fingerprint'",
+    )
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    checks.push(json!({"id": "repository-gpg", "ok": fingerprint_ready == 1, "message": "仓库 GPG 指纹已由 Publisher 固定"}));
+    checks.push(json!({"id": "agent-low", "ok": state.config.low_agent_endpoints.len() == 3, "message": format!("低成本 Agent Runner：{}", state.config.low_agent_endpoints.len())}));
+    checks.push(json!({"id": "agent-high", "ok": !state.config.high_agent_endpoint.is_empty(), "message": "高成本 Agent Runner 已配置"}));
+    let ready = checks.iter().all(|check| check["ok"] == true);
+    Ok(Json(
+        json!({"ready": ready, "checked_at": Utc::now(), "checks": checks}),
+    ))
+}
+
+async fn metrics_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let queue = sqlx::query("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status")
+        .fetch_all(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    let stages = sqlx::query("SELECT jobs.kind, COUNT(*) AS count, CAST(AVG((julianday(attempts.finished_at) - julianday(attempts.started_at)) * 86400000) AS INTEGER) AS average_milliseconds FROM attempts JOIN jobs ON jobs.id = attempts.job_id WHERE attempts.status = 'succeeded' AND attempts.started_at IS NOT NULL AND attempts.finished_at IS NOT NULL GROUP BY jobs.kind")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let agent = sqlx::query("SELECT COUNT(*) AS calls, COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failures, COALESCE(SUM(cost_microusd), 0) AS cost_microusd FROM agent_runs")
+        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    let dependencies = sqlx::query("SELECT COUNT(*) AS observations, COALESCE(SUM(cache_hit), 0) AS cache_hits, COALESCE(SUM(download_bytes), 0) AS download_bytes, COALESCE(SUM(download_milliseconds), 0) AS download_milliseconds FROM dependency_observations")
+        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    let archives = sqlx::query("SELECT COUNT(*) AS copies, COALESCE(SUM(CASE WHEN state = 'verified' THEN 1 ELSE 0 END), 0) AS verified, COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0) AS failed FROM archive_copies")
+        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "queue": queue.into_iter().map(|row| (row.get::<String,_>("status"), row.get::<i64,_>("count"))).collect::<BTreeMap<_,_>>(),
+        "stage_durations": stages.into_iter().map(|row| json!({"kind": row.get::<String,_>("kind"), "count": row.get::<i64,_>("count"), "average_milliseconds": row.get::<Option<i64>,_>("average_milliseconds")})).collect::<Vec<_>>(),
+        "agent": {"calls": agent.get::<i64,_>("calls"), "failures": agent.get::<i64,_>("failures"), "cost_microusd": agent.get::<i64,_>("cost_microusd")},
+        "dependencies": {"observations": dependencies.get::<i64,_>("observations"), "cache_hits": dependencies.get::<i64,_>("cache_hits"), "download_bytes": dependencies.get::<i64,_>("download_bytes"), "download_milliseconds": dependencies.get::<i64,_>("download_milliseconds")},
+        "archives": {"copies": archives.get::<i64,_>("copies"), "verified": archives.get::<i64,_>("verified"), "failed": archives.get::<i64,_>("failed")},
+        "generated_at": Utc::now(),
+    })))
+}
+
+async fn list_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let rows = sqlx::query("SELECT id, fingerprint, severity, state, title, details_json, opened_at, acknowledged_at, resolved_at FROM alerts ORDER BY CASE state WHEN 'open' THEN 0 WHEN 'acknowledged' THEN 1 ELSE 2 END, opened_at DESC LIMIT 500")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
+        "id": row.get::<String,_>("id"), "fingerprint": row.get::<String,_>("fingerprint"),
+        "severity": row.get::<String,_>("severity"), "state": row.get::<String,_>("state"),
+        "title": row.get::<String,_>("title"),
+        "details": serde_json::from_str::<Value>(row.get("details_json")).unwrap_or(Value::Null),
+        "opened_at": row.get::<String,_>("opened_at"),
+        "acknowledged_at": row.get::<Option<String>,_>("acknowledged_at"),
+        "resolved_at": row.get::<Option<String>,_>("resolved_at"),
+    })).collect::<Vec<_>>() })))
+}
+
+async fn acknowledge_alert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let result = sqlx::query("UPDATE alerts SET state = 'acknowledged', acknowledged_at = ? WHERE id = ? AND state = 'open'")
+        .bind(Utc::now()).bind(&id).execute(&state.database).await.map_err(ApiError::internal)?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::conflict("ALERT_NOT_OPEN", "告警不存在或已经处理"));
+    }
+    append_event(
+        &state.database,
+        "alert",
+        &id,
+        "alert_acknowledged",
+        json!({}),
+        &actor,
+    )
+    .await?;
+    Ok(Json(json!({"id": id, "state": "acknowledged"})))
 }
 
 async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -340,6 +462,8 @@ struct WorkerResponse {
     protocol_version: i64,
     labels: Vec<String>,
     last_seen_at: Option<String>,
+    storage: Option<Value>,
+    clock_skew_seconds: Option<i64>,
 }
 
 async fn register_worker(
@@ -443,7 +567,7 @@ async fn list_workers(
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, name, role, state, endpoint, protocol_version, labels_json, last_seen_at FROM workers ORDER BY name",
+        "SELECT id, name, role, state, endpoint, protocol_version, labels_json, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY name",
     )
     .fetch_all(&state.database)
     .await
@@ -452,6 +576,9 @@ async fn list_workers(
         .into_iter()
         .map(|row| {
             let labels_json: String = row.get("labels_json");
+            let status = row
+                .get::<Option<String>, _>("status_json")
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok());
             Ok(WorkerResponse {
                 id: row.get("id"),
                 name: row.get("name"),
@@ -461,6 +588,11 @@ async fn list_workers(
                 protocol_version: row.get("protocol_version"),
                 labels: serde_json::from_str(&labels_json).map_err(ApiError::internal)?,
                 last_seen_at: row.get("last_seen_at"),
+                storage: status
+                    .as_ref()
+                    .and_then(|value| value.get("storage"))
+                    .cloned(),
+                clock_skew_seconds: row.get("clock_skew_seconds"),
             })
         })
         .collect();
@@ -809,6 +941,9 @@ mod tests {
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            webhook_url: None,
+            webhook_hmac_secret_file: "/不存在".into(),
+            ntfy_url: None,
         };
         router(AppState::new(
             database,

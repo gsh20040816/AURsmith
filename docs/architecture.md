@@ -33,6 +33,16 @@ Fetch Guest 实测官方依赖下载耗时并随 FetchResult 返回，Controller
 
 `Revision`、`Job`、`Attempt`、`Artifact`、`Release` 和 `ArchiveCopy` 是相互独立的聚合。已提交的 Release 不会因为 ArchiveCopy 等待或失败而退回未发布状态。任务采用至少一次投递，Attempt token 用于保证结果接收幂等并拒绝迟到结果。
 
+## 运维健康与背压
+
+Controller 定期通过已经固定 host key 的 Worker `status` 命令获取角色、协议、实例身份、UTC 时间、cgroup v2、Builder KVM 能力以及角色数据卷所在文件系统的总量和可用量。Worker 只以固定参数执行 `/usr/bin/df`，不会接收 Controller 提供的命令或路径。原始状态快照和计算出的时钟偏差写入控制面，Doctor 将至少一个在线 Builder、Publisher、Archiver、已验证 Profile、仓库 GPG 指纹和四个 Agent Runner 作为运行前条件。
+
+可用空间低于 15% 时产生 warning，低于 10% 时产生 critical。活动 Publisher 低于 10% 时，持久化的 `publication_backpressure` 同时阻止新 Job 调度和新 Release 授权，已经提交的仓库继续提供服务；恢复到阈值以上后自动解除。未获得有效 ArchiveReceipt 的已发布 Artifact 合计超过 20 GiB 时独立告警，不能通过把 Release 改回失败来隐藏欠归档状态。Worker 不可达、时钟偏差超过 60 秒、缺少 cgroup v2 或 Builder 缺少 KVM 都使用稳定 fingerprint 更新同一告警。
+
+告警具有 `open → acknowledged → resolved` 生命周期。页面可查看和确认告警，结构化容器日志记录新打开的运维故障。可选 Webhook 使用 JSON 负载和 `X-AURsmith-Signature: sha256=<HMAC-SHA256>`，可选 ntfy 使用固定目标 URL；目标不能包含 URL 用户名或密码。通知先写 SQLite outbox，每个状态和通道只投递一次，失败最多尝试三次并保留最后错误，不会因为通知服务故障阻塞调度器。
+
+`/api/v1/metrics` 汇总任务状态、成功 Attempt 的阶段平均耗时、Agent 调用/失败/成本、依赖下载与缓存命中，以及归档副本状态。第一版由认证后的 Web UI 消费该 JSON，不另行引入 Prometheus、Redis 或消息系统。
+
 ## AUR 同步与依赖闭包
 
 Controller 不直接访问 AUR。浏览器请求由 Controller 认证后，经固定 argv 的 OpenSSH forced command 发给在线 Publisher；Publisher Worker 才能调用 AUR RPC 和 AUR Git。Builder 或 Archiver 收到同类命令会以角色错误拒绝。

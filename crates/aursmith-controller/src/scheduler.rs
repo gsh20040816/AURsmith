@@ -61,6 +61,17 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+    let notification_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(std::time::Duration::from_secs(10));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = crate::notifications::dispatch_one(&notification_state).await {
+                tracing::warn!(%error, "告警通知调度失败");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -309,6 +320,9 @@ async fn record_archive_failure(
 }
 
 async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
+    if publication_backpressure(&state.database).await? {
+        return Ok(());
+    }
     let pending = sqlx::query("SELECT release_authorizations.release_id, release_authorizations.state, release_authorizations.envelope_json, release_authorizations.attempt_count, workers.endpoint FROM release_authorizations JOIN workers ON workers.id = release_authorizations.publisher_worker_id WHERE release_authorizations.state IN ('issued', 'awaiting_signer') ORDER BY release_authorizations.updated_at LIMIT 1")
         .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
     if let Some(row) = pending {
@@ -673,17 +687,32 @@ pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, A
             } else {
                 "online"
             };
+            let remote_time = reply.data["time"]
+                .as_str()
+                .and_then(|value| value.parse::<chrono::DateTime<Utc>>().ok());
+            let clock_skew_seconds = remote_time.map(|value| (Utc::now() - value).num_seconds());
             sqlx::query(
-                "UPDATE workers SET state = ?, profiles_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE workers SET state = ?, profiles_json = ?, status_json = ?, clock_skew_seconds = ?, last_seen_at = ?, updated_at = ? WHERE id = ?",
             )
             .bind(new_state)
             .bind(reply.data["profiles"].to_string())
+            .bind(reply.data.to_string())
+            .bind(clock_skew_seconds)
             .bind(Utc::now())
             .bind(Utc::now())
             .bind(worker_id)
             .execute(&state.database)
             .await
             .map_err(ApiError::internal)?;
+            evaluate_worker_health(
+                state,
+                worker_id,
+                &expected_role,
+                &reply.data,
+                clock_skew_seconds,
+            )
+            .await?;
+            resolve_alert(state, &format!("worker-unreachable:{worker_id}")).await?;
             Ok(new_state.to_owned())
         }
         Err(error) => {
@@ -695,9 +724,115 @@ pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, A
             .execute(&state.database)
             .await
             .map_err(ApiError::internal)?;
+            upsert_operational_alert(
+                state,
+                &format!("worker-unreachable:{worker_id}"),
+                "critical",
+                "Worker 无法访问",
+                json!({"worker_id": worker_id, "error": error.to_string()}),
+            )
+            .await?;
             Err(error)
         }
     }
+}
+
+async fn evaluate_worker_health(
+    state: &AppState,
+    worker_id: &str,
+    role: &str,
+    status: &serde_json::Value,
+    clock_skew_seconds: Option<i64>,
+) -> Result<(), ApiError> {
+    let available_percent = status["storage"]["available_percent"].as_u64();
+    let disk_fingerprint = format!("worker-disk-low:{worker_id}");
+    match available_percent {
+        Some(percent) if percent < 15 => {
+            upsert_operational_alert(
+                state,
+                &disk_fingerprint,
+                if percent < 10 { "critical" } else { "warning" },
+                "Worker 磁盘空间不足",
+                json!({"worker_id": worker_id, "role": role, "available_percent": percent}),
+            )
+            .await?;
+        }
+        Some(_) => resolve_alert(state, &disk_fingerprint).await?,
+        None => {}
+    }
+    let skew_fingerprint = format!("worker-clock-skew:{worker_id}");
+    if clock_skew_seconds.is_some_and(|value| value.unsigned_abs() > 60) {
+        upsert_operational_alert(
+            state,
+            &skew_fingerprint,
+            "warning",
+            "Worker 时钟偏差过大",
+            json!({"worker_id": worker_id, "seconds": clock_skew_seconds}),
+        )
+        .await?;
+    } else {
+        resolve_alert(state, &skew_fingerprint).await?;
+    }
+    for (field, title) in [
+        ("cgroup_v2", "Worker 缺少 cgroup v2"),
+        ("kvm_available", "Builder 缺少 KVM"),
+    ] {
+        let fingerprint = format!("worker-capability:{field}:{worker_id}");
+        if status[field].as_bool() == Some(false) {
+            upsert_operational_alert(
+                state,
+                &fingerprint,
+                "critical",
+                title,
+                json!({"worker_id": worker_id, "role": role}),
+            )
+            .await?;
+        } else {
+            resolve_alert(state, &fingerprint).await?;
+        }
+    }
+    if role == "publisher" {
+        let backpressure = available_percent.is_some_and(|percent| percent < 10);
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('publication_backpressure', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
+            .bind(json!(backpressure).to_string()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+        let unarchived_bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(artifacts.size), 0) FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 JOIN releases ON releases.id = release_artifacts.release_id WHERE releases.state = 'committed' AND NOT EXISTS (SELECT 1 FROM archive_copies WHERE archive_copies.release_id = releases.id AND archive_copies.state = 'verified')")
+            .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+        if unarchived_bytes > 20 * 1024 * 1024 * 1024_i64 {
+            upsert_operational_alert(
+                state,
+                "publisher-unarchived-bytes",
+                "warning",
+                "Publisher 未归档数据超过 20 GiB",
+                json!({"unarchived_bytes": unarchived_bytes}),
+            )
+            .await?;
+        } else {
+            resolve_alert(state, "publisher-unarchived-bytes").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn upsert_operational_alert(
+    state: &AppState,
+    fingerprint: &str,
+    severity: &str,
+    title: &str,
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT state FROM alerts WHERE fingerprint = ?")
+            .bind(fingerprint)
+            .fetch_optional(&state.database)
+            .await
+            .map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, ?, 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET severity = excluded.severity, state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, title = excluded.title, details_json = excluded.details_json, resolved_at = NULL")
+        .bind(Uuid::new_v4().to_string()).bind(fingerprint).bind(severity).bind(title)
+        .bind(details.to_string()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+    if previous.as_deref().is_none_or(|value| value == "resolved") {
+        tracing::warn!(%fingerprint, %severity, %title, "系统告警已打开");
+    }
+    Ok(())
 }
 
 async fn probe_all_workers(state: &AppState) -> Result<(), ApiError> {
@@ -713,6 +848,9 @@ async fn probe_all_workers(state: &AppState) -> Result<(), ApiError> {
 }
 
 async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
+    if publication_backpressure(&state.database).await? {
+        return Ok(());
+    }
     let job = sqlx::query(
         "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') ORDER BY priority DESC, created_at LIMIT 1",
     )
@@ -849,6 +987,18 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     }
     resolve_alert(state, &format!("no-eligible-worker:{job_id}")).await?;
     Ok(())
+}
+
+async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, ApiError> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value_json FROM system_settings WHERE key = 'publication_backpressure'",
+    )
+    .fetch_optional(database)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(value
+        .and_then(|value| serde_json::from_str::<bool>(&value).ok())
+        .unwrap_or(false))
 }
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
@@ -1135,5 +1285,19 @@ mod release_tests {
         assert_eq!(merged[0].package_name.as_deref(), Some("alpha"));
         assert_eq!(merged[0].package_version.as_deref(), Some("2"));
         assert_eq!(merged[1].package_name.as_deref(), Some("beta"));
+    }
+
+    #[tokio::test]
+    async fn publication_backpressure_defaults_to_false_and_uses_persisted_value() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        assert!(!publication_backpressure(&database).await.unwrap());
+        sqlx::query(
+            "INSERT INTO system_settings(key, value_json, updated_at) VALUES ('publication_backpressure', 'true', ?)",
+        )
+        .bind(Utc::now())
+        .execute(&database)
+        .await
+        .unwrap();
+        assert!(publication_backpressure(&database).await.unwrap());
     }
 }

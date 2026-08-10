@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod notifications;
 mod packages;
 mod profiles;
 mod routes;
