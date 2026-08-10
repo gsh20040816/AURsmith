@@ -81,7 +81,7 @@ Controller 每六小时读取当前 Release 中 Artifact 构建时记录的官�
 
 Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publisher 只能向只写 inbox 投递软件包和 Controller 签名的 `ReleaseAuthorization`，不能访问 Signer 的 GPG home；Signer 只能只读 inbox 并写独立 signed volume。Signer 再次验证 Controller Ed25519 公钥、授权期限、writer epoch 对应的授权内容、每个包的相对路径、大小、SHA-256 和 `.PKGINFO`，随后用固定 argv 调用 GPG 与官方 `repo-add`。包、仓库数据库和 Release Manifest 均生成 GPG 分离签名，完整 staging 最后通过目录 rename 提交。Publisher 仍须在公开前复验签名并执行 hot set/数据库切换；Signer 自身不拥有公开仓库卷。
 
-Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.PKGINFO`：路径逃逸、重复条目、设备文件、FIFO、Socket，以及缺失或重复的 `.PKGINFO`、`.BUILDINFO`、`.MTREE` 会失败关闭；包名、版本和架构必须与 BuildResult 一致。INSTALL 脚本、pacman hook、systemd 单元、setuid/setgid 文件和内核模块作为风险事实记录，不因类别本身宣称恶意。结构化 `artifact-inspections.json` 随 Signer 输入进入断网边界，Signer核对报告数量和大小，并把其摘要写入 GPG 签名的 Release Manifest；因此 Archiver 会与 Release 一起保存这份发布前检查证据。
+Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.PKGINFO`：路径逃逸、重复条目、设备文件、FIFO、Socket，以及缺失或重复的 `.PKGINFO`、`.BUILDINFO`、`.MTREE` 会失败关闭；包名、版本和架构必须与 BuildResult 一致。INSTALL 脚本、pacman hook、systemd 单元、setuid/setgid 文件和内核模块作为风险事实记录，不因类别本身宣称恶意。对可执行文件和共享库候选，Publisher 通过 bsdtar 按单文件安全提取到临时文件，再以固定 argv 运行 readelf 并记录每个 ELF 的 `DT_NEEDED`。file capability 不通过需要特权的实际解包恢复，而是从归档的 pax `LIBARCHIVE.xattr.security.capability` 头识别并绑定路径。结构化 `artifact-inspections.json` 随 Signer 输入进入断网边界，Signer核对报告数量和大小，并把其摘要写入 GPG 签名的 Release Manifest；因此 Archiver 会与 Release 一起保存这份发布前检查证据。
 
 ## Builder KVM 执行内核
 

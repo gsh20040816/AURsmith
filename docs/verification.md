@@ -212,3 +212,10 @@
 - Web：设置页不再只有客户端引导，新增预算表单、当前使用量、provider 配置方式、通知和 30 天仓库兼容窗口；页面明确 provider/Base URL/API key 必须通过 Compose 与 secret 修改。前端测试打开设置页，确认预算值可见、Codex/Claude Code 状态可见且不存在类似 API key 的内容。
 - 验证：认证路由测试实际登录后 PUT 设置并核对响应中的新限额及 `api_keys_exposed=false`；Controller 33 个测试、TypeScript 检查、5 个前端测试和生产构建通过。第一次把 npm 串在仓库根目录命令后再次得到 ENOENT，随后在 `web/` 目录纠正并通过；该重复操作失误不计为验证成功。
 - 边界：设置页不热更新 Agent 容器的 provider 与 Base URL，也不接收 API key；这是刻意的 secret 边界。尚未用真实 provider key 执行模型调用，Agent 外部服务 E2E 仍未验证。
+
+## 2026-08-10：Publisher ELF 与 file capability 检查
+
+- ELF：软件包检查在完整归档门禁通过后，对可执行文件、共享库和内核模块候选使用 bsdtar 单独提取；单文件上限 1 GiB。确认 ELF magic 后以固定 argv 调用 readelf，单份输出上限 16 MiB，并把路径到 `DT_NEEDED` 的映射写入检查报告。
+- capability：Publisher 不需要 root 或 `CAP_SETFCAP`。检查器让 bsdtar 针对可执行归档项重建有限的 pax 头流，只读取前 128 KiB，并识别 `LIBARCHIVE.xattr.security.capability`；随后终止子进程，不把整个大文件读入内存。命中只记录路径，不自动判为恶意。
+- 测试：真实 tar fixture 加入宿主 `/usr/bin/true` 的副本，正式检查入口识别 ELF 并生成依赖映射；另有 pax 头识别回归。修改后的 Worker 镜像实际构建为 `aursmith-worker:inspection-test`，镜像内非 root 用户执行 `/usr/bin/readelf --version` 返回 GNU Binutils 2.47；验证后该临时镜像标签及其独占层已删除，可由 Dockerfile 重新构建。
+- 边界：测试用纯函数覆盖 capability pax 头识别，且已在独立 Arch 容器中确认 bsdtar 重建会保留真实 `security.capability` 头；尚未通过完整 Publisher Release API 提交一个带 capability 的 pacman 包。Controller 当前保存的是构建时官方依赖快照，签名检查报告中的 ELF 映射已归档但还没有单独进入 ABI 建议查询表。

@@ -1,7 +1,12 @@
 use anyhow::{Context, bail};
 use aursmith_protocol::ArtifactRecord;
 use serde::Serialize;
-use std::{collections::BTreeSet, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 const MAXIMUM_ARCHIVE_ENTRIES: usize = 500_000;
 
@@ -13,7 +18,9 @@ pub struct PackageInspection {
     pub pacman_hooks: Vec<String>,
     pub systemd_units: Vec<String>,
     pub setuid_or_setgid: Vec<String>,
+    pub file_capabilities: Vec<String>,
     pub kernel_modules: Vec<String>,
+    pub elf_needed: BTreeMap<String, Vec<String>>,
 }
 
 pub fn inspect_package(
@@ -32,8 +39,9 @@ pub fn inspect_package(
         })
         .collect::<Vec<_>>();
     let paths = paths.lines().map(str::to_owned).collect::<Vec<_>>();
-    let inspection = inspect_listing(&paths, &modes, &artifact.sha256)?;
+    let mut inspection = inspect_listing(&paths, &modes, &artifact.sha256)?;
     validate_pkginfo(path, artifact)?;
+    inspect_regular_files(path, &paths, &modes, &mut inspection)?;
     Ok(inspection)
 }
 
@@ -92,7 +100,9 @@ fn inspect_listing(
         pacman_hooks: Vec::new(),
         systemd_units: Vec::new(),
         setuid_or_setgid: Vec::new(),
+        file_capabilities: Vec::new(),
         kernel_modules: Vec::new(),
+        elf_needed: BTreeMap::new(),
     };
     for (raw_path, mode) in paths.iter().zip(modes) {
         let normalized = raw_path
@@ -153,6 +163,99 @@ fn inspect_listing(
     Ok(inspection)
 }
 
+fn inspect_regular_files(
+    package: &Path,
+    paths: &[String],
+    modes: &[String],
+    inspection: &mut PackageInspection,
+) -> anyhow::Result<()> {
+    for (raw_path, mode) in paths.iter().zip(modes) {
+        if !mode.starts_with('-') {
+            continue;
+        }
+        let path = raw_path
+            .strip_prefix("./")
+            .unwrap_or(raw_path)
+            .trim_end_matches('/');
+        let executable = mode.chars().skip(1).any(|value| matches!(value, 'x' | 's'));
+        let elf_candidate = executable
+            || path.contains(".so")
+            || path.ends_with(".ko")
+            || path.ends_with(".ko.gz")
+            || path.ends_with(".ko.xz")
+            || path.ends_with(".ko.zst");
+        if executable && archive_entry_has_file_capability(package, path)? {
+            inspection.file_capabilities.push(path.to_owned());
+        }
+        if !elf_candidate {
+            continue;
+        }
+        let extracted = tempfile::NamedTempFile::new()?;
+        let output_file = extracted.reopen()?;
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["-xOf"])
+            .arg(package)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output_file))
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() || extracted.as_file().metadata()?.len() > 1024 * 1024 * 1024 {
+            bail!("无法有界提取软件包文件：{path}");
+        }
+        let mut magic = [0_u8; 4];
+        let mut file = extracted.reopen()?;
+        if file.read_exact(&mut magic).is_err() || magic != *b"\x7fELF" {
+            continue;
+        }
+        let output = Command::new("/usr/bin/readelf")
+            .args(["-dW"])
+            .arg(extracted.path())
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() || output.stdout.len() > 16 * 1024 * 1024 {
+            bail!("readelf 无法解析 ELF：{path}");
+        }
+        let text = String::from_utf8(output.stdout).context("readelf 输出不是 UTF-8")?;
+        let needed = text
+            .lines()
+            .filter(|line| line.contains("(NEEDED)"))
+            .filter_map(|line| line.split_once("Shared library: ["))
+            .filter_map(|(_, value)| value.split_once(']'))
+            .map(|(name, _)| name.to_owned())
+            .collect::<Vec<_>>();
+        inspection.elf_needed.insert(path.to_owned(), needed);
+    }
+    Ok(())
+}
+
+fn archive_entry_has_file_capability(package: &Path, path: &str) -> anyhow::Result<bool> {
+    const HEADER_LIMIT: u64 = 128 * 1024;
+    let mut child = Command::new("/usr/bin/bsdtar")
+        .args(["-cf", "-", "--format", "pax", "--include", path])
+        .arg(format!("@{}", package.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("无法读取 bsdtar 输出")?
+        .take(HEADER_LIMIT)
+        .read_to_end(&mut bytes)?;
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(contains_capability_header(&bytes))
+}
+
+fn contains_capability_header(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"LIBARCHIVE.xattr.security.capability=".len())
+        .any(|window| window == b"LIBARCHIVE.xattr.security.capability=")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,12 +270,14 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join(".BUILDINFO"), "format = 2\n").unwrap();
         std::fs::write(root.path().join(".MTREE"), "#mtree\n").unwrap();
+        std::fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        std::fs::copy("/usr/bin/true", root.path().join("usr/bin/demo")).unwrap();
         let package = root.path().join("demo-1-1-any.pkg.tar");
         let status = Command::new("/usr/bin/bsdtar")
             .current_dir(root.path())
             .args(["-cf"])
             .arg(&package)
-            .args([".PKGINFO", ".BUILDINFO", ".MTREE"])
+            .args([".PKGINFO", ".BUILDINFO", ".MTREE", "usr/bin/demo"])
             .status()
             .unwrap();
         assert!(status.success());
@@ -184,7 +289,9 @@ mod tests {
             package_version: Some("1-1".into()),
             architecture: Some("any".into()),
         };
-        assert_eq!(inspect_package(&package, &artifact).unwrap().entry_count, 3);
+        let inspection = inspect_package(&package, &artifact).unwrap();
+        assert_eq!(inspection.entry_count, 4);
+        assert!(inspection.elf_needed.contains_key("usr/bin/demo"));
     }
 
     #[test]
@@ -242,5 +349,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn capability_pax_header_is_detected_without_interpreting_payload() {
+        assert!(contains_capability_header(
+            b"68 LIBARCHIVE.xattr.security.capability=AQAAAgAEAAAA"
+        ));
+        assert!(!contains_capability_header(b"ordinary pax header"));
     }
 }
