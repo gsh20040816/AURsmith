@@ -4,8 +4,9 @@ mod builder;
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
-    ArchiveInventory, ArchiveReceipt, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization,
-    ReleaseManifest, ReleaseRollbackAuthorization, SignedEnvelope, TransferCapability,
+    ArchiveInventory, ArchiveReceipt, BackupArchiveReceipt, ControlPlaneBackup, JobSpec,
+    PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, ReleaseRollbackAuthorization,
+    SignedEnvelope, TransferCapability,
 };
 use chrono::Utc;
 use clap::Parser;
@@ -310,6 +311,11 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS backup_archive_receipts(backup_id TEXT PRIMARY KEY, capability_id TEXT NOT NULL UNIQUE, envelope_json TEXT NOT NULL, directory TEXT NOT NULL, created_at TEXT NOT NULL);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS attempts(\
          job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
          envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
@@ -444,7 +450,7 @@ async fn authorize_export(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         let Some(attempt) = &capability.attempt else {
             return WorkerResponse::error("ATTEMPT_REQUIRED", "Artifact 导出必须绑定 Attempt");
         };
-        if capability.release_id.is_some() {
+        if capability.release_id.is_some() || capability.backup_id.is_some() {
             return WorkerResponse::error(
                 "INVALID_CAPABILITY",
                 "Builder Capability 不能绑定 Release",
@@ -462,7 +468,10 @@ async fn authorize_export(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         let Some(release_id) = capability.release_id else {
             return WorkerResponse::error("RELEASE_REQUIRED", "Publisher 导出必须绑定 Release");
         };
-        if capability.attempt.is_some() || capability.writer_epoch != worker.writer_epoch {
+        if capability.attempt.is_some()
+            || capability.backup_id.is_some()
+            || capability.writer_epoch != worker.writer_epoch
+        {
             return WorkerResponse::error(
                 "INVALID_CAPABILITY",
                 "Publisher Release Capability 的 Attempt 或 writer epoch 无效",
@@ -657,25 +666,38 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         );
     }
     if (worker.role == WorkerRole::Publisher
-        && (capability.attempt.is_none() || capability.release_id.is_some()))
+        && (capability.attempt.is_none()
+            || capability.release_id.is_some()
+            || capability.backup_id.is_some()))
         || (worker.role == WorkerRole::Archiver
-            && (capability.attempt.is_some() || capability.release_id.is_none()))
+            && (capability.attempt.is_some()
+                || capability.release_id.is_some() == capability.backup_id.is_some()))
     {
         return WorkerResponse::error("INVALID_CAPABILITY", "Capability 聚合类型与目标角色不匹配");
     }
     if worker.role == WorkerRole::Archiver {
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT envelope_json FROM archive_receipts WHERE release_id = ?")
-                .bind(
-                    capability
-                        .release_id
-                        .map(|value| value.to_string())
-                        .unwrap_or_default(),
-                )
-                .fetch_optional(&worker.database)
-                .await
-                .ok()
-                .flatten();
+        let (table, aggregate_id) = if let Some(release_id) = capability.release_id {
+            ("archive_receipts", release_id.to_string())
+        } else {
+            (
+                "backup_archive_receipts",
+                capability.backup_id.unwrap_or_default().to_string(),
+            )
+        };
+        let query = format!(
+            "SELECT envelope_json FROM {table} WHERE {} = ?",
+            if capability.release_id.is_some() {
+                "release_id"
+            } else {
+                "backup_id"
+            }
+        );
+        let existing: Option<String> = sqlx::query_scalar(&query)
+            .bind(aggregate_id)
+            .fetch_optional(&worker.database)
+            .await
+            .ok()
+            .flatten();
         if let Some(receipt) =
             existing.and_then(|value| serde_json::from_str::<SignedEnvelope>(&value).ok())
         {
@@ -815,7 +837,12 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         .execute(&worker.database).await;
     match inserted {
         Ok(_) if worker.role == WorkerRole::Archiver => {
-            match archive_release(worker, &capability, &final_directory).await {
+            let archived = if capability.backup_id.is_some() {
+                archive_control_plane_backup(worker, &capability, &final_directory).await
+            } else {
+                archive_release(worker, &capability, &final_directory).await
+            };
+            match archived {
                 Ok(receipt) => WorkerResponse::ok(
                     "ARCHIVE_VERIFIED",
                     serde_json::json!({"capability_id": capability.id, "receipt": receipt}),
@@ -836,13 +863,92 @@ async fn archived_receipt_response(
     capability: &TransferCapability,
 ) -> WorkerResponse {
     let imported = worker.landing_dir.join(capability.id.to_string());
-    match archive_release(worker, capability, &imported).await {
+    let archived = if capability.backup_id.is_some() {
+        archive_control_plane_backup(worker, capability, &imported).await
+    } else {
+        archive_release(worker, capability, &imported).await
+    };
+    match archived {
         Ok(receipt) => WorkerResponse::ok(
             "ARCHIVE_VERIFIED",
             serde_json::json!({"capability_id": capability.id, "receipt": receipt}),
         ),
         Err(error) => WorkerResponse::error("ARCHIVE_FAILED", error.to_string()),
     }
+}
+
+async fn archive_control_plane_backup(
+    worker: &Worker,
+    capability: &TransferCapability,
+    imported: &Path,
+) -> anyhow::Result<SignedEnvelope> {
+    let backup_id =
+        validate_control_plane_backup_input(&worker.trusted_controller_key, capability, imported)?;
+    let root = worker.archive_dir.join("control-plane-backups");
+    std::fs::create_dir_all(&root)?;
+    let committed = root.join(backup_id.to_string());
+    if !committed.exists() {
+        let staging = root.join(format!(".{backup_id}.staging"));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        materialize_export(imported, &staging, &capability.files)?;
+        verify_manifest_directory(&staging, &capability.files)?;
+        sync_directory(&staging)?;
+        std::fs::rename(&staging, &committed)?;
+        sync_directory(&root)?;
+    } else {
+        verify_manifest_directory(&committed, &capability.files)?;
+    }
+    let instance_id: String =
+        sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
+            .fetch_one(&worker.database)
+            .await?;
+    let receipt = BackupArchiveReceipt {
+        backup_id,
+        archive_worker: uuid::Uuid::parse_str(&instance_id)?,
+        files: directory_manifest(&committed)?,
+        verified_at: Utc::now(),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.backup_archive_receipt",
+        &receipt,
+        &worker.identity_signing_key,
+    )?;
+    sqlx::query("INSERT INTO backup_archive_receipts(backup_id, capability_id, envelope_json, directory, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(backup_id) DO NOTHING")
+        .bind(backup_id.to_string()).bind(capability.id.to_string()).bind(serde_json::to_string(&envelope)?)
+        .bind(committed.to_string_lossy().as_ref()).bind(Utc::now()).execute(&worker.database).await?;
+    let _ = std::fs::remove_dir_all(imported);
+    Ok(envelope)
+}
+
+fn validate_control_plane_backup_input(
+    trusted_controller_key: &[u8],
+    capability: &TransferCapability,
+    imported: &Path,
+) -> anyhow::Result<uuid::Uuid> {
+    let backup_id = capability
+        .backup_id
+        .context("备份 Capability 缺少 Backup ID")?;
+    verify_manifest_directory(imported, &capability.files)?;
+    let backup_envelope: SignedEnvelope =
+        serde_json::from_slice(&std::fs::read(imported.join("backup-envelope.json"))?)?;
+    if backup_envelope.verifying_key != trusted_controller_key {
+        bail!("控制面备份不是由当前 Controller 签署");
+    }
+    let backup: ControlPlaneBackup = backup_envelope.verify("aursmith.control_plane_backup")?;
+    if backup.backup_id != backup_id {
+        bail!("控制面备份 ID 与 Capability 不一致");
+    }
+    let database = capability
+        .files
+        .iter()
+        .find(|entry| entry.path == backup.database.path)
+        .context("Capability 缺少控制面数据库")?;
+    if database != &backup.database {
+        bail!("控制面数据库与签名 Manifest 不一致");
+    }
+    Ok(backup_id)
 }
 
 async fn archive_release(
@@ -950,6 +1056,7 @@ async fn inventory(worker: &Worker, full_digest: bool) -> WorkerResponse {
             Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
         };
     let mut release_count = 0_u64;
+    let mut backup_count = 0_u64;
     let mut file_count = 0_u64;
     let mut byte_count = 0_u64;
     let mut failures = Vec::new();
@@ -989,6 +1096,53 @@ async fn inventory(worker: &Worker, full_digest: bool) -> WorkerResponse {
             break;
         }
     }
+    if failures.len() < 100 {
+        let backup_rows = match sqlx::query(
+            "SELECT envelope_json, directory FROM backup_archive_receipts ORDER BY backup_id",
+        )
+        .fetch_all(&worker.database)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+        };
+        for row in backup_rows {
+            let envelope = serde_json::from_str::<SignedEnvelope>(row.get("envelope_json"));
+            let receipt = envelope.and_then(|value| {
+                if value.verifying_key != worker.identity_signing_key.verifying_key().as_bytes() {
+                    return Err(serde_json::Error::io(std::io::Error::other(
+                        "备份 Receipt 身份公钥不匹配",
+                    )));
+                }
+                value
+                    .verify::<BackupArchiveReceipt>("aursmith.backup_archive_receipt")
+                    .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+            });
+            let receipt = match receipt {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(format!("备份 Receipt 无效：{error}"));
+                    continue;
+                }
+            };
+            backup_count += 1;
+            file_count = file_count.saturating_add(receipt.files.len() as u64);
+            byte_count = byte_count
+                .saturating_add(receipt.files.iter().map(|entry| entry.size).sum::<u64>());
+            let directory = PathBuf::from(row.get::<String, _>("directory"));
+            let result = if full_digest {
+                verify_manifest_directory(&directory, &receipt.files)
+            } else {
+                verify_manifest_directory_shallow(&directory, &receipt.files)
+            };
+            if let Err(error) = result {
+                failures.push(format!("控制面备份 {}：{error}", receipt.backup_id));
+            }
+            if failures.len() >= 100 {
+                break;
+            }
+        }
+    }
     let report = ArchiveInventory {
         archive_worker: match uuid::Uuid::parse_str(&instance_id) {
             Ok(value) => value,
@@ -996,6 +1150,7 @@ async fn inventory(worker: &Worker, full_digest: bool) -> WorkerResponse {
         },
         full_digest,
         release_count,
+        backup_count,
         file_count,
         byte_count,
         failures,
@@ -2162,5 +2317,58 @@ mod transfer_tests {
             verify_manifest_directory_shallow(root.path(), std::slice::from_ref(&entry)).is_ok()
         );
         assert!(verify_manifest_directory(root.path(), &[entry]).is_err());
+    }
+
+    #[test]
+    fn control_plane_backup_requires_controller_signature_and_bound_database() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("controller.db");
+        std::fs::write(&database_path, b"sqlite-backup").unwrap();
+        let database = aursmith_protocol::ManifestEntry {
+            path: "controller.db".into(),
+            sha256: file_sha256(&database_path).unwrap(),
+            size: 13,
+        };
+        let backup_id = uuid::Uuid::new_v4();
+        let controller_key = SigningKey::from_bytes(&[23_u8; 32]);
+        let backup = ControlPlaneBackup {
+            backup_id,
+            database: database.clone(),
+            source_git_commit: "test".into(),
+            created_at: Utc::now(),
+        };
+        let envelope =
+            SignedEnvelope::sign("aursmith.control_plane_backup", &backup, &controller_key)
+                .unwrap();
+        let envelope_path = root.path().join("backup-envelope.json");
+        std::fs::write(&envelope_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let envelope_entry = aursmith_protocol::ManifestEntry {
+            path: "backup-envelope.json".into(),
+            sha256: file_sha256(&envelope_path).unwrap(),
+            size: envelope_path.metadata().unwrap().len(),
+        };
+        let capability = TransferCapability {
+            id: uuid::Uuid::new_v4(),
+            source_worker: uuid::Uuid::new_v4(),
+            destination_worker: uuid::Uuid::new_v4(),
+            attempt: None,
+            release_id: None,
+            backup_id: Some(backup_id),
+            writer_epoch: 0,
+            files: vec![database, envelope_entry],
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+        };
+        assert_eq!(
+            validate_control_plane_backup_input(
+                controller_key.verifying_key().as_bytes(),
+                &capability,
+                root.path(),
+            )
+            .unwrap(),
+            backup_id
+        );
+        assert!(
+            validate_control_plane_backup_input(&[0_u8; 32], &capability, root.path()).is_err()
+        );
     }
 }

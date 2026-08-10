@@ -24,6 +24,8 @@ pub struct Config {
     pub webhook_hmac_secret_file: String,
     pub ntfy_url: Option<String>,
     pub backup_dir: String,
+    pub backup_export_dir: String,
+    pub backup_export_socket: String,
 }
 
 impl Config {
@@ -89,6 +91,10 @@ impl Config {
             ntfy_url: optional_env("AURSMITH_NTFY_URL"),
             backup_dir: env::var("AURSMITH_BACKUP_DIR")
                 .unwrap_or_else(|_| "/var/lib/aursmith/backups".into()),
+            backup_export_dir: env::var("AURSMITH_BACKUP_EXPORT_DIR")
+                .unwrap_or_else(|_| "/var/lib/aursmith/transfers".into()),
+            backup_export_socket: env::var("AURSMITH_BACKUP_EXPORT_SOCKET")
+                .unwrap_or_else(|_| "/run/aursmith-controller/export.sock".into()),
         })
     }
 

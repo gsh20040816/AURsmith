@@ -114,8 +114,131 @@ pub fn spawn(state: AppState) {
             if let Err(error) = dispatch_archive_one(&state).await {
                 tracing::warn!(%error, "Release 归档调度失败");
             }
+            if let Err(error) = dispatch_backup_archive_one(&state).await {
+                tracing::warn!(%error, "控制面备份归档调度失败");
+            }
         }
     });
+}
+
+async fn dispatch_backup_archive_one(state: &AppState) -> Result<(), ApiError> {
+    let pending = sqlx::query("SELECT control_plane_backup_archives.id, control_plane_backup_archives.backup_id, control_plane_backup_archives.envelope_json, control_plane_backup_archives.export_directory, control_plane_backup_archives.attempt_count, control_plane_backup_archives.expires_at, workers.endpoint, workers.identity_signing_key_hex FROM control_plane_backup_archives JOIN workers ON workers.id = control_plane_backup_archives.archiver_worker_id WHERE control_plane_backup_archives.state = 'issued' ORDER BY control_plane_backup_archives.updated_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = pending {
+        let transfer_id: String = row.get("id");
+        let backup_id: String = row.get("backup_id");
+        let expires_at: String = row.get("expires_at");
+        if expires_at
+            .parse::<chrono::DateTime<Utc>>()
+            .is_ok_and(|value| value <= Utc::now())
+        {
+            sqlx::query("UPDATE control_plane_backup_archives SET state = 'failed', last_error = 'CAPABILITY_EXPIRED', updated_at = ? WHERE id = ?")
+                .bind(Utc::now()).bind(&transfer_id).execute(&state.database).await.map_err(ApiError::internal)?;
+            return Ok(());
+        }
+        let envelope: SignedEnvelope =
+            serde_json::from_str(row.get("envelope_json")).map_err(ApiError::internal)?;
+        match transport::authorize_import(&state.config, row.get("endpoint"), &envelope).await {
+            Ok(reply) => {
+                let receipt_envelope: SignedEnvelope =
+                    serde_json::from_value(reply.data["receipt"].clone())
+                        .map_err(ApiError::internal)?;
+                let expected_key: String = row
+                    .get::<Option<String>, _>("identity_signing_key_hex")
+                    .ok_or_else(|| ApiError::internal("Archiver 缺少身份公钥"))?;
+                if receipt_envelope.verifying_key
+                    != hex::decode(expected_key).map_err(ApiError::internal)?
+                {
+                    return Err(ApiError::conflict(
+                        "BACKUP_RECEIPT_UNTRUSTED",
+                        "备份归档 Receipt 身份签名不匹配",
+                    ));
+                }
+                let receipt: aursmith_protocol::BackupArchiveReceipt = receipt_envelope
+                    .verify("aursmith.backup_archive_receipt")
+                    .map_err(ApiError::internal)?;
+                let capability: aursmith_protocol::TransferCapability = envelope
+                    .verify("aursmith.transfer_capability")
+                    .map_err(ApiError::internal)?;
+                if receipt.backup_id.to_string() != backup_id
+                    || receipt.archive_worker != capability.destination_worker
+                    || receipt.files != capability.files
+                {
+                    return Err(ApiError::conflict(
+                        "BACKUP_RECEIPT_MISMATCH",
+                        "备份归档 Receipt 与 Capability 不一致",
+                    ));
+                }
+                sqlx::query("UPDATE control_plane_backup_archives SET state = 'verified', receipt_sha256 = ?, last_error = NULL, updated_at = ? WHERE id = ?")
+                    .bind(&receipt_envelope.payload_sha256).bind(Utc::now()).bind(&transfer_id)
+                    .execute(&state.database).await.map_err(ApiError::internal)?;
+                let export = std::path::PathBuf::from(row.get::<String, _>("export_directory"));
+                if export.starts_with(&state.config.backup_export_dir) {
+                    let _ = std::fs::remove_dir_all(export);
+                }
+            }
+            Err(error) => {
+                let attempts: i64 = row.get("attempt_count");
+                let terminal = attempts + 1 >= 3;
+                sqlx::query("UPDATE control_plane_backup_archives SET state = CASE WHEN ? THEN 'failed' ELSE state END, attempt_count = attempt_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
+                    .bind(terminal).bind(error.to_string()).bind(Utc::now()).bind(&transfer_id)
+                    .execute(&state.database).await.map_err(ApiError::internal)?;
+                if terminal {
+                    upsert_operational_alert(
+                        state,
+                        &format!("backup-archive:{backup_id}"),
+                        "warning",
+                        "控制面备份归档失败",
+                        json!({"backup_id": backup_id, "error": error.to_string()}),
+                    )
+                    .await?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    let backup_id: Option<String> = sqlx::query_scalar("SELECT id FROM control_plane_backups WHERE state = 'verified' AND NOT EXISTS (SELECT 1 FROM control_plane_backup_archives WHERE control_plane_backup_archives.backup_id = control_plane_backups.id) ORDER BY created_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let Some(backup_id) = backup_id else {
+        return Ok(());
+    };
+    let archiver = sqlx::query(
+        "SELECT id FROM workers WHERE role = 'archiver' AND state = 'online' ORDER BY name LIMIT 1",
+    )
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(archiver) = archiver else {
+        return Ok(());
+    };
+    let transfer_id = Uuid::new_v4();
+    let parsed_backup_id = Uuid::parse_str(&backup_id).map_err(ApiError::internal)?;
+    let (files, export_directory) =
+        crate::backups::prepare_export(state, parsed_backup_id, transfer_id).await?;
+    let now = Utc::now();
+    let capability = aursmith_protocol::TransferCapability {
+        id: transfer_id,
+        source_worker: crate::backups::transfer_source_id(state),
+        destination_worker: Uuid::parse_str(archiver.get("id")).map_err(ApiError::internal)?,
+        attempt: None,
+        release_id: None,
+        backup_id: Some(parsed_backup_id),
+        writer_epoch: 0,
+        files,
+        expires_at: now + Duration::hours(1),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.transfer_capability",
+        &capability,
+        &state.signing_key,
+    )
+    .map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO control_plane_backup_archives(id, backup_id, archiver_worker_id, state, envelope_json, export_directory, expires_at, created_at, updated_at) VALUES (?, ?, ?, 'issued', ?, ?, ?, ?, ?)")
+        .bind(transfer_id.to_string()).bind(&backup_id).bind(archiver.get::<String,_>("id"))
+        .bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+        .bind(export_directory.to_string_lossy().as_ref()).bind(capability.expires_at).bind(now).bind(now)
+        .execute(&state.database).await.map_err(ApiError::internal)?;
+    Ok(())
 }
 
 async fn run_archive_inventory_if_due(state: &AppState) -> Result<(), ApiError> {
@@ -162,9 +285,10 @@ async fn run_archive_inventory_if_due(state: &AppState) -> Result<(), ApiError> 
             "库存报告与请求不一致",
         ));
     }
-    sqlx::query("INSERT INTO archive_inventories(id, archiver_worker_id, full_digest, release_count, file_count, byte_count, failure_count, envelope_json, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO archive_inventories(id, archiver_worker_id, full_digest, release_count, backup_count, file_count, byte_count, failure_count, envelope_json, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(Uuid::new_v4().to_string()).bind(&worker_id).bind(full_digest)
         .bind(i64::try_from(report.release_count).map_err(ApiError::internal)?)
+        .bind(i64::try_from(report.backup_count).map_err(ApiError::internal)?)
         .bind(i64::try_from(report.file_count).map_err(ApiError::internal)?)
         .bind(i64::try_from(report.byte_count).map_err(ApiError::internal)?)
         .bind(i64::try_from(report.failures.len()).map_err(ApiError::internal)?)
@@ -356,6 +480,7 @@ async fn dispatch_archive_one(state: &AppState) -> Result<(), ApiError> {
         destination_worker: Uuid::parse_str(archiver.get("id")).map_err(ApiError::internal)?,
         attempt: None,
         release_id: Some(Uuid::parse_str(&release_id).map_err(ApiError::internal)?),
+        backup_id: None,
         writer_epoch: u64::try_from(release.get::<i64, _>("writer_epoch"))
             .map_err(ApiError::internal)?,
         files,
@@ -704,6 +829,7 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
                     .map_err(ApiError::internal)?,
             }),
             release_id: None,
+            backup_id: None,
             writer_epoch: u64::try_from(publisher.get::<i64, _>("writer_epoch"))
                 .map_err(ApiError::internal)?,
             files,

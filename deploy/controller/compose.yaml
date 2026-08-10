@@ -31,6 +31,8 @@ services:
       AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
       AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
       AURSMITH_BACKUP_DIR: /var/lib/aursmith/backups
+      AURSMITH_BACKUP_EXPORT_DIR: /var/lib/aursmith/transfers
+      AURSMITH_BACKUP_EXPORT_SOCKET: /run/aursmith/worker.sock
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
       - setup_token
@@ -40,6 +42,7 @@ services:
       - webhook_hmac_secret
     volumes:
       - controller-data:/var/lib/aursmith
+      - controller-run:/run/aursmith
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
@@ -49,6 +52,39 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    restart: unless-stopped
+
+  backup-ssh:
+    build:
+      context: ../..
+      dockerfile: deploy/images/controller.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    entrypoint: [/usr/local/bin/aursmithctl]
+    command: [run-sshd]
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH, SETGID, SETPCAP, SETUID]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - controller-run:/run/aursmith
+      - controller-data:/jobs:ro
+      - ../common/sshd_config:/etc/ssh/sshd_config:ro
+    secrets:
+      - source: source_ssh_host_ed25519_key
+        target: ssh_host_ed25519_key
+      - source: source_authorized_keys
+        target: authorized_keys
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/private:uid=0,gid=0,mode=0755,size=2m
+    ports:
+      - ${AURSMITH_BACKUP_SSH_BIND:-127.0.0.1:2221}:2222
+    networks: [control]
+    depends_on:
+      controller:
+        condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -142,6 +178,10 @@ secrets:
     file: ${AURSMITH_WORKER_KNOWN_HOSTS_FILE:-./secrets/worker_known_hosts}
   webhook_hmac_secret:
     file: ${AURSMITH_WEBHOOK_HMAC_SECRET_FILE:-./secrets/webhook_hmac_secret}
+  source_ssh_host_ed25519_key:
+    file: ${AURSMITH_BACKUP_SSH_HOST_KEY_FILE:-./secrets/backup_ssh_host_ed25519_key}
+  source_authorized_keys:
+    file: ${AURSMITH_BACKUP_AUTHORIZED_KEYS_FILE:-./secrets/backup_authorized_keys}
   low_agent_api_key:
     file: ${AURSMITH_LOW_AGENT_API_KEY_FILE:-./secrets/low_agent_api_key}
   high_agent_api_key:
@@ -149,6 +189,7 @@ secrets:
 
 volumes:
   controller-data:
+  controller-run:
 
 networks:
   control:

@@ -99,7 +99,7 @@
 - 测试在临时文件数据库完成全部 migration，写入 `before` 状态后执行正式备份实现；备份由 `VACUUM INTO` 生成，经过 `integrity_check`、SHA-256 和测试 Controller Ed25519 密钥签名。
 - 随后把在线数据库状态改为 `after`、关闭连接池，并执行正式 `restore-control-plane` 内核逻辑。重新连接后读到签名快照中的 `before`，证明恢复的不是修改后的主数据库。
 - 测试确认被替换数据库进入 `recovery` 目录；另有路径测试拒绝内存数据库和带查询参数的恢复目标，避免把不明确 URL 当成文件覆盖。
-- 未覆盖：本条使用临时目录和测试密钥，没有在 Docker volume 上执行人工停机恢复演练；备份自动传输到独立 Archiver 尚未接入，因此当前只完成本地一致性与可恢复性，不满足独立故障域验收。
+- 未覆盖：本条使用临时目录和测试密钥，没有在 Docker volume 上执行人工停机恢复演练；远端 Archiver 传输由后续条目覆盖静态路径，但仍需要一次真实跨设备恢复演练。
 
 ## 2026-08-10：Archiver 周期库存巡检
 
@@ -107,3 +107,10 @@
 - 单元测试创建一个与 Receipt 完全匹配的归档目录，确认每周浅巡检和完整摘要巡检均通过；随后把文件改为相同长度的不同内容，浅巡检仍只负责集合/大小，而完整巡检按 SHA-256 明确失败，锁定两种检查的职责差异。
 - Worker 只允许 Archiver 角色执行 inventory，并以本地 Journal 身份密钥签署版本化报告。Controller 调度实现会核对固定身份公钥、Worker UUID 和 full-digest 请求，失败报告进入稳定 fingerprint 的 critical 告警；归档 UI 可查看报告历史。
 - 未覆盖：没有在包含上一轮真实 Release 的 Archiver 容器上实际运行季度全量扫描，也未进行损坏后从第二副本恢复演练；当前测试覆盖算法、协议、调度静态路径和 UI 构建。
+
+## 2026-08-10：控制面备份独立归档路径
+
+- 快速测试共运行 72 个 Rust 测试，前端和 Compose 检查全部通过。控制面备份测试额外验证最小导出目录只包含 `controller.db` 与 `backup-envelope.json`，目录名绑定随机 Capability，传输源 UUID 对同一 Controller 身份保持稳定；后续库存报告分别统计 Release 与控制面备份，二者都进入每周/季度巡检。
+- Archiver 输入测试使用测试 Controller 密钥签署 `ControlPlaneBackup`，确认 Backup ID、数据库摘要、Capability 文件集合和 Controller 公钥全部一致时才接受；替换为其他公钥会失败关闭。
+- Controller、backup-ssh 共用镜像以及修改后的 Archiver Worker 镜像均已通过真实 Docker build。Controller 镜像包含 OpenSSH server、rsync 和永久降权工具；Compose 安全检查确认 sidecar 仍为 `cap_drop: ALL`、只增加启动后永久降权所需能力、只读挂载导出卷且不获得 Controller 数据库写权限。
+- 未覆盖：本次没有配置一组真实 Controller/Archiver SSH key 完成跨容器 rsync 与 BackupArchiveReceipt 冒烟，也没有从 Archiver 副本执行停机恢复；因此独立归档的协议、文件校验、容器镜像和调度代码已验证，但跨设备端到端验收仍未完成。

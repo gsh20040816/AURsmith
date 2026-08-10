@@ -35,6 +35,7 @@ fn main() -> anyhow::Result<()> {
         destination_worker: Uuid::parse_str(&arguments[2])?,
         attempt: None,
         release_id: Some(Uuid::parse_str(&arguments[3])?),
+        backup_id: None,
         writer_epoch: 1,
         files,
         expires_at: Utc::now() + Duration::minutes(10),

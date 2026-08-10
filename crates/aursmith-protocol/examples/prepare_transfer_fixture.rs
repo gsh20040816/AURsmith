@@ -26,6 +26,7 @@ fn main() -> anyhow::Result<()> {
             generation: 0,
         }),
         release_id: None,
+        backup_id: None,
         writer_epoch: 0,
         files: vec![ManifestEntry {
             path: artifact

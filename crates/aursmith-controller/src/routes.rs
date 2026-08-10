@@ -340,11 +340,12 @@ async fn list_archive_inventories(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("SELECT archive_inventories.id, archive_inventories.full_digest, archive_inventories.release_count, archive_inventories.file_count, archive_inventories.byte_count, archive_inventories.failure_count, archive_inventories.checked_at, workers.name FROM archive_inventories JOIN workers ON workers.id = archive_inventories.archiver_worker_id ORDER BY checked_at DESC LIMIT 100")
+    let rows = sqlx::query("SELECT archive_inventories.id, archive_inventories.full_digest, archive_inventories.release_count, archive_inventories.backup_count, archive_inventories.file_count, archive_inventories.byte_count, archive_inventories.failure_count, archive_inventories.checked_at, workers.name FROM archive_inventories JOIN workers ON workers.id = archive_inventories.archiver_worker_id ORDER BY checked_at DESC LIMIT 100")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>("id"), "archiver_name": row.get::<String,_>("name"),
         "full_digest": row.get::<bool,_>("full_digest"), "release_count": row.get::<i64,_>("release_count"),
+        "backup_count": row.get::<i64,_>("backup_count"),
         "file_count": row.get::<i64,_>("file_count"), "byte_count": row.get::<i64,_>("byte_count"),
         "failure_count": row.get::<i64,_>("failure_count"), "checked_at": row.get::<String,_>("checked_at"),
     })).collect::<Vec<_>>() })))
@@ -1008,6 +1009,8 @@ mod tests {
             webhook_hmac_secret_file: "/不存在".into(),
             ntfy_url: None,
             backup_dir: "/不存在".into(),
+            backup_export_dir: "/不存在".into(),
+            backup_export_socket: "/不存在".into(),
         };
         router(AppState::new(
             database,

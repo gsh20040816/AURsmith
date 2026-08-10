@@ -30,6 +30,7 @@
 - ADR-026：Worker 容量和能力复用已有签名身份与 OpenSSH 心跳采集，不部署额外主机 Agent。Publisher 低于 10% 可用空间时使用 SQLite 持久化背压停止新任务和 Release，当前仓库仍可读；告警通知使用 SQLite outbox、HMAC Webhook或 ntfy，不为单用户部署引入消息队列。
 - ADR-027：控制面备份使用 SQLite 原生 `VACUUM INTO`，而不是在 WAL 运行时复制主数据库文件。每份快照必须通过完整性检查并由 Controller Ed25519 签名；恢复只作为停机 CLI 提供，并先保留当前数据库，避免 Web 请求在线覆盖控制面。
 - ADR-028：归档库存检查分为每周集合/大小复验和每九十天完整 SHA-256 巡检。报告由 Archiver 身份密钥签署并在 Controller 端核对，不把 SSH 传输成功或文件存在等同于长期数据完整。
+- ADR-029：控制面备份进入 Archiver 时复用 OpenSSH、rsync 和 TransferCapability，但 Controller 仅为备份导出运行无 Shell 的容器化 SSH sidecar。传输源 UUID由 Controller 公钥确定，Archiver 仍使用静态端点和独立拉取凭据；数据库字节不经过 JSON 控制消息，也不引入新的集群协议。
 
 ## 已拒绝
 

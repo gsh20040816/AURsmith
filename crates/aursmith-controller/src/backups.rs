@@ -9,10 +9,139 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
 };
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
+};
 use uuid::Uuid;
 
 const DATABASE_FILE: &str = "controller.db";
 const ENVELOPE_FILE: &str = "backup-envelope.json";
+
+pub fn transfer_source_id(state: &AppState) -> Uuid {
+    let digest = Sha256::digest(state.signing_key.verifying_key().as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+pub async fn prepare_export(
+    state: &AppState,
+    backup_id: Uuid,
+    capability_id: Uuid,
+) -> Result<(Vec<ManifestEntry>, PathBuf), ApiError> {
+    let directory: String = sqlx::query_scalar(
+        "SELECT directory FROM control_plane_backups WHERE id = ? AND state = 'verified'",
+    )
+    .bind(backup_id.to_string())
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("已验证控制面备份不存在"))?;
+    verify_directory(
+        Path::new(&directory),
+        state.signing_key.verifying_key().as_bytes(),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let files = vec![
+        file_entry(&Path::new(&directory).join(DATABASE_FILE), DATABASE_FILE)
+            .map_err(ApiError::internal)?,
+        file_entry(&Path::new(&directory).join(ENVELOPE_FILE), ENVELOPE_FILE)
+            .map_err(ApiError::internal)?,
+    ];
+    let root = Path::new(&state.config.backup_export_dir);
+    fs::create_dir_all(root).map_err(ApiError::internal)?;
+    reject_symlink(root)?;
+    let final_directory = root.join(capability_id.to_string());
+    let staging = root.join(format!(".{capability_id}.staging"));
+    if final_directory.exists() {
+        verify_file_set(&final_directory, &files).map_err(ApiError::internal)?;
+        return Ok((files, final_directory));
+    }
+    fs::create_dir(&staging).map_err(ApiError::internal)?;
+    for entry in &files {
+        fs::copy(
+            Path::new(&directory).join(&entry.path),
+            staging.join(&entry.path),
+        )
+        .map_err(ApiError::internal)?;
+    }
+    verify_file_set(&staging, &files).map_err(ApiError::internal)?;
+    sync_directory(&staging).map_err(ApiError::internal)?;
+    fs::rename(&staging, &final_directory).map_err(ApiError::internal)?;
+    sync_directory(root).map_err(ApiError::internal)?;
+    Ok((files, final_directory))
+}
+
+pub async fn spawn_export_socket(state: AppState) -> anyhow::Result<()> {
+    let path = Path::new(&state.config.backup_export_socket);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = UnixListener::bind(path)?;
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_export_request(&state, stream).await {
+                            tracing::warn!(%error, "控制面备份导出请求失败");
+                        }
+                    });
+                }
+                Err(error) => tracing::warn!(%error, "控制面备份导出 Socket 接收失败"),
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn handle_export_request(state: &AppState, stream: UnixStream) -> anyhow::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut line = String::new();
+    BufReader::new(reader)
+        .take(4096)
+        .read_line(&mut line)
+        .await?;
+    let request: Value = serde_json::from_str(&line)?;
+    let capability_id = request["capability_id"].as_str().unwrap_or_default();
+    let valid_id = Uuid::parse_str(capability_id).is_ok();
+    let row = if request["command"] == "resolve_export" && valid_id {
+        sqlx::query("SELECT expires_at, export_directory FROM control_plane_backup_archives WHERE id = ? AND state = 'issued'")
+            .bind(capability_id).fetch_optional(&state.database).await?
+    } else {
+        None
+    };
+    let response = if let Some(row) = row {
+        let expires_at: String = row.get("expires_at");
+        let expected = Path::new(&state.config.backup_export_dir).join(capability_id);
+        if expires_at
+            .parse::<chrono::DateTime<Utc>>()
+            .is_ok_and(|value| value > Utc::now())
+            && row.get::<String, _>("export_directory") == expected.to_string_lossy()
+            && expected.is_dir()
+        {
+            json!({"ok": true, "code": "EXPORT_ALLOWED", "message": "", "data": {"directory": format!("/jobs/transfers/{capability_id}")}})
+        } else {
+            json!({"ok": false, "code": "CAPABILITY_EXPIRED", "message": "Capability 已过期或导出目录无效", "data": null})
+        }
+    } else {
+        json!({"ok": false, "code": "CAPABILITY_NOT_FOUND", "message": "Capability 不存在", "data": null})
+    };
+    let mut bytes = serde_json::to_vec(&response)?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    Ok(())
+}
 
 pub async fn create_if_due(state: &AppState) -> Result<(), ApiError> {
     let latest: Option<String> = sqlx::query_scalar(
@@ -100,7 +229,7 @@ async fn create_files(
 }
 
 pub async fn list(database: &SqlitePool) -> Result<Value, ApiError> {
-    let rows = sqlx::query("SELECT id, state, database_sha256, database_size, last_error, created_at, verified_at FROM control_plane_backups ORDER BY created_at DESC LIMIT 200")
+    let rows = sqlx::query("SELECT control_plane_backups.id, control_plane_backups.state, control_plane_backups.database_sha256, control_plane_backups.database_size, control_plane_backups.last_error, control_plane_backups.created_at, control_plane_backups.verified_at, control_plane_backup_archives.state AS archive_state, control_plane_backup_archives.receipt_sha256 AS archive_receipt_sha256, workers.name AS archiver_name FROM control_plane_backups LEFT JOIN control_plane_backup_archives ON control_plane_backup_archives.backup_id = control_plane_backups.id LEFT JOIN workers ON workers.id = control_plane_backup_archives.archiver_worker_id ORDER BY control_plane_backups.created_at DESC LIMIT 200")
         .fetch_all(database).await.map_err(ApiError::internal)?;
     Ok(json!({"items": rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>("id"), "state": row.get::<String,_>("state"),
@@ -109,6 +238,9 @@ pub async fn list(database: &SqlitePool) -> Result<Value, ApiError> {
         "last_error": row.get::<Option<String>,_>("last_error"),
         "created_at": row.get::<String,_>("created_at"),
         "verified_at": row.get::<Option<String>,_>("verified_at"),
+        "archive_state": row.get::<Option<String>,_>("archive_state"),
+        "archive_receipt_sha256": row.get::<Option<String>,_>("archive_receipt_sha256"),
+        "archiver_name": row.get::<Option<String>,_>("archiver_name"),
     })).collect::<Vec<_>>() }))
 }
 
@@ -198,6 +330,31 @@ fn file_entry(path: &Path, logical_path: &str) -> anyhow::Result<ManifestEntry> 
         sha256: hex::encode(digest.finalize()),
         size: metadata.len(),
     })
+}
+
+fn verify_file_set(directory: &Path, files: &[ManifestEntry]) -> anyhow::Result<()> {
+    let mut expected = std::collections::BTreeSet::new();
+    for entry in files {
+        aursmith_protocol::validate_relative_path(&entry.path)?;
+        if !expected.insert(entry.path.clone())
+            || file_entry(&directory.join(&entry.path), &entry.path)? != *entry
+        {
+            anyhow::bail!("备份导出文件与 Manifest 不一致：{}", entry.path);
+        }
+    }
+    let actual = fs::read_dir(directory)?
+        .map(|entry| {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                anyhow::bail!("备份导出目录包含非普通文件");
+            }
+            Ok(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+    if actual != expected {
+        anyhow::bail!("备份导出文件集合与 Manifest 不一致");
+    }
+    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), ApiError> {
@@ -346,12 +503,29 @@ mod tests {
             webhook_hmac_secret_file: "/不存在".into(),
             ntfy_url: None,
             backup_dir: backup_dir.to_string_lossy().into(),
+            backup_export_dir: temporary.path().join("transfers").to_string_lossy().into(),
+            backup_export_socket: temporary
+                .path()
+                .join("export.sock")
+                .to_string_lossy()
+                .into(),
         };
         let database = crate::db::connect(&config.database_url).await.unwrap();
         sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('backup-fixture', '\"before\"', ?)")
             .bind(Utc::now()).execute(&database).await.unwrap();
         let state = AppState::new(database.clone(), config.clone(), signing_key);
         let result = create(&state).await.unwrap();
+        let transfer_id = Uuid::new_v4();
+        let backup_id = Uuid::parse_str(result["id"].as_str().unwrap()).unwrap();
+        let (files, export) = prepare_export(&state, backup_id, transfer_id)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            export.file_name().unwrap().to_string_lossy(),
+            transfer_id.to_string()
+        );
+        assert_eq!(transfer_source_id(&state), transfer_source_id(&state));
         sqlx::query(
             "UPDATE system_settings SET value_json = '\"after\"' WHERE key = 'backup-fixture'",
         )

@@ -31,6 +31,7 @@ enum Command {
         #[arg(long)]
         backup: std::path::PathBuf,
     },
+    TransferSourceId,
 }
 
 #[tokio::main]
@@ -46,9 +47,15 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", config.setup_token);
         return Ok(());
     }
-    if let Some(Command::RestoreControlPlane { backup }) = cli.command {
+    if let Some(Command::RestoreControlPlane { backup }) = &cli.command {
         backups::restore(&config, &backup).await?;
         println!("控制面数据库已从签名备份恢复；原数据库保留在同目录的 recovery 子目录中");
+        return Ok(());
+    }
+    if matches!(&cli.command, Some(Command::TransferSourceId)) {
+        let database = db::connect(&config.database_url).await?;
+        let state = routes::AppState::new(database, config.clone(), config.load_signing_key()?);
+        println!("{}", backups::transfer_source_id(&state));
         return Ok(());
     }
 
@@ -56,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let signing_key = config.load_signing_key()?;
     config.materialize_ssh_identity()?;
     let state = routes::AppState::new(database, config.clone(), signing_key);
+    backups::spawn_export_socket(state.clone()).await?;
     scheduler::spawn(state.clone());
     let app = routes::router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_address)

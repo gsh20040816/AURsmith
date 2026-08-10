@@ -94,7 +94,15 @@ Doctor 页面显示每个 Worker 的在线状态、数据卷可用百分比和�
 
 ## 控制面备份与恢复
 
-Controller 默认把每日一致性备份写入同一持久卷的 `/var/lib/aursmith/backups/<Backup ID>/`。这能防止进程或误操作损坏，但不能替代独立故障域；在自动传输到 Archiver 完成前，部署者必须定期把整个 Backup ID 目录复制到独立存储，且同时保留 `controller_signing_key` 的离线副本。不要只复制 `controller.db` 而丢失 `backup-envelope.json`。
+Controller 默认把每日一致性备份写入同一持久卷的 `/var/lib/aursmith/backups/<Backup ID>/`，随后通过独立的 `backup-ssh` sidecar 让 Archiver 主动拉取。不要只复制 `controller.db` 而丢失 `backup-envelope.json`；即使远端 Receipt 已验证，`controller_signing_key` 等 secret 仍必须另行离线备份。
+
+为备份源单独生成 SSH host key，并把 Archiver 的只读拉取公钥写入 Controller Stack 的 `backup_authorized_keys`。启动 Controller 后取得稳定源 UUID：
+
+```bash
+docker compose -f deploy/controller/compose.yaml exec controller aursmith-controller transfer-source-id
+```
+
+把输出 UUID 加入 Archiver 的 `AURSMITH_TRANSFER_ENDPOINTS_JSON`，值为 `ssh://aursmith@<Controller 地址>:<backup-ssh 端口>`；Archiver 的 known_hosts 同时固定 Publisher 和 Controller backup-ssh 的 host key。Controller 默认只把 backup-ssh 绑定到 `127.0.0.1:2221`，跨设备部署时必须显式设置 `AURSMITH_BACKUP_SSH_BIND` 为受防火墙保护的管理网地址。此端口只允许 forced-command rsync，不应暴露到公网。
 
 恢复时先停止 Controller 服务，确认没有其他容器打开数据库卷，然后以只挂载 Controller 数据卷和必要 secret 的一次性容器执行：
 

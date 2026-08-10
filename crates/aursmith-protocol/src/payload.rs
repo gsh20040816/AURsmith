@@ -206,6 +206,8 @@ pub struct TransferCapability {
     pub attempt: Option<AttemptRef>,
     #[serde(default)]
     pub release_id: Option<Uuid>,
+    #[serde(default)]
+    pub backup_id: Option<Uuid>,
     pub writer_epoch: u64,
     pub files: Vec<ManifestEntry>,
     pub expires_at: DateTime<Utc>,
@@ -269,10 +271,20 @@ pub struct ArchiveInventory {
     pub archive_worker: Uuid,
     pub full_digest: bool,
     pub release_count: u64,
+    #[serde(default)]
+    pub backup_count: u64,
     pub file_count: u64,
     pub byte_count: u64,
     pub failures: Vec<String>,
     pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupArchiveReceipt {
+    pub backup_id: Uuid,
+    pub archive_worker: Uuid,
+    pub files: Vec<ManifestEntry>,
+    pub verified_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

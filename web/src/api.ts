@@ -180,12 +180,16 @@ export type ControlPlaneBackup = {
   last_error: string | null;
   created_at: string;
   verified_at: string | null;
+  archive_state: "issued" | "verified" | "failed" | null;
+  archive_receipt_sha256: string | null;
+  archiver_name: string | null;
 };
 export type ArchiveInventory = {
   id: string;
   archiver_name: string;
   full_digest: boolean;
   release_count: number;
+  backup_count: number;
   file_count: number;
   byte_count: number;
   failure_count: number;
