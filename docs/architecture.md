@@ -85,6 +85,8 @@ Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publish
 
 Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.PKGINFO`：路径逃逸、重复条目、设备文件、FIFO、Socket，以及缺失或重复的 `.PKGINFO`、`.BUILDINFO`、`.MTREE` 会失败关闭；包名、版本和架构必须与 BuildResult 一致。INSTALL 脚本、pacman hook、systemd 单元、setuid/setgid 文件和内核模块作为风险事实记录，不因类别本身宣称恶意。对可执行文件和共享库候选，Publisher 通过 bsdtar 按单文件安全提取到临时文件，再以固定 argv 运行 readelf 并记录每个 ELF 的 `DT_NEEDED`。file capability 不通过需要特权的实际解包恢复，而是从归档的 pax `LIBARCHIVE.xattr.security.capability` 头识别并绑定路径。结构化 `artifact-inspections.json` 随 Signer 输入进入断网边界，Signer核对报告数量和大小，并把其摘要写入 GPG 签名的 Release Manifest；因此 Archiver 会与 Release 一起保存这份发布前检查证据。
 
+Controller 在成功 Attempt 对账事务中保存完整 GuestResult，而不是只保留最终 Artifact 行。创建 ReleaseAuthorization 时，系统收集 ReleaseBatch、参与 Revision、AuditBundle、成功 Agent 报告和 Job GuestResult，形成版本化 `ReleaseEvidence`；每条记录都有基于规范 JSON 的 SHA-256。证据最多 10000 条、序列化后最多 16 MiB，超限时阻止发布并要求人工拆分，不能静默截断。`authorization.json` 由 Controller Ed25519 签名，Signer 原样复制并将其文件摘要写入 GPG 签名的 Release Manifest，Publisher 逐字节复验，因此 Archiver 的 Release 文件集合自动包含这份证据。管理员可以从 Release 页面查询证据摘要。当前证据包含日志和输入文件摘要，但还不等于原始 build/fetch/QEMU 日志或完整 Source/License 文件包；这些大文件必须另行通过受限传输补齐。
+
 ## Builder KVM 执行内核
 
 Builder Worker 的 Journal 保存完整签名 JobSpec。执行循环以条件更新认领 queued Attempt，重启后会继续处理尚未认领的任务；同一 generation 的重放仍由 Journal 幂等规则约束。任务分为 Fetch、Build 和 ProfileFixture 三种，协议字段带默认值仅用于同一 major 版本内读取早期 Build 任务。

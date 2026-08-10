@@ -142,6 +142,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/releases", get(crate::packages::list_releases))
         .route(
+            "/api/v1/releases/{id}/evidence",
+            get(crate::packages::release_evidence),
+        )
+        .route(
             "/api/v1/releases/{id}/rollback",
             post(crate::packages::rollback_release),
         )

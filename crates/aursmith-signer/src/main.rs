@@ -132,6 +132,8 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
     }
     let inspection_destination = staging.join("artifact-inspections.json");
     fs::write(&inspection_destination, inspection_bytes)?;
+    let authorization_destination = staging.join("authorization.json");
+    fs::copy(&authorization_path, &authorization_destination)?;
     let manifest = ReleaseManifest {
         release_id: authorization.release_id,
         batch_id: authorization.batch_id,
@@ -143,6 +145,7 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
         artifact_inspections: Some(file_entry(&inspection_destination)?),
+        release_authorization: Some(file_entry(&authorization_destination)?),
         committed_at: Utc::now(),
     };
     fs::write(
@@ -326,6 +329,7 @@ mod tests {
                 architecture: Some("any".into()),
             }],
             removed_package_names: vec![],
+            evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };

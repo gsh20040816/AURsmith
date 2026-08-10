@@ -229,6 +229,8 @@ pub struct ReleaseAuthorization {
     pub artifacts: Vec<ArtifactRecord>,
     #[serde(default)]
     pub removed_package_names: Vec<String>,
+    #[serde(default)]
+    pub evidence: ReleaseEvidence,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -247,7 +249,23 @@ pub struct ReleaseManifest {
     pub repository_files: ManifestEntry,
     #[serde(default)]
     pub artifact_inspections: Option<ManifestEntry>,
+    #[serde(default)]
+    pub release_authorization: Option<ManifestEntry>,
     pub committed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReleaseEvidence {
+    pub schema_version: u16,
+    pub records: Vec<ReleaseEvidenceRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseEvidenceRecord {
+    pub kind: String,
+    pub identity: String,
+    pub sha256: String,
+    pub document: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

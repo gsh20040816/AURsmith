@@ -2,7 +2,7 @@ use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
 use aursmith_protocol::{
     ArtifactRecord, DependencyInput, DependencySource, GuestResult, JobKind, JobSpec,
-    ReleaseAuthorization, ResourceLimits, SignedEnvelope,
+    ReleaseAuthorization, ReleaseEvidence, ReleaseEvidenceRecord, ResourceLimits, SignedEnvelope,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -845,6 +845,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let audit_report_sha256s = sqlx::query_scalar::<_, String>("SELECT DISTINCT audit_decisions.report_sha256 FROM audit_decisions JOIN jobs ON jobs.revision_id = audit_decisions.revision_id WHERE jobs.batch_id = ? ORDER BY audit_decisions.report_sha256")
         .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let evidence = build_release_evidence(&state.database, &batch_id).await?;
     let release_id = Uuid::new_v4();
     let writer_epoch =
         u64::try_from(publisher.get::<i64, _>("writer_epoch")).map_err(ApiError::internal)?;
@@ -859,6 +860,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         audit_report_sha256s,
         artifacts,
         removed_package_names: removed_package_names.into_iter().collect(),
+        evidence,
         issued_at: now,
         expires_at: now + Duration::hours(1),
     };
@@ -951,6 +953,145 @@ async fn current_release_id(database: &sqlx::SqlitePool) -> Result<Option<String
         .await
         .map_err(ApiError::internal)
         .map(Option::flatten)
+}
+
+async fn build_release_evidence(
+    database: &sqlx::SqlitePool,
+    batch_id: &str,
+) -> Result<ReleaseEvidence, ApiError> {
+    let mut records = Vec::new();
+    let batch = sqlx::query("SELECT state, graph_json, failure_reason, created_at, updated_at FROM release_batches WHERE id = ?")
+        .bind(batch_id).fetch_one(database).await.map_err(ApiError::internal)?;
+    push_evidence(
+        &mut records,
+        "release_batch",
+        batch_id,
+        json!({
+            "state": batch.get::<String, _>("state"),
+            "graph": serde_json::from_str::<serde_json::Value>(batch.get("graph_json")).map_err(ApiError::internal)?,
+            "failure_reason": batch.get::<Option<String>, _>("failure_reason"),
+            "created_at": batch.get::<String, _>("created_at"),
+            "updated_at": batch.get::<String, _>("updated_at")
+        }),
+    )?;
+    let revisions = sqlx::query("SELECT DISTINCT revisions.id, revisions.package_base, revisions.aur_commit, revisions.vcs_commit, revisions.upstream_version, revisions.published_version, revisions.input_sha256, revisions.source_manifest_sha256, revisions.dependency_snapshot_sha256, revisions.audit_policy_version, revisions.metadata_json FROM revisions JOIN jobs ON jobs.revision_id = revisions.id WHERE jobs.batch_id = ? ORDER BY revisions.package_base")
+        .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
+    for row in revisions {
+        let identity: String = row.get("id");
+        push_evidence(
+            &mut records,
+            "revision",
+            &identity,
+            json!({
+                "id": &identity,
+                "package_base": row.get::<String, _>("package_base"),
+                "aur_commit": row.get::<String, _>("aur_commit"),
+                "vcs_commit": row.get::<Option<String>, _>("vcs_commit"),
+                "upstream_version": row.get::<String, _>("upstream_version"),
+                "published_version": row.get::<Option<String>, _>("published_version"),
+                "input_sha256": row.get::<String, _>("input_sha256"),
+                "source_manifest_sha256": row.get::<Option<String>, _>("source_manifest_sha256"),
+                "dependency_snapshot_sha256": row.get::<Option<String>, _>("dependency_snapshot_sha256"),
+                "audit_policy_version": row.get::<String, _>("audit_policy_version"),
+                "snapshot": serde_json::from_str::<serde_json::Value>(row.get("metadata_json")).map_err(ApiError::internal)?
+            }),
+        )?;
+    }
+    let audits = sqlx::query("SELECT DISTINCT audit_bundles.sha256, audit_bundles.policy_version, audit_bundles.payload_json, audit_bundles.coverage_json, audit_bundles.deterministic_findings_json, audit_bundles.state FROM audit_bundles JOIN jobs ON jobs.revision_id = audit_bundles.revision_id WHERE jobs.batch_id = ? ORDER BY audit_bundles.sha256")
+        .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
+    for row in audits {
+        let identity: String = row.get("sha256");
+        push_evidence(
+            &mut records,
+            "audit_bundle",
+            &identity,
+            json!({
+                "sha256": &identity,
+                "policy_version": row.get::<String, _>("policy_version"),
+                "state": row.get::<String, _>("state"),
+                "payload": serde_json::from_str::<serde_json::Value>(row.get("payload_json")).map_err(ApiError::internal)?,
+                "coverage": serde_json::from_str::<serde_json::Value>(row.get("coverage_json")).map_err(ApiError::internal)?,
+                "deterministic_findings": serde_json::from_str::<serde_json::Value>(row.get("deterministic_findings_json")).map_err(ApiError::internal)?
+            }),
+        )?;
+    }
+    let reports = sqlx::query("SELECT DISTINCT agent_runs.id, agent_runs.tier, agent_runs.slot, agent_runs.attempt, agent_runs.adapter, agent_runs.provider, agent_runs.model, agent_runs.adapter_version, agent_runs.prompt_version, agent_runs.verdict, agent_runs.report_json, agent_runs.raw_output_json, agent_runs.report_sha256, agent_runs.started_at, agent_runs.finished_at FROM agent_runs JOIN audit_bundles ON audit_bundles.sha256 = agent_runs.audit_bundle_sha256 JOIN jobs ON jobs.revision_id = audit_bundles.revision_id WHERE jobs.batch_id = ? AND agent_runs.status = 'succeeded' ORDER BY agent_runs.tier, agent_runs.slot, agent_runs.attempt")
+        .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
+    for row in reports {
+        let identity: String = row.get("id");
+        push_evidence(
+            &mut records,
+            "agent_report",
+            &identity,
+            json!({
+                "id": &identity, "tier": row.get::<String, _>("tier"), "slot": row.get::<i64, _>("slot"),
+                "attempt": row.get::<i64, _>("attempt"), "adapter": row.get::<String, _>("adapter"),
+                "provider": row.get::<String, _>("provider"), "model": row.get::<String, _>("model"),
+                "adapter_version": row.get::<String, _>("adapter_version"), "prompt_version": row.get::<String, _>("prompt_version"),
+                "verdict": row.get::<Option<String>, _>("verdict"),
+                "report": row.get::<Option<String>, _>("report_json").map(|value| serde_json::from_str::<serde_json::Value>(&value)).transpose().map_err(ApiError::internal)?,
+                "raw_output": row.get::<Option<String>, _>("raw_output_json").map(|value| serde_json::from_str::<serde_json::Value>(&value)).transpose().map_err(ApiError::internal)?,
+                "report_sha256": row.get::<Option<String>, _>("report_sha256"),
+                "started_at": row.get::<Option<String>, _>("started_at"), "finished_at": row.get::<Option<String>, _>("finished_at")
+            }),
+        )?;
+    }
+    let jobs = sqlx::query("SELECT job_evidence.job_id, job_evidence.kind, job_evidence.document_json, job_evidence.sha256, jobs.profile_sha256 FROM job_evidence JOIN jobs ON jobs.id = job_evidence.job_id WHERE jobs.batch_id = ? ORDER BY jobs.created_at")
+        .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
+    for row in jobs {
+        let identity: String = row.get("job_id");
+        push_evidence(
+            &mut records,
+            "job_result",
+            &identity,
+            json!({
+                "job_id": &identity,
+                "kind": row.get::<String, _>("kind"),
+                "profile_sha256": row.get::<Option<String>, _>("profile_sha256"),
+                "stored_sha256": row.get::<String, _>("sha256"),
+                "result": serde_json::from_str::<serde_json::Value>(row.get("document_json")).map_err(ApiError::internal)?
+            }),
+        )?;
+    }
+    if records.len() > 10_000 {
+        return Err(ApiError::conflict(
+            "RELEASE_EVIDENCE_TOO_LARGE",
+            "Release 证据记录超过 10000 条",
+        ));
+    }
+    let evidence = ReleaseEvidence {
+        schema_version: 1,
+        records,
+    };
+    if serde_json::to_vec(&evidence)
+        .map_err(ApiError::internal)?
+        .len()
+        > 16 * 1024 * 1024
+    {
+        return Err(ApiError::conflict(
+            "RELEASE_EVIDENCE_TOO_LARGE",
+            "Release 证据超过 16 MiB",
+        ));
+    }
+    Ok(evidence)
+}
+
+fn push_evidence(
+    records: &mut Vec<ReleaseEvidenceRecord>,
+    kind: &str,
+    identity: &str,
+    document: serde_json::Value,
+) -> Result<(), ApiError> {
+    let sha256 = hex::encode(Sha256::digest(
+        serde_json::to_vec(&document).map_err(ApiError::internal)?,
+    ));
+    records.push(ReleaseEvidenceRecord {
+        kind: kind.to_owned(),
+        identity: identity.to_owned(),
+        sha256,
+        document,
+    });
+    Ok(())
 }
 
 async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
@@ -1547,6 +1688,16 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
+    if status == "succeeded"
+        && let Some(guest_result) = guest_result.as_ref()
+    {
+        let document = serde_json::to_value(guest_result).map_err(ApiError::internal)?;
+        let bytes = serde_json::to_vec(&document).map_err(ApiError::internal)?;
+        sqlx::query("INSERT OR REPLACE INTO job_evidence(job_id, kind, document_json, sha256, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(&job_id).bind(row.get::<String, _>("kind")).bind(document.to_string())
+            .bind(hex::encode(Sha256::digest(bytes))).bind(Utc::now())
+            .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
     if row.get::<String, _>("kind") == "profile_fixture" {
         let profile_sha: Option<String> = row.get("profile_sha256");
         if let Some(profile_sha) = profile_sha {
@@ -2010,6 +2161,14 @@ mod release_tests {
         assert_eq!(
             authorization.removed_package_names,
             ["demo-cli", "demo-lib"]
+        );
+        assert_eq!(authorization.evidence.schema_version, 1);
+        assert!(
+            authorization
+                .evidence
+                .records
+                .iter()
+                .any(|record| record.kind == "release_batch" && record.identity == removal_batch)
         );
     }
 

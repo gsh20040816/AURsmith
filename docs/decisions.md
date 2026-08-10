@@ -45,6 +45,7 @@
 - ADR-041：Publisher 的 ELF 检查使用固定路径 readelf，只对归档中经过安全路径与普通文件验证的候选逐个提取到有界临时文件。file capability 直接检查 pax 扩展头，不要求 Publisher 以 root 或获得 `CAP_SETFCAP` 来恢复 xattr。两类结果都是风险与溯源事实，不单独作为恶意判定。
 - ADR-042：Job 自动重试以明确 failure code 白名单和 Attempt generation 为准，最多重试两次。`uncertain` 必须等待三十分钟再查询 Worker Journal；不能因一次 SSH 错误立即生成可能重复执行的新 Attempt。确定性输入、Profile、身份和审计错误永不进入自动重试白名单。
 - ADR-043：第一版实时进度使用认证 SSE 加 SQLite 增量快照，不引入 Redis、Kafka 或 WebSocket 服务。SSE 只作为“状态已变化”通知，页面随后读取 JSON API，避免连接丢帧后浏览器与控制面状态分叉。
+- ADR-044：Release 证据索引直接进入 Controller 签名的 ReleaseAuthorization，不新建独立证据服务或对象存储。Signer 把原始授权纳入 GPG 签名的 Release Manifest，Publisher 逐字节复验，Archiver 因而自动保存相同证据。内嵌内容限制为 10000 条和 16 MiB，适合结构化审计与 provenance；大型源码、License bundle 和原始日志以后使用单独的受限文件传输，未完成前 B03/R03 不能标记为全部完成。
 
 ## 已拒绝
 

@@ -1292,6 +1292,44 @@ pub async fn list_releases(
     })).collect::<Vec<_>>() })))
 }
 
+pub async fn release_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let release_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request("INVALID_RELEASE_ID", "Release ID 无效"))?;
+    let raw: String =
+        sqlx::query_scalar("SELECT envelope_json FROM release_authorizations WHERE release_id = ?")
+            .bind(release_id.to_string())
+            .fetch_optional(&state.database)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("Release 证据不存在"))?;
+    let envelope: SignedEnvelope = serde_json::from_str(&raw).map_err(ApiError::internal)?;
+    if envelope.verifying_key != state.signing_key.verifying_key().as_bytes() {
+        return Err(ApiError::conflict(
+            "RELEASE_EVIDENCE_UNTRUSTED",
+            "ReleaseAuthorization 不是由当前 Controller 签发",
+        ));
+    }
+    let authorization: aursmith_protocol::ReleaseAuthorization = envelope
+        .verify("aursmith.release_authorization")
+        .map_err(ApiError::internal)?;
+    if authorization.release_id != release_id {
+        return Err(ApiError::conflict(
+            "RELEASE_EVIDENCE_MISMATCH",
+            "ReleaseAuthorization 身份不匹配",
+        ));
+    }
+    Ok(Json(json!({
+        "release_id": release_id,
+        "authorization_sha256": envelope.payload_sha256,
+        "evidence": authorization.evidence
+    })))
+}
+
 pub async fn list_archives(
     State(state): State<AppState>,
     headers: HeaderMap,

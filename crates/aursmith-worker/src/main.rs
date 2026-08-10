@@ -1591,6 +1591,11 @@ fn verify_and_publish_release(
             .as_ref()
             .map(|entry| entry.path.as_str())
             != Some("artifact-inspections.json")
+        || manifest
+            .release_authorization
+            .as_ref()
+            .map(|entry| entry.path.as_str())
+            != Some("authorization.json")
     {
         bail!("ReleaseManifest 仓库数据库名称无效");
     }
@@ -1604,6 +1609,14 @@ fn verify_and_publish_release(
             .as_ref()
             .context("ReleaseManifest 缺少 Artifact 检查报告")?,
     )?;
+    let authorization_entry = manifest
+        .release_authorization
+        .as_ref()
+        .context("ReleaseManifest 缺少 ReleaseAuthorization")?;
+    verify_manifest_entry(signed, authorization_entry)?;
+    if std::fs::read(signed.join(&authorization_entry.path))? != serde_json::to_vec(envelope)? {
+        bail!("Signer 输出的 ReleaseAuthorization 与 Controller Envelope 不一致");
+    }
     let mut package_names = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         aursmith_protocol::validate_relative_path(&artifact.path)?;
@@ -1652,6 +1665,7 @@ fn verify_and_publish_release(
         "release-manifest.json".into(),
         "release-manifest.json.sig".into(),
         "artifact-inspections.json".into(),
+        "authorization.json".into(),
     ];
     for name in &package_names {
         release_files.push(name.clone());
@@ -1660,10 +1674,6 @@ fn verify_and_publish_release(
     for name in &release_files {
         copy_regular_synced(&signed.join(name), &staging.join(name))?;
     }
-    std::fs::write(
-        staging.join("authorization.json"),
-        serde_json::to_vec(envelope)?,
-    )?;
     sync_directory(&staging)?;
     std::fs::create_dir_all(&releases_root)?;
     std::fs::rename(&staging, &committed)?;
@@ -1691,6 +1701,9 @@ fn activate_committed_release(
     verify_signed_entry(worker, committed, &manifest.repository_files)?;
     if let Some(inspection) = &manifest.artifact_inspections {
         verify_manifest_entry(committed, inspection)?;
+    }
+    if let Some(authorization) = &manifest.release_authorization {
+        verify_manifest_entry(committed, authorization)?;
     }
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
@@ -2342,6 +2355,7 @@ mod transfer_tests {
                 architecture: Some("any".into()),
             }],
             removed_package_names: vec![],
+            evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
         };

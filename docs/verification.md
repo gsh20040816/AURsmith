@@ -235,3 +235,11 @@
 - 前端：登录成功后建立同源 EventSource，侧栏显示“实时连接正常/重试中”；收到变化帧后增加版本号，构建页重新读取 `/jobs` 权威状态。页面不从 SSE payload 拼装业务对象，因此断线重连不会漏掉最终状态。
 - 测试：SQLite 测试确认添加 Job 与告警会改变实时快照；TypeScript 与生产构建验证浏览器端 EventSource 生命周期。jsdom 没有 EventSource 时页面安全跳过连接，不用假对象伪造实时成功。
 - 边界：第一版只让高频构建页自动刷新，其他页面仍保留手工刷新按钮；SSE 是状态变化流，不是逐行构建日志传输。Worker 当前保存 build/fetch/QEMU 日志，按需日志流 API 仍是后续缺口。
+
+## 2026-08-10：Release 签名证据链
+
+- Controller 在成功 Attempt 对账时，把完整 GuestResult 与摘要写入独立 `job_evidence` 表；生成 ReleaseAuthorization 时同时收集批次图、Revision 快照、AuditBundle 覆盖范围、确定性发现、成功 Agent 原始结构化输出和 Job provenance。
+- Signer 原样复制 Controller 的 `authorization.json`，把它作为 ManifestEntry 写入 GPG 签名的 Release Manifest。Publisher 在公开前复验文件摘要，并把文件字节与数据库中保存的 Controller Envelope 比较；归档文件枚举会自动包含它。
+- Web Release 页面通过管理员认证 API 读取并验证当前 Controller 签名后，显示证据类型、身份和摘要；API 不向未登录用户暴露 Agent 输出。
+- 定向验证执行 `cargo test -p aursmith-protocol -p aursmith-controller -p aursmith-signer -p aursmith-worker`：65 个测试通过。随后执行 `bash scripts/test-all.sh`，全仓库 99 个 Rust 测试、前端类型检查、6 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
+- 未覆盖：本轮未重新运行完整 Publisher→Signer→Archiver 容器链；当前结构化证据只保存日志摘要和 GuestResult，不包含全部原始日志字节、完整上游源码或 License bundle。因此不能据此把 B03/R03 标为已完成。

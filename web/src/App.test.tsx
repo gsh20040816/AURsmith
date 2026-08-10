@@ -83,4 +83,23 @@ describe("AURsmith 控制台", () => {
     expect(screen.getByLabelText("每日调用上限")).toHaveValue(300);
     expect(screen.queryByText(/sk-/)).not.toBeInTheDocument();
   });
+
+  it("Release 页面可以查看签名证据摘要", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/setup/status") ? { initialized: true }
+        : url.endsWith("/auth/me") ? { id: "admin-id", username: "admin" }
+          : url.endsWith("/requirements") ? { items: [] }
+            : url.endsWith("/releases") ? { items: [{ id: "11111111-1111-4111-8111-111111111111", batch_id: "22222222-2222-4222-8222-222222222222", state: "committed", manifest_sha256: "a".repeat(64), source_git_commit: "b".repeat(40), writer_epoch: 1, artifact_count: 1, authorization_state: "published", last_error: null, committed_at: "2026-08-10T00:00:00Z", created_at: "2026-08-10T00:00:00Z" }] }
+              : url.includes("/releases/11111111-1111-4111-8111-111111111111/evidence") ? { release_id: "11111111-1111-4111-8111-111111111111", authorization_sha256: "c".repeat(64), evidence: { schema_version: 1, records: [{ kind: "job_result", identity: "build-job", sha256: "d".repeat(64), document: { provenance: { check_enabled: true } } }] } }
+                : { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Release/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "查看证据" }));
+    expect(await screen.findByText("1 条证据记录")).toBeInTheDocument();
+    expect(screen.getByText("job_result")).toBeInTheDocument();
+    expect(screen.getByText("build-job")).toBeInTheDocument();
+  });
 });

@@ -166,6 +166,14 @@ export type Release = {
   committed_at: string | null;
   created_at: string;
 };
+export type ReleaseEvidence = {
+  release_id: string;
+  authorization_sha256: string;
+  evidence: {
+    schema_version: number;
+    records: Array<{ kind: string; identity: string; sha256: string; document: unknown }>;
+  };
+};
 export type ArchiveCopy = {
   id: string;
   release_id: string;
@@ -284,6 +292,7 @@ export const api = {
   }),
   profileRecommendations: () => request<{ items: ProfileRecommendation[] }>("/api/v1/profile-recommendations"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
+  releaseEvidence: (id: string) => request<ReleaseEvidence>(`/api/v1/releases/${encodeURIComponent(id)}/evidence`),
   rollbackRelease: (id: string) => request<{
     release_id: string;
     server_rolled_back: boolean;

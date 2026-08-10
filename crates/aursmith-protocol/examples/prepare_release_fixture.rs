@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             architecture: Some(field("arch")?),
         }],
         removed_package_names: vec![],
+        evidence: Default::default(),
         issued_at: Utc::now(),
         expires_at: Utc::now() + Duration::minutes(10),
     };
