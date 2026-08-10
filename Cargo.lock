@@ -204,6 +204,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aursmith-domain",
+ "base64",
  "chrono",
  "ciborium",
  "ed25519-dalek",

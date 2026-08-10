@@ -13,3 +13,12 @@
 - 实际发现并修复：QEMU memfd/NUMA 后端缺少匹配的 `-m`；最小 Arch rootfs 的 os-release 位于 `/usr/lib/os-release`；失败 VM 日志此前会随 runtime 清理而丢失。
 - 未覆盖：这次只验证 ProfileFixture，不代表 Fetch 代理、真实 AUR source、批次内 AUR 依赖、Publisher、Signer 或 Archiver 已完成端到端验证。
 - 清理：四个本次创建的临时 Profile/runtime 目录已移动到桌面环境回收站，可恢复；未保留运行中的 QEMU、virtiofsd 或 Worker 进程。
+
+## 2026-08-10：Fetch 到离线 Build 接力
+
+- 验证对象：提交 `c8d7851` 之后加入精确依赖快照的工作树。
+- 输入：测试 PKGBUILD 不含外部 source 和依赖；它通过签名 JobSpec 的内联输入进入 Worker，不从宿主共享可写目录注入。
+- Fetch：Job `42a6f6c4-2b19-44b3-9a32-e2c86c9b8d0d`、Attempt `59d2c20c-f0a0-4b80-a43b-b1d44ecba210` 在受限联网 KVM 中成功；Source Manifest 摘要为 `22f6a17734aea5df41ef3498c2bdf79fd5cb4d13e858b3c65cc5d428d0be957a`，并完整记录 PKGBUILD、src 目录和 Agent 风险选读文本。
+- Build：新的 Job `74881cb7-c2be-49e4-96e7-f6a7b4b0f07c` 只引用上述 Fetch Attempt 和摘要；Worker 从 completed 目录重新验证并创建新 overlay。Build VM 使用 `network=none`，成功生成 `aursmith-fetch-fixture-1-1-any.pkg.tar.zst`，解析到包名、版本 `1-1`、架构 `any`，SHA-256 为 `744859e3eceb7675962040dc91150b1cef219936e1ad4a11bec5d630119ee24b`。
+- 边界：fixture 没有实际下载官方依赖，因此验证了依赖为空时的快照与离线安装路径，但未验证 pacman 经 source proxy 下载真实官方包的网络行为。
+- 清理：Worker 和临时监听器已停止；本次 Profile 与 runtime 目录移动到回收站后再确认无 QEMU/virtiofsd 残留。

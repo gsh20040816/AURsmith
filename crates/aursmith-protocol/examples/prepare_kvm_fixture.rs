@@ -1,10 +1,12 @@
 use anyhow::{Context, bail};
 use aursmith_domain::{AttemptRef, WorkerRole};
 use aursmith_protocol::{BuildProfileSpec, JobKind, JobSpec, ResourceLimits, SignedEnvelope};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{env, fs, path::Path};
 use uuid::Uuid;
 
@@ -15,8 +17,17 @@ struct Candidate {
 
 fn main() -> anyhow::Result<()> {
     let arguments = env::args().collect::<Vec<_>>();
-    if arguments.len() != 3 {
-        bail!("用法：prepare_kvm_fixture <Profile 导出目录> <临时运行目录>");
+    if !(arguments.len() == 3 || arguments.len() == 4) {
+        bail!(
+            "用法：prepare_kvm_fixture <Profile 导出目录> <临时运行目录> [profile_fixture|fetch]"
+        );
+    }
+    let fixture_kind = arguments
+        .get(3)
+        .map(String::as_str)
+        .unwrap_or("profile_fixture");
+    if !matches!(fixture_kind, "profile_fixture" | "fetch") {
+        bail!("fixture 类型只能是 profile_fixture 或 fetch");
     }
     let source = Path::new(&arguments[1]);
     let runtime = Path::new(&arguments[2]);
@@ -45,6 +56,12 @@ fn main() -> anyhow::Result<()> {
     let job_id = Uuid::new_v4();
     let attempt_id = Uuid::new_v4();
     let now = Utc::now();
+    let package_build = b"pkgname=aursmith-fetch-fixture\npkgver=1\npkgrel=1\narch=('any')\nsource=()\nsha256sums=()\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-fetch-fixture/os-release\"; }\n";
+    let package_entry = aursmith_protocol::ManifestEntry {
+        path: "PKGBUILD".into(),
+        sha256: hex::encode(Sha256::digest(package_build)),
+        size: package_build.len() as u64,
+    };
     let job = JobSpec {
         job_id,
         attempt: AttemptRef {
@@ -53,7 +70,11 @@ fn main() -> anyhow::Result<()> {
             generation: 0,
         },
         required_role: WorkerRole::Builder,
-        kind: JobKind::ProfileFixture,
+        kind: if fixture_kind == "fetch" {
+            JobKind::Fetch
+        } else {
+            JobKind::ProfileFixture
+        },
         revision_sha256: candidate.spec.profile_sha256.clone(),
         source_manifest_sha256: Some("0".repeat(64)),
         dependency_snapshot_sha256: Some("0".repeat(64)),
@@ -61,8 +82,19 @@ fn main() -> anyhow::Result<()> {
         source_attempt_id: None,
         dependency_attempt_ids: vec![],
         dependencies: vec![],
-        inputs: vec![],
-        inline_inputs: vec![],
+        inputs: if fixture_kind == "fetch" {
+            vec![package_entry.clone()]
+        } else {
+            vec![]
+        },
+        inline_inputs: if fixture_kind == "fetch" {
+            vec![aursmith_protocol::InlineInput {
+                entry: package_entry,
+                content_base64: STANDARD.encode(package_build),
+            }]
+        } else {
+            vec![]
+        },
         limits: ResourceLimits {
             cpu_count: 1,
             memory_mib: 1024,
@@ -84,6 +116,7 @@ fn main() -> anyhow::Result<()> {
             "profile_sha256": candidate.spec.profile_sha256,
             "job_id": job_id,
             "attempt_id": attempt_id
+            ,"fixture_kind": fixture_kind
         }))?
     );
     Ok(())

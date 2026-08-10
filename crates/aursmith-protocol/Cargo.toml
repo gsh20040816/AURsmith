@@ -19,3 +19,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+base64.workspace = true
