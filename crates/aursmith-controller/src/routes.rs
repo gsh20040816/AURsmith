@@ -103,6 +103,7 @@ pub fn router(state: AppState) -> Router {
             get(crate::packages::list_batches),
         )
         .route("/api/v1/releases", get(crate::packages::list_releases))
+        .route("/api/v1/archives", get(crate::packages::list_archives))
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -312,6 +313,14 @@ async fn register_worker(
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| ApiError::conflict("WORKER_ID_MISSING", "Worker 没有报告有效实例 ID"))?
         .to_string();
+    let identity_signing_key_hex = remote.data["identity_signing_key_hex"]
+        .as_str()
+        .filter(|value| {
+            value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            ApiError::conflict("WORKER_SIGNING_KEY_MISSING", "Worker 没有报告有效身份公钥")
+        })?;
     if remote.data["name"].as_str() != Some(request.name.trim())
         || remote.data["role"].as_str() != Some(role)
         || remote.data["protocol_major"].as_u64() != Some(u64::from(request.protocol_version))
@@ -325,7 +334,7 @@ async fn register_worker(
     let now = Utc::now();
     let labels_json = serde_json::to_string(&request.labels).map_err(ApiError::internal)?;
     sqlx::query(
-        "INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, created_at, updated_at) VALUES (?, ?, ?, 'offline', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, identity_signing_key_hex, created_at, updated_at) VALUES (?, ?, ?, 'offline', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(request.name.trim())
@@ -334,6 +343,7 @@ async fn register_worker(
     .bind(request.ssh_host_key_sha256.trim())
     .bind(i64::from(request.protocol_version))
     .bind(labels_json)
+    .bind(identity_signing_key_hex)
     .bind(now)
     .bind(now)
     .execute(&state.database)

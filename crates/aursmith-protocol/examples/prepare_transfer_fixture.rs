@@ -25,6 +25,7 @@ fn main() -> anyhow::Result<()> {
             attempt_id: Uuid::parse_str(&arguments[4])?,
             generation: 0,
         }),
+        release_id: None,
         writer_epoch: 0,
         files: vec![ManifestEntry {
             path: artifact

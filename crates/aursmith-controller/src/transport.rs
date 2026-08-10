@@ -49,6 +49,15 @@ pub async fn authorize_import(
     invoke(config, endpoint, "authorize-import", Some(body)).await
 }
 
+pub async fn complete_export(
+    config: &Config,
+    endpoint: &str,
+    envelope: &SignedEnvelope,
+) -> Result<WorkerReply, ApiError> {
+    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
+    invoke(config, endpoint, "complete-export", Some(body)).await
+}
+
 pub async fn authorize_release(
     config: &Config,
     endpoint: &str,
@@ -67,6 +76,20 @@ pub async fn query_release(
         config,
         endpoint,
         "query-release",
+        Some(release_id.as_bytes().to_vec()),
+    )
+    .await
+}
+
+pub async fn release_files(
+    config: &Config,
+    endpoint: &str,
+    release_id: &str,
+) -> Result<WorkerReply, ApiError> {
+    invoke(
+        config,
+        endpoint,
+        "release-files",
         Some(release_id.as_bytes().to_vec()),
     )
     .await

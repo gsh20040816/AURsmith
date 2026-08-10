@@ -119,6 +119,17 @@ export type Release = {
   committed_at: string | null;
   created_at: string;
 };
+export type ArchiveCopy = {
+  id: string;
+  release_id: string;
+  state: string;
+  receipt_sha256: string | null;
+  release_manifest_sha256: string;
+  archiver_name: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -142,6 +153,7 @@ export const api = {
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
   profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
+  archives: () => request<{ items: ArchiveCopy[] }>("/api/v1/archives"),
   activateProfile: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>

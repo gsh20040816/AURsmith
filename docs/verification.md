@@ -60,3 +60,12 @@
 - 实际覆盖：真实 `gpg --verify`、`repo-add`、Publisher Journal、Signer inbox 原子接管、签名输出复验、同名包摘要冲突保护、Release 目录持久化和数据库最后切换。
 - 容器：修改后的 Publisher Worker 与 Signer 镜像均通过实际 Docker 构建；Publisher Worker 镜像包含验签所需的 GnuPG，Compose 安全检查确认它只挂载公钥，而断网 Signer 只挂载私钥且不挂载公开仓库。
 - 边界：尚未用独立 Arch 客户端执行 `pacman -Syu`，也未完成服务端回滚、30 天兼容窗口清理和 Archiver Receipt。
+
+## 2026-08-10：Publisher 到 Archiver 不可变快照
+
+- 拓扑：Publisher Worker 与 OpenSSH forced-command sidecar 运行在独立容器边界，Archiver Worker 作为目标端主动拉取；Release 文件没有经过 Controller。
+- 授权：TransferCapability `c7a251dc-3de3-4dab-9019-45e3811f5c3c` 绑定 Publisher `10cca597-8121-475c-82c6-2b4d2b0d18af`、Archiver `7f423b9d-bb34-45fe-bc64-914aa3a2a800`、writer epoch、Release `ba886982-3484-47e4-9e06-caed2f5d5955` 和 9 个文件的路径、大小及摘要。
+- 传输与快照：Publisher 仅导出能力目录；Archiver 通过固定 host key 和独立拉取密钥执行 rsync，复验完整文件集合后使用本地 `rsync --link-dest` 创建不可变 Release 快照。首次快照没有前代可去重，后续 Release 才会对同路径同内容文件形成硬链接。
+- Receipt：Archiver 使用首次启动后保存在 Journal 的 Ed25519 身份密钥签署 ArchiveReceipt，Receipt SHA-256 为 `1bbdeb0c0f8d7156b80475533915e155ad903390ad15983d322d43a4880b0374`。再次提交相同 Capability 返回 `IDEMPOTENT_ARCHIVE` 和同一 Receipt。
+- 结果：归档与 Publisher 的 `release-manifest.json` SHA-256 均为 `cd443f23412dc70a73ce1f256e4a7f39e0cd50df9d2bee1bdf16b7a25abfaef9`；快照包含包、包签名、db/files 数据库及签名、ReleaseAuthorization 和签名 Manifest。
+- 边界：尚未执行第二个不同 Release 的硬链接 inode 去重验证、Controller 自动调度 Receipt 对账、每周库存巡检或从归档恢复控制面数据。

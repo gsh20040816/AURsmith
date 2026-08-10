@@ -2,13 +2,14 @@ mod aur;
 mod builder;
 
 use anyhow::{Context, bail};
-use aursmith_domain::{JobStatus, WorkerRole, WorkerState};
+use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
-    JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, SignedEnvelope,
+    ArchiveReceipt, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, SignedEnvelope,
     TransferCapability,
 };
 use chrono::Utc;
 use clap::Parser;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -87,6 +88,8 @@ struct Cli {
         default_value = "/run/aursmith-gpg"
     )]
     publisher_gpg_home: PathBuf,
+    #[arg(long, env = "AURSMITH_ARCHIVE_DIR", default_value = "/archive")]
+    archive_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -124,6 +127,9 @@ struct Worker {
     repository_dir: PathBuf,
     repository_arch: String,
     publisher_gpg_home: PathBuf,
+    jobs_dir: PathBuf,
+    archive_dir: PathBuf,
+    identity_signing_key: SigningKey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,9 +146,11 @@ enum WorkerCommand {
     AurSnapshot { package_base: String },
     AuthorizeExport { envelope: SignedEnvelope },
     ResolveExport { capability_id: String },
+    CompleteExport { envelope: SignedEnvelope },
     AuthorizeImport { envelope: SignedEnvelope },
     AuthorizeRelease { envelope: SignedEnvelope },
     QueryRelease { release_id: String },
+    ReleaseFiles { release_id: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +194,8 @@ async fn main() -> anyhow::Result<()> {
         bail!("Controller verifying key 必须是 32 字节 Ed25519 公钥");
     }
     let database = connect(&cli.database).await?;
+    let identity_signing_key = load_or_create_identity_signing_key(&database).await?;
+    let jobs_dir = PathBuf::from(&cli.jobs_dir);
     let transfer_endpoints: BTreeMap<String, String> =
         serde_json::from_str(&cli.transfer_endpoints_json)
             .context("AURSMITH_TRANSFER_ENDPOINTS_JSON 不是字符串映射")?;
@@ -199,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
         builder: if matches!(cli.role, RoleArg::Builder) {
             Some(builder::BuilderRuntime::new(
                 cli.profiles_dir.into(),
-                cli.jobs_dir.into(),
+                jobs_dir.clone(),
                 cli.fetch_proxy,
             ))
         } else {
@@ -215,6 +225,9 @@ async fn main() -> anyhow::Result<()> {
         repository_dir: cli.repository_dir,
         repository_arch: cli.repository_arch,
         publisher_gpg_home: cli.publisher_gpg_home,
+        jobs_dir,
+        archive_dir: cli.archive_dir,
+        identity_signing_key,
     });
     if worker.builder.is_some() {
         builder::spawn(
@@ -276,6 +289,11 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS archive_receipts(release_id TEXT PRIMARY KEY, capability_id TEXT NOT NULL UNIQUE, envelope_json TEXT NOT NULL, directory TEXT NOT NULL, created_at TEXT NOT NULL);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS attempts(\
          job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
          envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
@@ -305,6 +323,28 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
     Ok(pool)
+}
+
+async fn load_or_create_identity_signing_key(database: &SqlitePool) -> anyhow::Result<SigningKey> {
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'identity_signing_key'")
+            .fetch_optional(database)
+            .await?;
+    let secret = if let Some(value) = existing {
+        let bytes = hex::decode(value)?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("Worker 身份密钥长度无效"))?
+    } else {
+        use std::io::Read;
+        let mut secret = [0_u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
+        sqlx::query("INSERT INTO worker_state(key, value) VALUES ('identity_signing_key', ?)")
+            .bind(hex::encode(secret))
+            .execute(database)
+            .await?;
+        secret
+    };
+    Ok(SigningKey::from_bytes(&secret))
 }
 
 async fn prepare_socket(socket: &str) -> anyhow::Result<()> {
@@ -349,15 +389,17 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         WorkerCommand::ResolveExport { capability_id } => {
             resolve_export(worker, &capability_id).await
         }
+        WorkerCommand::CompleteExport { envelope } => complete_export(worker, envelope).await,
         WorkerCommand::AuthorizeImport { envelope } => authorize_import(worker, envelope).await,
         WorkerCommand::AuthorizeRelease { envelope } => authorize_release(worker, envelope).await,
         WorkerCommand::QueryRelease { release_id } => query_release(worker, &release_id).await,
+        WorkerCommand::ReleaseFiles { release_id } => release_files(worker, &release_id).await,
     }
 }
 
 async fn authorize_export(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
-    if worker.role != WorkerRole::Builder {
-        return WorkerResponse::error("WRONG_ROLE", "只有 Builder 可以导出 Artifact");
+    if !matches!(worker.role, WorkerRole::Builder | WorkerRole::Publisher) {
+        return WorkerResponse::error("WRONG_ROLE", "当前 Worker 不能导出文件");
     }
     if envelope.verifying_key != worker.trusted_controller_key {
         return WorkerResponse::error("UNTRUSTED_CONTROLLER", "TransferCapability 签名无效");
@@ -377,21 +419,47 @@ async fn authorize_export(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
     if !matches!(instance_id.as_deref(), Ok(value) if value == expected_source) {
         return WorkerResponse::error("CAPABILITY_SOURCE_MISMATCH", "Capability 不属于本 Worker");
     }
-    let Some(runtime) = &worker.builder else {
-        return WorkerResponse::error("WRONG_ROLE", "Builder runtime 不可用");
+    let (source, transfer_root) = if worker.role == WorkerRole::Builder {
+        let Some(runtime) = &worker.builder else {
+            return WorkerResponse::error("WRONG_ROLE", "Builder runtime 不可用");
+        };
+        let Some(attempt) = &capability.attempt else {
+            return WorkerResponse::error("ATTEMPT_REQUIRED", "Artifact 导出必须绑定 Attempt");
+        };
+        if capability.release_id.is_some() {
+            return WorkerResponse::error(
+                "INVALID_CAPABILITY",
+                "Builder Capability 不能绑定 Release",
+            );
+        }
+        (
+            runtime
+                .jobs_dir()
+                .join("completed")
+                .join(attempt.attempt_id.to_string())
+                .join("output"),
+            runtime.jobs_dir().join("transfers"),
+        )
+    } else {
+        let Some(release_id) = capability.release_id else {
+            return WorkerResponse::error("RELEASE_REQUIRED", "Publisher 导出必须绑定 Release");
+        };
+        if capability.attempt.is_some() || capability.writer_epoch != worker.writer_epoch {
+            return WorkerResponse::error(
+                "INVALID_CAPABILITY",
+                "Publisher Release Capability 的 Attempt 或 writer epoch 无效",
+            );
+        }
+        (
+            worker
+                .repository_dir
+                .join(&worker.repository_arch)
+                .join("releases")
+                .join(release_id.to_string()),
+            worker.jobs_dir.join("transfers"),
+        )
     };
-    let Some(attempt) = &capability.attempt else {
-        return WorkerResponse::error("ATTEMPT_REQUIRED", "Artifact 导出必须绑定 Attempt");
-    };
-    let source = runtime
-        .jobs_dir()
-        .join("completed")
-        .join(attempt.attempt_id.to_string())
-        .join("output");
-    let directory = runtime
-        .jobs_dir()
-        .join("transfers")
-        .join(capability.id.to_string());
+    let directory = transfer_root.join(capability.id.to_string());
     if directory.exists() {
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT manifest_json FROM transfer_exports WHERE capability_id = ?",
@@ -494,9 +562,65 @@ async fn resolve_export(worker: &Worker, capability_id: &str) -> WorkerResponse 
     }
 }
 
+async fn complete_export(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
+    if envelope.verifying_key != worker.trusted_controller_key {
+        return WorkerResponse::error("UNTRUSTED_CONTROLLER", "TransferCapability 签名无效");
+    }
+    let capability: TransferCapability = match envelope.verify("aursmith.transfer_capability") {
+        Ok(value) => value,
+        Err(error) => return WorkerResponse::error("INVALID_CAPABILITY", error.to_string()),
+    };
+    let instance_id: Result<String, _> =
+        sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
+            .fetch_one(&worker.database)
+            .await;
+    if !matches!(instance_id.as_deref(), Ok(value) if value == capability.source_worker.to_string())
+    {
+        return WorkerResponse::error("CAPABILITY_SOURCE_MISMATCH", "Capability 不属于本 Worker");
+    }
+    let row = sqlx::query(
+        "SELECT directory, manifest_json FROM transfer_exports WHERE capability_id = ?",
+    )
+    .bind(capability.id.to_string())
+    .fetch_optional(&worker.database)
+    .await;
+    let row = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return WorkerResponse::ok(
+                "IDEMPOTENT_EXPORT_CLEANUP",
+                serde_json::json!({"capability_id": capability.id}),
+            );
+        }
+        Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    };
+    if row.get::<String, _>("manifest_json")
+        != serde_json::to_string(&capability.files).unwrap_or_default()
+    {
+        return WorkerResponse::error("CAPABILITY_CONFLICT", "导出 Manifest 与授权不一致");
+    }
+    let directory = PathBuf::from(row.get::<String, _>("directory"));
+    if directory.exists()
+        && let Err(error) = std::fs::remove_dir_all(&directory)
+    {
+        return WorkerResponse::error("EXPORT_CLEANUP_FAILED", error.to_string());
+    }
+    match sqlx::query("UPDATE transfer_exports SET state = 'completed' WHERE capability_id = ?")
+        .bind(capability.id.to_string())
+        .execute(&worker.database)
+        .await
+    {
+        Ok(_) => WorkerResponse::ok(
+            "EXPORT_CLEANED",
+            serde_json::json!({"capability_id": capability.id}),
+        ),
+        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    }
+}
+
 async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
-    if worker.role != WorkerRole::Publisher {
-        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以接收 Artifact");
+    if !matches!(worker.role, WorkerRole::Publisher | WorkerRole::Archiver) {
+        return WorkerResponse::error("WRONG_ROLE", "当前 Worker 不能接收传输");
     }
     if envelope.verifying_key != worker.trusted_controller_key {
         return WorkerResponse::error("UNTRUSTED_CONTROLLER", "TransferCapability 签名无效");
@@ -508,11 +632,40 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
     if capability.expires_at < Utc::now() || capability.files.is_empty() {
         return WorkerResponse::error("INVALID_CAPABILITY", "TransferCapability 已过期或为空");
     }
-    if capability.writer_epoch != worker.writer_epoch {
+    if worker.role == WorkerRole::Publisher && capability.writer_epoch != worker.writer_epoch {
         return WorkerResponse::error(
             "WRITER_EPOCH_MISMATCH",
             "TransferCapability 不属于当前 Publisher writer epoch",
         );
+    }
+    if (worker.role == WorkerRole::Publisher
+        && (capability.attempt.is_none() || capability.release_id.is_some()))
+        || (worker.role == WorkerRole::Archiver
+            && (capability.attempt.is_some() || capability.release_id.is_none()))
+    {
+        return WorkerResponse::error("INVALID_CAPABILITY", "Capability 聚合类型与目标角色不匹配");
+    }
+    if worker.role == WorkerRole::Archiver {
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT envelope_json FROM archive_receipts WHERE release_id = ?")
+                .bind(
+                    capability
+                        .release_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                )
+                .fetch_optional(&worker.database)
+                .await
+                .ok()
+                .flatten();
+        if let Some(receipt) =
+            existing.and_then(|value| serde_json::from_str::<SignedEnvelope>(&value).ok())
+        {
+            return WorkerResponse::ok(
+                "IDEMPOTENT_ARCHIVE",
+                serde_json::json!({"capability_id": capability.id, "receipt": receipt}),
+            );
+        }
     }
     let instance_id: Result<String, _> =
         sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
@@ -563,6 +716,9 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
     }
     let final_directory = worker.landing_dir.join(capability.id.to_string());
     if final_directory.exists() {
+        if worker.role == WorkerRole::Archiver {
+            return archived_receipt_response(worker, &capability).await;
+        }
         return match verify_manifest_directory(&final_directory, &capability.files) {
             Ok(()) => WorkerResponse::ok(
                 "IDEMPOTENT_IMPORT",
@@ -640,12 +796,118 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         .bind(final_directory.to_string_lossy().as_ref()).bind(serde_json::to_string(&capability.files).unwrap_or_default())
         .execute(&worker.database).await;
     match inserted {
+        Ok(_) if worker.role == WorkerRole::Archiver => {
+            match archive_release(worker, &capability, &final_directory).await {
+                Ok(receipt) => WorkerResponse::ok(
+                    "ARCHIVE_VERIFIED",
+                    serde_json::json!({"capability_id": capability.id, "receipt": receipt}),
+                ),
+                Err(error) => WorkerResponse::error("ARCHIVE_FAILED", error.to_string()),
+            }
+        }
         Ok(_) => WorkerResponse::ok(
             "IMPORT_VERIFIED",
             serde_json::json!({"capability_id": capability.id, "files": capability.files.len()}),
         ),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
+}
+
+async fn archived_receipt_response(
+    worker: &Worker,
+    capability: &TransferCapability,
+) -> WorkerResponse {
+    let imported = worker.landing_dir.join(capability.id.to_string());
+    match archive_release(worker, capability, &imported).await {
+        Ok(receipt) => WorkerResponse::ok(
+            "ARCHIVE_VERIFIED",
+            serde_json::json!({"capability_id": capability.id, "receipt": receipt}),
+        ),
+        Err(error) => WorkerResponse::error("ARCHIVE_FAILED", error.to_string()),
+    }
+}
+
+async fn archive_release(
+    worker: &Worker,
+    capability: &TransferCapability,
+    imported: &Path,
+) -> anyhow::Result<SignedEnvelope> {
+    let release_id = capability
+        .release_id
+        .context("归档 Capability 缺少 Release ID")?;
+    verify_manifest_directory(imported, &capability.files)?;
+    let releases = worker.archive_dir.join("releases");
+    std::fs::create_dir_all(&releases)?;
+    let committed = releases.join(release_id.to_string());
+    if !committed.exists() {
+        let staging = releases.join(format!(".{release_id}.staging"));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir_all(&staging)?;
+        let previous = std::fs::read_dir(&releases)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && !entry.file_name().to_string_lossy().starts_with('.')
+                    && entry.file_name().to_string_lossy() != release_id.to_string()
+            })
+            .max_by_key(|entry| entry.file_name());
+        let mut command = tokio::process::Command::new("/usr/bin/rsync");
+        command.args(["-a", "--numeric-ids"]);
+        if let Some(previous) = previous {
+            command.arg(format!("--link-dest={}", previous.path().display()));
+        }
+        let output = command
+            .arg(format!("{}/", imported.display()))
+            .arg(format!("{}/", staging.display()))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "归档 rsync 失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(512)
+                    .collect::<String>()
+            );
+        }
+        verify_manifest_directory(&staging, &capability.files)?;
+        sync_directory(&staging)?;
+        std::fs::rename(&staging, &committed)?;
+        sync_directory(&releases)?;
+    } else {
+        verify_manifest_directory(&committed, &capability.files)?;
+    }
+    let files = directory_manifest(&committed)?;
+    let release_manifest = files
+        .iter()
+        .find(|entry| entry.path == "release-manifest.json")
+        .context("归档 Release 缺少 Manifest")?;
+    let instance_id: String =
+        sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
+            .fetch_one(&worker.database)
+            .await?;
+    let receipt = ArchiveReceipt {
+        release_id,
+        archive_worker: uuid::Uuid::parse_str(&instance_id)?,
+        release_manifest_sha256: release_manifest.sha256.clone(),
+        files,
+        state: ArchiveState::Verified,
+        verified_at: Utc::now(),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.archive_receipt",
+        &receipt,
+        &worker.identity_signing_key,
+    )?;
+    sqlx::query("INSERT INTO archive_receipts(release_id, capability_id, envelope_json, directory, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(release_id) DO NOTHING")
+        .bind(release_id.to_string()).bind(capability.id.to_string())
+        .bind(serde_json::to_string(&envelope)?).bind(committed.to_string_lossy().as_ref())
+        .bind(Utc::now()).execute(&worker.database).await?;
+    let _ = std::fs::remove_dir_all(imported);
+    Ok(envelope)
 }
 
 async fn authorize_release(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
@@ -843,6 +1105,49 @@ async fn query_release(worker: &Worker, release_id: &str) -> WorkerResponse {
         Ok(None) => WorkerResponse::error("RELEASE_NOT_FOUND", "Release 不存在"),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
+}
+
+async fn release_files(worker: &Worker, release_id: &str) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher || uuid::Uuid::parse_str(release_id).is_err() {
+        return WorkerResponse::error("INVALID_RELEASE", "Release ID 或 Worker 角色无效");
+    }
+    let directory = worker
+        .repository_dir
+        .join(&worker.repository_arch)
+        .join("releases")
+        .join(release_id);
+    let manifest = directory.join("release-manifest.json");
+    if !manifest.is_file() {
+        return WorkerResponse::error("RELEASE_NOT_FOUND", "已提交 Release 不存在");
+    }
+    match directory_manifest(&directory) {
+        Ok(files) if files.len() <= 8192 => WorkerResponse::ok(
+            "RELEASE_FILES",
+            serde_json::json!({
+                "release_id": release_id,
+                "release_manifest_sha256": file_sha256(&manifest).unwrap_or_default(),
+                "files": files,
+            }),
+        ),
+        Ok(_) => WorkerResponse::error("RELEASE_TOO_LARGE", "Release 文件数量超过上限"),
+        Err(error) => WorkerResponse::error("RELEASE_INVALID", error.to_string()),
+    }
+}
+
+fn directory_manifest(root: &Path) -> anyhow::Result<Vec<aursmith_protocol::ManifestEntry>> {
+    let mut paths = std::collections::BTreeSet::new();
+    collect_regular_files(root, root, &mut paths)?;
+    paths
+        .into_iter()
+        .map(|path| {
+            let file = root.join(&path);
+            Ok(aursmith_protocol::ManifestEntry {
+                path,
+                sha256: file_sha256(&file)?,
+                size: std::fs::metadata(file)?.len(),
+            })
+        })
+        .collect()
 }
 
 fn initialize_publisher_gpg(home: &Path, public_key: &Path) -> anyhow::Result<()> {
@@ -1255,6 +1560,7 @@ async fn status(worker: &Worker) -> WorkerResponse {
                 "state": state,
                 "protocol_major": PROTOCOL_MAJOR,
                 "writer_epoch": worker.writer_epoch,
+                "identity_signing_key_hex": hex::encode(worker.identity_signing_key.verifying_key().as_bytes()),
                 "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
                 "time": Utc::now(),
             }),

@@ -65,8 +65,234 @@ pub fn spawn(state: AppState) {
             if let Err(error) = dispatch_release_one(&state).await {
                 tracing::warn!(%error, "Release 发布调度失败");
             }
+            if let Err(error) = dispatch_archive_one(&state).await {
+                tracing::warn!(%error, "Release 归档调度失败");
+            }
         }
     });
+}
+
+async fn dispatch_archive_one(state: &AppState) -> Result<(), ApiError> {
+    let cleanup = sqlx::query("SELECT archive_transfers.id, archive_transfers.envelope_json, workers.endpoint FROM archive_transfers JOIN workers ON workers.id = archive_transfers.publisher_worker_id WHERE archive_transfers.state = 'verified' AND archive_transfers.export_cleaned_at IS NULL ORDER BY archive_transfers.updated_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = cleanup {
+        let envelope: SignedEnvelope =
+            serde_json::from_str(row.get("envelope_json")).map_err(ApiError::internal)?;
+        transport::complete_export(&state.config, row.get("endpoint"), &envelope).await?;
+        sqlx::query(
+            "UPDATE archive_transfers SET export_cleaned_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .bind(row.get::<String, _>("id"))
+        .execute(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+        return Ok(());
+    }
+    let expired = sqlx::query("SELECT id, archive_copy_id FROM archive_transfers WHERE state IN ('issued', 'export_ready') AND expires_at <= ?")
+        .bind(Utc::now()).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    for row in expired {
+        let transfer_id: String = row.get("id");
+        let copy_id: String = row.get("archive_copy_id");
+        sqlx::query("UPDATE archive_transfers SET state = 'expired', last_error = 'CAPABILITY_EXPIRED', updated_at = ? WHERE id = ?")
+            .bind(Utc::now()).bind(&transfer_id).execute(&state.database).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE archive_copies SET state = 'failed', last_error = 'CAPABILITY_EXPIRED', updated_at = ? WHERE id = ?")
+            .bind(Utc::now()).bind(copy_id).execute(&state.database).await.map_err(ApiError::internal)?;
+    }
+    let pending = sqlx::query("SELECT archive_transfers.id, archive_transfers.archive_copy_id, archive_transfers.state, archive_transfers.envelope_json, archive_transfers.attempt_count, publisher.endpoint AS publisher_endpoint, archiver.endpoint AS archiver_endpoint, archiver.identity_signing_key_hex FROM archive_transfers JOIN workers AS publisher ON publisher.id = archive_transfers.publisher_worker_id JOIN workers AS archiver ON archiver.id = archive_transfers.archiver_worker_id WHERE archive_transfers.state IN ('issued', 'export_ready') AND archive_transfers.expires_at > ? ORDER BY archive_transfers.updated_at LIMIT 1")
+        .bind(Utc::now()).fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = pending {
+        let transfer_id: String = row.get("id");
+        let copy_id: String = row.get("archive_copy_id");
+        let envelope: SignedEnvelope =
+            serde_json::from_str(row.get("envelope_json")).map_err(ApiError::internal)?;
+        if row.get::<String, _>("state") == "issued" {
+            match transport::authorize_export(
+                &state.config,
+                row.get("publisher_endpoint"),
+                &envelope,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let mut transaction =
+                        state.database.begin().await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE archive_transfers SET state = 'export_ready', last_error = NULL, updated_at = ? WHERE id = ?")
+                        .bind(Utc::now()).bind(transfer_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE archive_copies SET state = 'transferring', updated_at = ? WHERE id = ?")
+                        .bind(Utc::now()).bind(copy_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    transaction.commit().await.map_err(ApiError::internal)?;
+                }
+                Err(error) => {
+                    record_archive_failure(
+                        state,
+                        &transfer_id,
+                        &copy_id,
+                        row.get("attempt_count"),
+                        &error.to_string(),
+                    )
+                    .await?
+                }
+            }
+        } else {
+            match transport::authorize_import(
+                &state.config,
+                row.get("archiver_endpoint"),
+                &envelope,
+            )
+            .await
+            {
+                Ok(reply) => {
+                    let receipt_envelope: SignedEnvelope =
+                        serde_json::from_value(reply.data["receipt"].clone())
+                            .map_err(ApiError::internal)?;
+                    let expected_key: String = row
+                        .get::<Option<String>, _>("identity_signing_key_hex")
+                        .ok_or_else(|| ApiError::internal("Archiver 缺少身份公钥"))?;
+                    if receipt_envelope.verifying_key
+                        != hex::decode(expected_key).map_err(ApiError::internal)?
+                    {
+                        return Err(ApiError::conflict(
+                            "ARCHIVE_RECEIPT_UNTRUSTED",
+                            "ArchiveReceipt 身份签名不匹配",
+                        ));
+                    }
+                    let receipt: aursmith_protocol::ArchiveReceipt = receipt_envelope
+                        .verify("aursmith.archive_receipt")
+                        .map_err(ApiError::internal)?;
+                    let capability: aursmith_protocol::TransferCapability = envelope
+                        .verify("aursmith.transfer_capability")
+                        .map_err(ApiError::internal)?;
+                    let release_id = capability
+                        .release_id
+                        .ok_or_else(|| ApiError::internal("Archive Capability 缺少 Release"))?;
+                    let expected_manifest: String =
+                        sqlx::query_scalar("SELECT manifest_sha256 FROM releases WHERE id = ?")
+                            .bind(release_id.to_string())
+                            .fetch_one(&state.database)
+                            .await
+                            .map_err(ApiError::internal)?;
+                    if receipt.release_id != release_id
+                        || receipt.archive_worker != capability.destination_worker
+                        || receipt.release_manifest_sha256 != expected_manifest
+                        || receipt.files != capability.files
+                        || receipt.state != aursmith_domain::ArchiveState::Verified
+                    {
+                        return Err(ApiError::conflict(
+                            "ARCHIVE_RECEIPT_MISMATCH",
+                            "ArchiveReceipt 与授权文件集合不一致",
+                        ));
+                    }
+                    let mut transaction =
+                        state.database.begin().await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE archive_transfers SET state = 'verified', last_error = NULL, updated_at = ? WHERE id = ?")
+                        .bind(Utc::now()).bind(&transfer_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE archive_copies SET state = 'verified', receipt_sha256 = ?, last_error = NULL, updated_at = ? WHERE id = ?")
+                        .bind(&receipt_envelope.payload_sha256).bind(Utc::now()).bind(&copy_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    transaction.commit().await.map_err(ApiError::internal)?;
+                }
+                Err(error) => {
+                    record_archive_failure(
+                        state,
+                        &transfer_id,
+                        &copy_id,
+                        row.get("attempt_count"),
+                        &error.to_string(),
+                    )
+                    .await?
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let release = sqlx::query("SELECT releases.id, releases.manifest_sha256, releases.writer_epoch, release_authorizations.publisher_worker_id, workers.endpoint FROM releases JOIN release_authorizations ON release_authorizations.release_id = releases.id JOIN workers ON workers.id = release_authorizations.publisher_worker_id WHERE releases.state = 'committed' AND NOT EXISTS (SELECT 1 FROM archive_copies WHERE archive_copies.release_id = releases.id) ORDER BY releases.committed_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let Some(release) = release else {
+        return Ok(());
+    };
+    let archiver = sqlx::query(
+        "SELECT id FROM workers WHERE role = 'archiver' AND state = 'online' ORDER BY name LIMIT 1",
+    )
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(archiver) = archiver else {
+        return Ok(());
+    };
+    let release_id: String = release.get("id");
+    let file_reply =
+        transport::release_files(&state.config, release.get("endpoint"), &release_id).await?;
+    if file_reply.data["release_manifest_sha256"].as_str()
+        != Some(release.get::<String, _>("manifest_sha256").as_str())
+    {
+        return Err(ApiError::conflict(
+            "RELEASE_MANIFEST_MISMATCH",
+            "Publisher Release 与 Controller 摘要不一致",
+        ));
+    }
+    let files: Vec<aursmith_protocol::ManifestEntry> =
+        serde_json::from_value(file_reply.data["files"].clone()).map_err(ApiError::internal)?;
+    if files.is_empty() {
+        return Err(ApiError::conflict(
+            "RELEASE_EMPTY",
+            "Publisher Release 文件集合为空",
+        ));
+    }
+    let transfer_id = Uuid::new_v4();
+    let copy_id = Uuid::new_v4();
+    let now = Utc::now();
+    let capability = aursmith_protocol::TransferCapability {
+        id: transfer_id,
+        source_worker: Uuid::parse_str(release.get("publisher_worker_id"))
+            .map_err(ApiError::internal)?,
+        destination_worker: Uuid::parse_str(archiver.get("id")).map_err(ApiError::internal)?,
+        attempt: None,
+        release_id: Some(Uuid::parse_str(&release_id).map_err(ApiError::internal)?),
+        writer_epoch: u64::try_from(release.get::<i64, _>("writer_epoch"))
+            .map_err(ApiError::internal)?,
+        files,
+        expires_at: now + Duration::hours(1),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.transfer_capability",
+        &capability,
+        &state.signing_key,
+    )
+    .map_err(ApiError::internal)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO archive_copies(id, release_id, archiver_worker_id, state, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)")
+        .bind(copy_id.to_string()).bind(&release_id).bind(archiver.get::<String,_>("id")).bind(now).bind(now)
+        .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO archive_transfers(id, archive_copy_id, publisher_worker_id, archiver_worker_id, state, envelope_json, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'issued', ?, ?, ?, ?)")
+        .bind(transfer_id.to_string()).bind(copy_id.to_string()).bind(release.get::<String,_>("publisher_worker_id"))
+        .bind(archiver.get::<String,_>("id")).bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+        .bind(capability.expires_at).bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn record_archive_failure(
+    state: &AppState,
+    transfer_id: &str,
+    copy_id: &str,
+    attempts: i64,
+    error: &str,
+) -> Result<(), ApiError> {
+    let terminal = attempts + 1 >= 3;
+    sqlx::query("UPDATE archive_transfers SET state = CASE WHEN ? THEN 'failed' ELSE state END, attempt_count = attempt_count + 1, last_error = ?, updated_at = ? WHERE id = ?")
+        .bind(terminal).bind(error).bind(Utc::now()).bind(transfer_id).execute(&state.database).await.map_err(ApiError::internal)?;
+    if terminal {
+        sqlx::query("UPDATE archive_copies SET state = 'failed', last_error = ?, updated_at = ? WHERE id = ?")
+            .bind(error).bind(Utc::now()).bind(copy_id).execute(&state.database).await.map_err(ApiError::internal)?;
+        let fingerprint = format!("archive-copy-failed:{copy_id}");
+        sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
+            .bind(Uuid::new_v4().to_string()).bind(fingerprint).bind("Release 归档失败")
+            .bind(json!({"archive_copy_id": copy_id, "error": error}).to_string()).bind(Utc::now())
+            .execute(&state.database).await.map_err(ApiError::internal)?;
+    }
+    Ok(())
 }
 
 async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
@@ -263,6 +489,23 @@ fn merge_release_artifacts(
 }
 
 async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
+    let cleanup = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.envelope_json, workers.endpoint FROM transfer_capabilities JOIN workers ON workers.id = transfer_capabilities.source_worker_id WHERE transfer_capabilities.state = 'verified' AND transfer_capabilities.export_cleaned_at IS NULL ORDER BY transfer_capabilities.updated_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = cleanup {
+        let envelope: SignedEnvelope =
+            serde_json::from_str(row.get("envelope_json")).map_err(ApiError::internal)?;
+        transport::complete_export(&state.config, row.get("endpoint"), &envelope).await?;
+        sqlx::query(
+            "UPDATE transfer_capabilities SET export_cleaned_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .bind(row.get::<String, _>("id"))
+        .execute(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+        return Ok(());
+    }
     sqlx::query("UPDATE transfer_capabilities SET state = 'expired', updated_at = ? WHERE state IN ('issued', 'export_ready') AND expires_at <= ?")
         .bind(Utc::now()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
     let pending = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.state, transfer_capabilities.envelope_json, transfer_capabilities.attempt_count, source.endpoint AS source_endpoint, destination.endpoint AS destination_endpoint FROM transfer_capabilities JOIN workers AS source ON source.id = transfer_capabilities.source_worker_id JOIN workers AS destination ON destination.id = transfer_capabilities.destination_worker_id WHERE transfer_capabilities.state IN ('issued', 'export_ready') AND transfer_capabilities.expires_at > ? ORDER BY transfer_capabilities.updated_at LIMIT 1")
@@ -349,6 +592,7 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
                 generation: u32::try_from(attempt.get::<i64, _>("generation"))
                     .map_err(ApiError::internal)?,
             }),
+            release_id: None,
             writer_epoch: u64::try_from(publisher.get::<i64, _>("writer_epoch"))
                 .map_err(ApiError::internal)?,
             files,
@@ -384,12 +628,14 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
 }
 
 pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, ApiError> {
-    let row = sqlx::query("SELECT endpoint, role, writer_epoch FROM workers WHERE id = ?")
-        .bind(worker_id)
-        .fetch_optional(&state.database)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("Worker 不存在"))?;
+    let row = sqlx::query(
+        "SELECT endpoint, role, writer_epoch, identity_signing_key_hex FROM workers WHERE id = ?",
+    )
+    .bind(worker_id)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("Worker 不存在"))?;
     let endpoint: String = row.get("endpoint");
     match transport::status(&state.config, &endpoint).await {
         Ok(reply) => {
@@ -398,12 +644,15 @@ pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, A
             let remote_id = reply.data["instance_id"].as_str().unwrap_or_default();
             let expected_role: String = row.get("role");
             let expected_writer_epoch: i64 = row.get("writer_epoch");
+            let expected_signing_key: Option<String> = row.get("identity_signing_key_hex");
             let writer_epoch_mismatch = expected_role == "publisher"
                 && reply.data["writer_epoch"].as_u64() != u64::try_from(expected_writer_epoch).ok();
             let new_state = if remote_id != worker_id
                 || protocol != u64::from(aursmith_protocol::PROTOCOL_MAJOR)
                 || remote_role != expected_role
                 || writer_epoch_mismatch
+                || reply.data["identity_signing_key_hex"].as_str()
+                    != expected_signing_key.as_deref()
             {
                 "incompatible"
             } else {

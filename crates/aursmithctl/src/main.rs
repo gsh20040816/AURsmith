@@ -89,8 +89,10 @@ enum WorkerCommand {
     AurSnapshot { package_base: String },
     AuthorizeExport { envelope_file: PathBuf },
     AuthorizeImport { envelope_file: PathBuf },
+    CompleteExport { envelope_file: PathBuf },
     AuthorizeRelease { envelope_file: PathBuf },
     QueryRelease { release_id: String },
+    ReleaseFiles { release_id: String },
 }
 
 #[tokio::main]
@@ -135,6 +137,11 @@ async fn main() -> anyhow::Result<()> {
                     let envelope: Value = serde_json::from_slice(&bytes)?;
                     json!({"command": "authorize_import", "envelope": envelope})
                 }
+                WorkerCommand::CompleteExport { envelope_file } => {
+                    let bytes = tokio::fs::read(&envelope_file).await?;
+                    let envelope: Value = serde_json::from_slice(&bytes)?;
+                    json!({"command": "complete_export", "envelope": envelope})
+                }
                 WorkerCommand::AuthorizeRelease { envelope_file } => {
                     let bytes = tokio::fs::read(&envelope_file).await?;
                     let envelope: Value = serde_json::from_slice(&bytes)?;
@@ -142,6 +149,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 WorkerCommand::QueryRelease { release_id } => {
                     json!({"command": "query_release", "release_id": release_id})
+                }
+                WorkerCommand::ReleaseFiles { release_id } => {
+                    json!({"command": "release_files", "release_id": release_id})
                 }
             };
             let response = worker_request(&socket, request).await?;
@@ -435,7 +445,10 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         ["aur-providers"] => read_limited_json_command("aur_providers").await?,
         ["official-info"] => read_limited_json_command("official_info").await?,
         ["aur-snapshot"] => read_limited_json_command("aur_snapshot").await?,
-        ["authorize-export"] | ["authorize-import"] | ["authorize-release"] => {
+        ["authorize-export"]
+        | ["authorize-import"]
+        | ["authorize-release"]
+        | ["complete-export"] => {
             let mut bytes = Vec::new();
             tokio::io::stdin()
                 .take(4 * 1024 * 1024)
@@ -448,12 +461,13 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
                 "command": match parts[0] {
                     "authorize-export" => "authorize_export",
                     "authorize-import" => "authorize_import",
+                    "complete-export" => "complete_export",
                     _ => "authorize_release",
                 },
                 "envelope": envelope
             })
         }
-        ["query-release"] => {
+        ["query-release"] | ["release-files"] => {
             let mut bytes = Vec::new();
             tokio::io::stdin()
                 .take(64)
@@ -464,7 +478,10 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
             if !uuid_like(&release_id) {
                 bail!("Release ID 无效");
             }
-            json!({"command": "query_release", "release_id": release_id})
+            json!({
+                "command": if parts[0] == "query-release" { "query_release" } else { "release_files" },
+                "release_id": release_id
+            })
         }
         _ => bail!("SSH 命令未被允许"),
     };

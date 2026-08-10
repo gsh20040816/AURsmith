@@ -27,12 +27,14 @@ services:
       AURSMITH_REPOSITORY_ARCH: ${AURSMITH_REPOSITORY_ARCH:-x86_64}
       AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE: /run/secrets/repository_gpg_public_key
       AURSMITH_PUBLISHER_GPG_HOME: /run/aursmith-gpg
+      AURSMITH_JOBS_DIR: /jobs
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
       - worker-run:/run/aursmith
       - publisher-state:/var/lib/aursmith
       - publisher-landing:/landing
       - publisher-staging:/staging
+      - publisher-staging:/jobs
       - publisher-hot:/repository
       - signer-inbox:/signer-inbox
       - signer-output:/signer-output:ro
@@ -92,6 +94,7 @@ services:
     security_opt: [no-new-privileges:true]
     volumes:
       - worker-run:/run/aursmith
+      - publisher-staging:/jobs:ro
       - ../common/sshd_config:/etc/ssh/sshd_config:ro
     secrets:
       - ssh_host_ed25519_key

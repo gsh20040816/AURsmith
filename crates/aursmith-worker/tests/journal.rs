@@ -108,6 +108,13 @@ impl Drop for RunningWorker {
 #[tokio::test]
 async fn journal_accepts_idempotent_replay_and_rejects_stale_attempt() {
     let worker = RunningWorker::start().await;
+    let status = worker.send(json!({"command": "status"})).await;
+    assert_eq!(
+        status["data"]["identity_signing_key_hex"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
     let job_id = Uuid::new_v4();
     let first = worker.envelope(job_id, 0);
     let accepted = worker

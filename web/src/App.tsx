@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiError, Audit, AurPackage, BuildProfile, Job, Release, Requirement, Session, Subscription, Worker, api } from "./api";
+import { ApiError, ArchiveCopy, Audit, AurPackage, BuildProfile, Job, Release, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -111,7 +111,8 @@ export function App() {
         {view === "audits" && <AuditsView />}
         {view === "profiles" && <ProfilesView />}
         {view === "releases" && <ReleasesView />}
-        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && view !== "profiles" && view !== "releases" && <PlannedView view={view} />}
+        {view === "archives" && <ArchivesView />}
+        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && view !== "profiles" && view !== "releases" && view !== "archives" && <PlannedView view={view} />}
       </main>
     </div>
   );
@@ -328,6 +329,14 @@ function ReleasesView() {
   const refresh = () => void api.releases().then((response) => setReleases(response.items)).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
   return <><header className="page-header compact"><div><p className="eyebrow">R01 / R02</p><h1>Release</h1><p className="lede">每条记录对应一个完整不可变仓库；Publisher 只在全部签名复验后切换当前数据库。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="table-panel"><div className="section-heading"><div><p className="eyebrow">完整 Manifest</p><h2>发布历史</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>{releases.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>尚无 Release</strong><p>ReleaseBatch 的全部 Artifact 传输并验证后会在这里进入签名与发布状态。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>Release</th><th>状态</th><th>包</th><th>Manifest</th><th>Writer</th><th>时间 / 错误</th></tr></thead><tbody>{releases.map((release) => <tr key={release.id}><td><strong>{release.id.slice(0, 12)}</strong><small className="cell-note">批次 {release.batch_id.slice(0, 12)}</small></td><td><span className={`state ${release.state}`}>{release.state}</span><small className="cell-note">{release.authorization_state ?? "等待授权"}</small></td><td>{release.artifact_count}</td><td><code>{release.manifest_sha256.startsWith("pending:") ? "等待 Signer" : release.manifest_sha256.slice(0, 16)}</code><small className="cell-note">源码 {release.source_git_commit.slice(0, 12)}</small></td><td>epoch {release.writer_epoch}</td><td>{release.last_error ?? new Date(release.committed_at ?? release.created_at).toLocaleString("zh-CN")}</td></tr>)}</tbody></table></div>}</section></>;
+}
+
+function ArchivesView() {
+  const [archives, setArchives] = useState<ArchiveCopy[]>([]);
+  const [error, setError] = useState("");
+  const refresh = () => void api.archives().then((response) => setArchives(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  return <><header className="page-header compact"><div><p className="eyebrow">R03</p><h1>归档</h1><p className="lede">ArchiveCopy 与 Release 独立推进；归档离线不会撤销已发布仓库。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="table-panel"><div className="section-heading"><div><p className="eyebrow">签名 Receipt</p><h2>归档副本</h2></div><button className="secondary-button" onClick={refresh}>刷新</button></div>{archives.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>尚无 ArchiveCopy</strong><p>Release 提交后，Archiver 会直接从 Publisher 拉取并核对完整文件集合。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>Release</th><th>状态</th><th>Archiver</th><th>Receipt</th><th>更新时间 / 错误</th></tr></thead><tbody>{archives.map((archive) => <tr key={archive.id}><td><strong>{archive.release_id.slice(0, 12)}</strong><small className="cell-note">Manifest {archive.release_manifest_sha256.slice(0, 12)}</small></td><td><span className={`state ${archive.state}`}>{archive.state}</span></td><td>{archive.archiver_name ?? "等待调度"}</td><td><code>{archive.receipt_sha256?.slice(0, 16) ?? "等待验证"}</code></td><td>{archive.last_error ?? new Date(archive.updated_at).toLocaleString("zh-CN")}</td></tr>)}</tbody></table></div>}</section></>;
 }
 
 function PlannedView({ view }: { view: View }) {

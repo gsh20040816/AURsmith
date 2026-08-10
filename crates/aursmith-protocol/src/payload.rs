@@ -203,6 +203,8 @@ pub struct TransferCapability {
     pub source_worker: Uuid,
     pub destination_worker: Uuid,
     pub attempt: Option<AttemptRef>,
+    #[serde(default)]
+    pub release_id: Option<Uuid>,
     pub writer_epoch: u64,
     pub files: Vec<ManifestEntry>,
     pub expires_at: DateTime<Utc>,

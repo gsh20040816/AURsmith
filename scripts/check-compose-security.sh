@@ -66,4 +66,14 @@ if jq -e '.services.signer.secrets[]? | select(.source == "repository_gpg_public
   exit 1
 fi
 
+archiver_json="$(docker compose -f deploy/archiver/compose.yaml config --format json)"
+if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_pull_key" or .source == "publisher_known_hosts")] | length' <<<"${archiver_json}")" != "2" ]]; then
+  echo "Archiver 必须使用独立的 Publisher 只读拉取凭据" >&2
+  exit 1
+fi
+if jq -e '.services.worker.secrets[]? | select(.source | contains("gpg"))' <<<"${archiver_json}" >/dev/null; then
+  echo "Archiver 禁止获得仓库 GPG 密钥" >&2
+  exit 1
+fi
+
 echo "Compose 安全策略检查通过"

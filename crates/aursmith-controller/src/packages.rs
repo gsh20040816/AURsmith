@@ -1030,6 +1030,26 @@ pub async fn list_releases(
     })).collect::<Vec<_>>() })))
 }
 
+pub async fn list_archives(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let rows = sqlx::query("SELECT archive_copies.id, archive_copies.release_id, archive_copies.state, archive_copies.receipt_sha256, archive_copies.last_error, archive_copies.created_at, archive_copies.updated_at, workers.name AS archiver_name, releases.manifest_sha256 FROM archive_copies JOIN releases ON releases.id = archive_copies.release_id LEFT JOIN workers ON workers.id = archive_copies.archiver_worker_id ORDER BY archive_copies.created_at DESC LIMIT 200")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
+        "id": row.get::<String,_>("id"),
+        "release_id": row.get::<String,_>("release_id"),
+        "state": row.get::<String,_>("state"),
+        "receipt_sha256": row.get::<Option<String>,_>("receipt_sha256"),
+        "release_manifest_sha256": row.get::<String,_>("manifest_sha256"),
+        "archiver_name": row.get::<Option<String>,_>("archiver_name"),
+        "last_error": row.get::<Option<String>,_>("last_error"),
+        "created_at": row.get::<String,_>("created_at"),
+        "updated_at": row.get::<String,_>("updated_at"),
+    })).collect::<Vec<_>>() })))
+}
+
 pub async fn refresh_package(
     State(state): State<AppState>,
     headers: HeaderMap,

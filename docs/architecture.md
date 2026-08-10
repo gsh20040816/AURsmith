@@ -21,6 +21,8 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
 
+Release 提交后，Controller 从 Publisher 读取只含路径、大小和摘要的 Release 文件清单，签发绑定 Publisher、Archiver、writer epoch 和 Release ID 的 TransferCapability。Archiver 使用静态 Publisher UUID→SSH 地址及独立只读拉取密钥直接拉取，按完整文件集合复验后通过 `rsync --link-dest` 创建不可变快照。每个 Worker 首次启动还会在本地 Journal 生成持久化 Ed25519 身份密钥；Controller 注册时固定公钥，ArchiveReceipt 必须由对应 Archiver 签署并与 Release Manifest 及 Capability 文件集合完全一致。Controller 只有在 Receipt 验证通过后才调用源端导出清理，清理失败会保留待重试状态，不能通过提前删除释放空间。
+
 ## 状态模型
 
 `Revision`、`Job`、`Attempt`、`Artifact`、`Release` 和 `ArchiveCopy` 是相互独立的聚合。已提交的 Release 不会因为 ArchiveCopy 等待或失败而退回未发布状态。任务采用至少一次投递，Attempt token 用于保证结果接收幂等并拒绝迟到结果。
