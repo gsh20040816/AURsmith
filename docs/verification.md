@@ -145,3 +145,9 @@
 - 使用与 Compose 相同的只读和降权参数启动真实容器，通过代理访问 `https://archlinux.org/` 返回 HTTP 200，访问 `127.0.0.1:8080` 返回 HTTP 403；测试容器随后删除。
 - 修复真实上游冒烟脚本，使其生成一次性 GPG 测试公钥并配置 Publisher 的仓库、Signer 和 Journal 临时目录。随后实际通过 AUR RPC 搜索 `visual-studio-code-bin`、固定其 40 位 AUR Git commit、读取 `paru-git` 上游 commit，并从 Arch 官方接口查到 `pacman`；临时密钥和数据库均已清理。
 - 边界：第一版代理执行全局公共网络策略，尚未由 Controller 按 Revision 自动生成精确 source 域名 allowlist，也没有引入 pacoloco 缓存统计。
+
+## 2026-08-10：Worker 注册和 Provider 处置界面
+
+- Worker 页面新增名称、固定角色、SSH 端点、host key 指纹和调度标签表单；注册请求仍由 Controller 执行真实 SSH 探测并核对 Worker UUID、名称、角色、协议和身份签名公钥，不在浏览器侧伪造在线状态。
+- 包详情页对 `needs_selection` 依赖展示全部 Provider 候选。用户选择后调用既有受认证 API，重新同步依赖闭包并刷新详情，选择只绑定新 Revision，不形成永久信任。
+- 前端类型检查、两个 Vitest 用例和生产构建通过；新增用例实际进入 Worker 页面并检查注册表单的可访问标签和提交按钮。

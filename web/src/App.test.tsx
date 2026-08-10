@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
@@ -25,5 +25,14 @@ describe("AURsmith 控制台", () => {
     expect(await screen.findByText("从上游变化到可安装软件包")).toBeInTheDocument();
     expect(screen.getByLabelText("软件包锻造流程")).toBeInTheDocument();
     expect(await screen.findByText("AUR 软件包搜索和订阅生命周期")).toBeInTheDocument();
+  });
+
+  it("Worker 页面提供探测注册表单", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Worker/ }));
+    expect(await screen.findByText("注册 Worker")).toBeInTheDocument();
+    expect(screen.getByLabelText("实例名称")).toBeInTheDocument();
+    expect(screen.getByLabelText("SSH host key 指纹")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "探测并注册" })).toBeInTheDocument();
   });
 });

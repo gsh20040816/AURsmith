@@ -229,6 +229,17 @@ export const api = {
   me: () => request<Session>("/api/v1/auth/me"),
   requirements: () => request<{ items: Requirement[] }>("/api/v1/requirements"),
   workers: () => request<{ items: Worker[] }>("/api/v1/workers"),
+  registerWorker: (worker: {
+    name: string;
+    role: Worker["role"];
+    endpoint: string;
+    ssh_host_key_sha256: string;
+    protocol_version: number;
+    labels: string[];
+  }) => request<{ id: string }>("/api/v1/workers", {
+    method: "POST",
+    body: JSON.stringify(worker)
+  }),
   jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
   searchAur: (query: string) =>
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
@@ -286,6 +297,11 @@ export const api = {
     ),
   packageDetail: (packageBase: string) =>
     request<PackageDetail>(`/api/v1/packages/${encodeURIComponent(packageBase)}`),
+  selectProvider: (packageBase: string, dependencyName: string, selectedPackageBase: string) =>
+    request<{ package_base: string; dependency_name: string; selected_package_base: string }>(
+      `/api/v1/packages/${encodeURIComponent(packageBase)}/providers/${encodeURIComponent(dependencyName)}`,
+      { method: "POST", body: JSON.stringify({ selected_package_base: selectedPackageBase }) }
+    ),
   rebuildRecommendations: () => request<{ items: RebuildRecommendation[] }>("/api/v1/rebuild-recommendations"),
   disableRebuildRecommendation: (packageBase: string) =>
     request<{ package_base: string; state: string }>(`/api/v1/rebuild-recommendations/${encodeURIComponent(packageBase)}/disable`, { method: "POST" }),

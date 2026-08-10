@@ -14,9 +14,9 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { cursor: pointer; }
-button:focus-visible, input:focus-visible { outline: 3px solid rgba(36, 101, 154, .35); outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(36, 101, 154, .35); outline-offset: 2px; }
 code { font-family: "JetBrains Mono", "Noto Sans Mono", monospace; font-size: .78em; }
 
 .shell { min-height: 100vh; display: grid; grid-template-columns: 236px 1fr; }
@@ -117,6 +117,10 @@ td { padding: 14px 12px; border-bottom: 1px solid var(--line); font-size: .84rem
 .manual-decision input { border: 1px solid var(--line); padding: 10px; background: white; }
 .manual-decision > div { display: flex; gap: 10px; }
 .secondary-button.danger { color: #8f402d; border-color: #8f402d; }
+.worker-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; }
+.worker-form label { display: grid; gap: 7px; color: var(--steel); font-size: .75rem; }
+.worker-form input, .worker-form select { min-width: 0; border: 1px solid var(--line); background: white; color: var(--ink); padding: 10px 11px; border-radius: 0; }
+.worker-form .secondary-button { align-self: end; }
 
 .notice { padding: 12px 14px; margin: 16px 0; border-left: 3px solid var(--arc); background: rgba(36,101,154,.08); font-size: .85rem; }
 .notice.error { border-color: var(--heat); background: rgba(212,91,50,.08); color: #823820; }
@@ -148,6 +152,7 @@ td { padding: 14px 12px; border-bottom: 1px solid var(--line); font-size: .84rem
   .nav-item code { font-size: .67rem; }
   .operator { grid-template-columns: 1fr; justify-items: center; }
   .dashboard-grid { grid-template-columns: 1fr; }
+  .worker-form { grid-template-columns: 1fr; }
   .auth-page { grid-template-columns: 1fr; }
   .auth-intro { min-height: 45vh; }
 }

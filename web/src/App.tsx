@@ -218,12 +218,38 @@ function ForgeRail() {
 function WorkersView() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState({ name: "", role: "builder" as Worker["role"], endpoint: "", hostKey: "", labels: "" });
   const refresh = () => void api.workers().then((response) => setWorkers(response.items)).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
+  const register = async (event: FormEvent) => {
+    event.preventDefault(); setBusy(true); setError("");
+    try {
+      await api.registerWorker({
+        name: draft.name.trim(), role: draft.role, endpoint: draft.endpoint.trim(),
+        ssh_host_key_sha256: draft.hostKey.trim(), protocol_version: 1,
+        labels: draft.labels.split(",").map((label) => label.trim()).filter(Boolean)
+      });
+      setDraft({ name: "", role: "builder", endpoint: "", hostKey: "", labels: "" });
+      refresh();
+    } catch (reason) { setError(messageOf(reason)); } finally { setBusy(false); }
+  };
   return (
     <>
       <header className="page-header compact"><div><p className="eyebrow">W02 / W04</p><h1>Worker</h1><p className="lede">角色分离部署，任务在本地 Journal 中保持幂等。</p></div></header>
       {error && <Notice kind="error">{error}</Notice>}
+      <section className="work-panel">
+        <div className="section-heading"><div><p className="eyebrow">固定 SSH 身份</p><h2>注册 Worker</h2></div></div>
+        <form className="worker-form" onSubmit={(event) => void register(event)}>
+          <label>实例名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="compute-01" required /></label>
+          <label>角色<select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Worker["role"] })}><option value="builder">Builder</option><option value="publisher">Publisher</option><option value="archiver">Archiver</option></select></label>
+          <label>SSH 端点<input value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} placeholder="ssh://aursmith@192.0.2.10:2222" required /></label>
+          <label>SSH host key 指纹<input value={draft.hostKey} onChange={(event) => setDraft({ ...draft, hostKey: event.target.value })} placeholder="SHA256:…" required /></label>
+          <label>标签（逗号分隔）<input value={draft.labels} onChange={(event) => setDraft({ ...draft, labels: event.target.value })} placeholder="nvme,large-memory" /></label>
+          <button className="secondary-button" disabled={busy}>{busy ? "正在探测…" : "探测并注册"}</button>
+        </form>
+        <p className="panel-note">端点必须已经写入 Controller 的 known_hosts；注册时会连接 Worker，并核对实例名称、角色、协议和持久化身份公钥。</p>
+      </section>
       <section className="table-panel">
         <div className="section-heading"><h2>已注册节点</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>
         {workers.length === 0 ? (
@@ -289,6 +315,16 @@ function PackagesView() {
     try { setDetail(await api.packageDetail(packageBase)); } catch (reason) { setError(messageOf(reason)); }
     finally { setBusy(""); }
   };
+  const selectProvider = async (dependencyName: string, selectedPackageBase: string) => {
+    if (!detail) return;
+    const packageBase = detail.package_base;
+    setBusy(`provider-${dependencyName}-${selectedPackageBase}`); setError("");
+    try {
+      await api.selectProvider(packageBase, dependencyName, selectedPackageBase);
+      setDetail(await api.packageDetail(packageBase));
+      refresh();
+    } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
+  };
   return <>
     <header className="page-header compact"><div><p className="eyebrow">P01 / P02 / P03 / P04</p><h1>AUR 软件包</h1><p className="lede">搜索在 Publisher 上执行；订阅会固定完整 pkgbase Git commit，并展开隐式 AUR 依赖。</p></div></header>
     {error && <Notice kind="error">{error}</Notice>}
@@ -306,7 +342,7 @@ function PackagesView() {
       {subscriptions.length === 0 ? <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未订阅软件包</strong><p>先部署并注册在线 Publisher，然后从上方搜索 AUR。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>pkgbase</th><th>来源</th><th>版本 / outputs</th><th>状态</th><th>引用</th><th /></tr></thead><tbody>{subscriptions.map((subscription) => <tr key={subscription.id}><td><strong>{subscription.package_base}</strong><small className="cell-note">{subscription.description}</small></td><td>{subscription.kind === "direct" ? "用户订阅" : "隐式依赖"}</td><td><code>{subscription.version ?? "等待同步"}</code><small className="cell-note">{subscription.outputs.join(" · ") || "—"}</small></td><td><span className={`state ${subscription.state}`}>{subscription.state}</span></td><td>{subscription.reference_count}</td><td><div className="row-actions"><button className="text-button" onClick={() => void showDetail(subscription.package_base)}>详情</button>{subscription.kind === "direct" && <button className="text-button" onClick={() => void operate(`refresh-${subscription.id}`, () => api.refreshPackage(subscription.package_base))}>检查</button>}{subscription.kind === "direct" && subscription.state === "active" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.pauseSubscription(subscription.package_base))}>暂停</button>}{subscription.kind === "direct" && subscription.state === "paused" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.resumeSubscription(subscription.package_base))}>恢复</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(subscription.id, () => api.unsubscribe(subscription.package_base))}>退订</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(`purge-${subscription.id}`, () => api.purgeSubscription(subscription.package_base))}>清除</button>}</div></td></tr>)}</tbody></table></div>}
     </section>
     {rebuilds.some((recommendation) => recommendation.state === "suggested") && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">P07 · 保守 ABI 检测</p><h2>官方依赖变化，建议重建</h2></div></div><div className="finding-list">{rebuilds.filter((recommendation) => recommendation.state === "suggested").map((recommendation) => <div key={recommendation.package_base}><code>{recommendation.package_base}</code><strong>{recommendation.changes.map((change) => `${change.dependency} ${change.built_with} → ${change.current}`).join("；")}</strong><span><button className="text-button" onClick={() => void operate(`schedule-${recommendation.package_base}`, () => api.scheduleRebuildRecommendation(recommendation.package_base))}>立即重建</button><button className="text-button" onClick={() => void operate(`disable-${recommendation.package_base}`, () => api.disableRebuildRecommendation(recommendation.package_base))}>关闭该包建议</button></span></div>)}</div><p className="panel-note">版本变化只是一种保守信号，不能证明 ABI 已经不兼容；未处理建议在七天后合并为一个重建批次。</p></section>}
-    {detail && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pkgbase 详情</p><h2>{detail.package_base} · {detail.version}</h2></div><button className="text-button" onClick={() => setDetail(null)}>关闭</button></div><p>{detail.description ?? "没有描述"} · {detail.maintainer ? `维护者 ${detail.maintainer}` : "孤儿包"}</p><h3>Revision 与 split outputs</h3><div className="finding-list">{detail.revisions.map((revision) => <div key={revision.id}><code>{revision.state}</code><strong>{revision.upstream_version} · {revision.aur_commit.slice(0, 12)}</strong><span>{revision.published_version ?? "尚未发布"}</span></div>)}</div><h3>依赖解析</h3><div className="finding-list">{detail.dependency_resolution.map((dependency) => <div key={`${dependency.kind}-${dependency.name}`}><code>{dependency.kind}</code><strong>{dependency.name}</strong><span>{dependency.target_package_base ?? dependency.state}</span></div>)}</div><h3>上游与人工事件</h3><div className="finding-list">{detail.events.length === 0 ? <p>尚无事件。</p> : detail.events.map((event, index) => <div key={`${event.type}-${index}`}><code>{event.type}</code><strong>{new Date(event.created_at).toLocaleString("zh-CN")}</strong><span>{JSON.stringify(event.payload)}</span></div>)}</div></section>}
+    {detail && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pkgbase 详情</p><h2>{detail.package_base} · {detail.version}</h2></div><button className="text-button" onClick={() => setDetail(null)}>关闭</button></div><p>{detail.description ?? "没有描述"} · {detail.maintainer ? `维护者 ${detail.maintainer}` : "孤儿包"}</p><h3>Revision 与 split outputs</h3><div className="finding-list">{detail.revisions.map((revision) => <div key={revision.id}><code>{revision.state}</code><strong>{revision.upstream_version} · {revision.aur_commit.slice(0, 12)}</strong><span>{revision.published_version ?? "尚未发布"}</span></div>)}</div><h3>依赖解析</h3><div className="finding-list">{detail.dependency_resolution.map((dependency) => <div key={`${dependency.kind}-${dependency.name}`}><code>{dependency.kind}</code><strong>{dependency.name}</strong><span>{dependency.state === "needs_selection" ? dependency.candidates.map((candidate) => <button key={candidate} className="text-button" disabled={busy.startsWith(`provider-${dependency.name}-`)} onClick={() => void selectProvider(dependency.name, candidate)}>选择 {candidate}</button>) : dependency.target_package_base ?? dependency.state}</span></div>)}</div><h3>上游与人工事件</h3><div className="finding-list">{detail.events.length === 0 ? <p>尚无事件。</p> : detail.events.map((event, index) => <div key={`${event.type}-${index}`}><code>{event.type}</code><strong>{new Date(event.created_at).toLocaleString("zh-CN")}</strong><span>{JSON.stringify(event.payload)}</span></div>)}</div></section>}
   </>;
 }
 
