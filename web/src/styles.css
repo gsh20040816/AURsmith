@@ -105,6 +105,18 @@ td { padding: 14px 12px; border-bottom: 1px solid var(--line); font-size: .84rem
 .package-title span { color: #89968f; font-size: .7rem; }
 .cell-note { display: block; max-width: 320px; color: var(--steel); margin-top: 5px; line-height: 1.45; }
 .text-button.danger { color: #9a4935; }
+.audit-list { display: grid; gap: 18px; margin-top: 30px; }
+.audit-card { background: var(--paper); border: 1px solid var(--line); border-left: 3px solid var(--arc); padding: 24px 27px; }
+.audit-title { display: flex; justify-content: space-between; gap: 20px; }
+.coverage-note { color: var(--steel); font-size: .82rem; line-height: 1.7; }
+.finding-list { border-top: 1px solid var(--line); }
+.finding-list > div { display: grid; grid-template-columns: 170px 180px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: .78rem; }
+.finding-list span { color: var(--steel); }
+.manual-decision { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--ink); display: grid; gap: 12px; }
+.manual-decision label { display: grid; gap: 7px; font-size: .78rem; }
+.manual-decision input { border: 1px solid var(--line); padding: 10px; background: white; }
+.manual-decision > div { display: flex; gap: 10px; }
+.secondary-button.danger { color: #8f402d; border-color: #8f402d; }
 
 .notice { padding: 12px 14px; margin: 16px 0; border-left: 3px solid var(--arc); background: rgba(36,101,154,.08); font-size: .85rem; }
 .notice.error { border-color: var(--heat); background: rgba(212,91,50,.08); color: #823820; }

@@ -1,6 +1,8 @@
 use anyhow::{Context, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::Path, process::Stdio, time::Duration};
 use tempfile::TempDir;
 use tokio::{process::Command, time::timeout};
@@ -70,6 +72,17 @@ pub struct AurSnapshot {
     pub architectures: Vec<String>,
     pub sources: Vec<String>,
     pub srcinfo: String,
+    pub files: Vec<SnapshotFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotFile {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+    pub binary: bool,
+    pub text: Option<String>,
+    pub content_base64: String,
 }
 
 #[derive(Clone)]
@@ -172,11 +185,90 @@ impl AurClient {
         }
         let srcinfo = run_git_output(temporary.path(), &["show", "HEAD:.SRCINFO"]).await?;
         let mut snapshot = parse_srcinfo(package_base, commit, srcinfo)?;
+        snapshot.files = collect_snapshot_files(temporary.path()).await?;
         if package_base.ends_with("-git") {
             snapshot.vcs_commit = resolve_git_vcs_commit(&snapshot.sources).await?;
         }
         Ok(snapshot)
     }
+}
+
+async fn collect_snapshot_files(directory: &Path) -> anyhow::Result<Vec<SnapshotFile>> {
+    const MAXIMUM_FILES: usize = 128;
+    const MAXIMUM_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+    let names = run_git_bytes(directory, &["ls-tree", "-r", "-z", "--name-only", "HEAD"]).await?;
+    let paths: Vec<String> = names
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8(path.to_vec()).context("AUR Git 路径不是 UTF-8"))
+        .collect::<Result<_, _>>()?;
+    if paths.is_empty() || paths.len() > MAXIMUM_FILES {
+        bail!("AUR Git 文件数量超出 1 至 {MAXIMUM_FILES} 的限制");
+    }
+    let mut total = 0_usize;
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        validate_snapshot_path(&path)?;
+        let object = format!("HEAD:{path}");
+        let bytes = run_git_bytes(directory, &["show", &object]).await?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("AUR Git 文件总大小溢出"))?;
+        if total > MAXIMUM_TOTAL_BYTES {
+            bail!("AUR Git 文件总大小超过 2 MiB");
+        }
+        let text = String::from_utf8(bytes.clone()).ok();
+        files.push(SnapshotFile {
+            path,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            size: u64::try_from(bytes.len())?,
+            binary: text.is_none(),
+            text,
+            content_base64: BASE64.encode(&bytes),
+        });
+    }
+    Ok(files)
+}
+
+async fn run_git_bytes(directory: &Path, arguments: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let output = timeout(
+        Duration::from_secs(15),
+        Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .context("读取 AUR Git 对象超时")??;
+    if !output.status.success() {
+        bail!(
+            "读取 AUR Git 对象失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn validate_snapshot_path(path: &str) -> anyhow::Result<()> {
+    let candidate = Path::new(path);
+    if path.starts_with('-')
+        || candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || path.chars().any(char::is_control)
+    {
+        bail!("AUR Git 包含不安全路径");
+    }
+    Ok(())
 }
 
 async fn run_git_clone(repository: &str, directory: &Path) -> anyhow::Result<()> {
@@ -455,6 +547,7 @@ fn parse_srcinfo(
         architectures: architectures.into_iter().collect(),
         sources: sources.into_iter().collect(),
         srcinfo,
+        files: Vec::new(),
     })
 }
 
@@ -515,6 +608,15 @@ mod tests {
         assert!(validate_package_base("../evil").is_err());
         assert!(validate_package_base("demo;touch").is_err());
         assert!(validate_package_base("valid-bin").is_ok());
+    }
+
+    #[test]
+    fn snapshot_paths_reject_traversal_options_and_controls() {
+        assert!(validate_snapshot_path("PKGBUILD").is_ok());
+        assert!(validate_snapshot_path("src/helper.sh").is_ok());
+        assert!(validate_snapshot_path("../secret").is_err());
+        assert!(validate_snapshot_path("-option").is_err());
+        assert!(validate_snapshot_path("bad\npath").is_err());
     }
 
     #[test]

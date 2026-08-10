@@ -33,6 +33,17 @@ pub fn spawn(state: AppState) {
             }
         }
     });
+    let audit_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(std::time::Duration::from_secs(3));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = crate::audits::dispatch_one(&audit_state).await {
+                tracing::warn!(%error, "Agent 审计调度失败");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);

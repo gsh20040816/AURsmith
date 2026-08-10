@@ -36,3 +36,15 @@ Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包�
 ## 发布安全
 
 受影响的依赖闭包组成一个 `ReleaseBatch`。系统完整暂存该批次，根据完整 Manifest 签名并验证，然后最后切换仓库数据库。失败批次不能修改当前 Release。
+
+## 审计流水线与 Agent 边界
+
+每个 Revision 首先形成包含全部 AUR Git 跟踪文件、相对差异、文件摘要、source 声明和覆盖说明的不可变 `AuditBundle`。确定性扫描会阻断路径逃逸、摘要不一致、私网 source URL 等确定性违规，并将动态下载、混淆、安装钩子、权限修改等不确定信号交给 Agent 判断。当前 Fetch VM 尚未补入完整上游源码前，覆盖说明必须明确写为“完整 AUR 包装层、上游仅清单”，不能将其描述成完整源码审计。
+
+三个低成本 Runner 各自独立读取同一 Bundle。三票通过时直接批准；恰好两票通过时只创建一次高成本任务；不超过一票通过时转入人工队列。Runner 超时、不可用、非零退出、非法 JSON 都按未通过处理，每个调用仅重试一次。高成本 Runner 只收到原始 Bundle 和低成本报告的规范化异议，不接收隐藏推理过程，并且只有明确 `approve` 才能批准。人工决定绑定 Revision、Bundle 摘要和策略版本。
+
+Runner 只支持 `codex` 与 `claude_code` 两种适配器，不接受用户提供任意可执行文件或 Shell 命令。两种 CLI 都从固定绝对路径和结构化 argv 启动，并使用 JSON Schema 约束最终输出。Codex 使用临时 `CODEX_HOME`、忽略用户配置与规则、只读 sandbox 和非交互审批；Claude Code 使用 bare/safe 配置、禁用全部工具、MCP、slash command、会话持久化和非必要遥测。一次性目录中只有输出 Schema，不挂载 Controller 数据库、仓库、Worker、SSH/GPG 密钥或 Docker Socket。
+
+真实 provider API key 不进入 Runner 容器。独立 `agent-credential-gateway` 挂载 low/high 两份 Docker secret，Runner 只连接内部 Agent 网络中的网关路径并使用无权限占位令牌。网关按静态配置的 upstream Base URL 转发流式响应，删除调用方的认证头后重新注入对应的 bearer 或 `x-api-key`，且不接受请求指定目标主机。这样既支持 Codex/Claude Code 的自定义 provider 与 Base URL，也避免模型通过工具或环境读取真实密钥。网关是唯一拥有 Agent 外网的容器。
+
+每次报告保存适配器、provider 名称、模型、CLI 版本、文件阅读范围、结构化发现、原始结构化输出、起止时间、退出状态、成本和报告摘要。API key、认证头和内部凭据不进入日志、数据库或报告。每日/月度调用次数与月度成本任一达到上限时，剩余任务进入人工队列，不会跳过审计。

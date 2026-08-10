@@ -14,7 +14,7 @@
 | P08 | 新 Revision 任意阶段失败后保留当前稳定 Release | 故障注入测试 |
 | A01 | 构建前执行确定性扫描和 Agent 审计 | 审计流水线测试 |
 | A02 | 精确实施三个低成本 Agent 的 3/2/不超过 1 票规则 | 投票测试 |
-| A03 | 隔离和配置 Agent 调用，并保存完整溯源 | 容器及适配器测试 |
+| A03 | 仅适配 Codex CLI 与 Claude Code；支持各自自定义 provider、Base URL 和 API key；隔离调用并保存完整溯源 | 容器、凭据网关及适配器测试 |
 | A04 | 如实记录源码审计覆盖范围 | 报告 Schema 测试 |
 | B01 | 所有不可信构建都运行在 KVM Guest 中 | KVM 集成测试 |
 | B02 | 限制 Fetch Guest 网络并彻底移除 Build Guest 网络 | 网络隔离测试 |

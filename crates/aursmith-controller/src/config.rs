@@ -12,6 +12,11 @@ pub struct Config {
     pub ssh_known_hosts_file: String,
     pub secure_cookies: bool,
     pub session_hours: i64,
+    pub low_agent_endpoints: Vec<String>,
+    pub high_agent_endpoint: String,
+    pub agent_daily_call_limit: i64,
+    pub agent_monthly_call_limit: i64,
+    pub agent_monthly_cost_limit_microusd: i64,
 }
 
 impl Config {
@@ -51,6 +56,20 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(168),
+            low_agent_endpoints: env::var("AURSMITH_LOW_AGENT_ENDPOINTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            high_agent_endpoint: env::var("AURSMITH_HIGH_AGENT_ENDPOINT").unwrap_or_default(),
+            agent_daily_call_limit: parse_nonnegative("AURSMITH_AGENT_DAILY_CALL_LIMIT", 300),
+            agent_monthly_call_limit: parse_nonnegative("AURSMITH_AGENT_MONTHLY_CALL_LIMIT", 3000),
+            agent_monthly_cost_limit_microusd: parse_nonnegative(
+                "AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD",
+                5_000_000,
+            ),
         })
     }
 
@@ -86,4 +105,12 @@ impl Config {
             .with_context(|| format!("无法同步私有 SSH 密钥 {}", target.display()))?;
         Ok(())
     }
+}
+
+fn parse_nonnegative(name: &str, default: i64) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(default)
 }

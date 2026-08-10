@@ -1,3 +1,4 @@
+mod audits;
 mod auth;
 mod config;
 mod db;

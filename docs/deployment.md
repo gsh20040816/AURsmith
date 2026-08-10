@@ -30,6 +30,25 @@ Compose 的本地文件型 secret 不支持可靠设置容器内 `uid/gid/mode`�
 
 Compose file-backed secret 以 UID/GID `10001`、模式 `0400` 挂载。部署前使用 `docker compose config` 检查实际渲染结果，不要把 `deploy/*/secrets` 加入 Git。
 
+## Agent provider 配置
+
+Controller Stack 内固定运行三个低成本 Runner、一个高成本 Runner和一个凭据网关。Runner 镜像固定包含 Codex CLI `0.147.0` 与 Claude Code `2.1.226`；升级 CLI 必须修改镜像构建参数、重新构建并运行适配器回归测试，不能在运行中自动更新。
+
+低成本与高成本层分别配置以下变量：
+
+- `AURSMITH_LOW_AGENT_ADAPTER`、`AURSMITH_HIGH_AGENT_ADAPTER`：只能是 `codex` 或 `claude_code`；
+- `AURSMITH_*_AGENT_PROVIDER`：写入报告的 provider 标识，只允许字母、数字、连字符和下划线；
+- `AURSMITH_*_AGENT_MODEL`：传给对应 CLI 的模型 ID；
+- `AURSMITH_*_AGENT_BASE_URL`：凭据网关访问的上游 HTTPS Base URL；
+- `AURSMITH_*_AGENT_AUTH_STYLE`：`bearer` 或 `x-api-key`；Codex 兼容 provider 通常使用 `bearer`，Claude 原生 API 使用 `x-api-key`；
+- `AURSMITH_*_AGENT_API_KEY_FILE`：宿主机上的 Docker secret 文件路径。
+
+默认低成本层使用 Codex 和 `https://api.openai.com/v1/`，高成本层使用 Claude Code 和 `https://api.anthropic.com/`。自建兼容网关也必须使用 HTTPS；第一版不允许明文 HTTP upstream。自定义 Base URL 只配置在凭据网关，Runner 实际看到的是 `http://agent-credential-gateway:8091/low/` 或 `/high/`，且只处于 Compose 内部网络。
+
+将低成本 key 写入 `deploy/controller/secrets/low_agent_api_key`，高成本 key 写入 `deploy/controller/secrets/high_agent_api_key`，权限设为仅部署账户可读。不要把 key 写进 `.env`、Compose environment、Controller 设置、Agent prompt 或日志。凭据网关读取 secret 后删除 Runner 发送的 `Authorization`、`x-api-key`、Host 和 hop-by-hop 头，再按配置注入真实凭据；Runner 子进程中只有无权限占位令牌。
+
+Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自定义 Base URL 需要提供 Anthropic Messages API 兼容接口。provider 名称只是可追踪标签，不会自动转换 API 协议。部署 Doctor 后续阶段会对两层分别执行不含软件包内容的结构化输出探测。
+
 ## 启动顺序
 
 1. 启动 Publisher 和 Archiver Stack。
@@ -39,6 +58,7 @@ Compose file-backed secret 以 UID/GID `10001`、模式 `0400` 挂载。部署�
 5. 在 Web 设置页创建管理员。
 6. 注册三个角色的 Worker，并执行“探测”。
 7. 运行 Doctor，确认 KVM、SSH、协议、仓库和归档存储状态。
+8. 在订阅真实软件包前，确认四个 Agent Runner 都能返回符合 Schema 的测试报告，且报告与容器日志中不含 API key。
 
 不同宿主机部署时只需要复制对应 Stack 的 Compose、镜像和该角色的 secret，不要复制其他角色的数据卷或私钥。
 

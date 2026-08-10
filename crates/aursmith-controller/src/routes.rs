@@ -51,6 +51,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
+        .route("/api/v1/audits", get(crate::audits::list))
+        .route(
+            "/api/v1/audits/{bundle}/manual-decision",
+            post(crate::audits::manual_decision),
+        )
         .route("/api/v1/aur/search", get(crate::packages::search))
         .route(
             "/api/v1/subscriptions",
@@ -585,6 +590,11 @@ mod tests {
             ssh_known_hosts_file: "/不存在".into(),
             secure_cookies: false,
             session_hours: 1,
+            low_agent_endpoints: vec![],
+            high_agent_endpoint: String::new(),
+            agent_daily_call_limit: 300,
+            agent_monthly_call_limit: 3000,
+            agent_monthly_cost_limit_microusd: 5_000_000,
         };
         router(AppState::new(
             database,

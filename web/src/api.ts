@@ -80,6 +80,20 @@ export type Subscription = {
   maintainer: string | null;
   out_of_date: number | null;
 };
+export type Audit = {
+  sha256: string;
+  revision_id: string;
+  state: string;
+  policy_version: string;
+  package_base: string;
+  aur_commit: string;
+  findings: Array<{ rule_id: string; severity: string; path: string; summary: string }>;
+  coverage: {
+    aur_wrapper?: { mode: string; files: string[] };
+    upstream_source?: { mode: string; statement: string };
+  };
+  created_at: string;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -100,6 +114,12 @@ export const api = {
   searchAur: (query: string) =>
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
+  audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
+  decideAudit: (bundle: string, approve: boolean, rationale: string) =>
+    request<{ bundle_sha256: string; decision: string }>(
+      `/api/v1/audits/${encodeURIComponent(bundle)}/manual-decision`,
+      { method: "POST", body: JSON.stringify({ approve, rationale }) }
+    ),
   subscribe: (packageName: string) =>
     request<{ package_base: string; revision_id: string; batch_id: string | null; batch_state: string }>(
       "/api/v1/subscriptions",

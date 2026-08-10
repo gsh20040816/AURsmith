@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiError, AurPackage, Job, Requirement, Session, Subscription, Worker, api } from "./api";
+import { ApiError, Audit, AurPackage, Job, Requirement, Session, Subscription, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -108,7 +108,8 @@ export function App() {
         {view === "workers" && <WorkersView />}
         {view === "builds" && <BuildsView />}
         {view === "packages" && <PackagesView />}
-        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && <PlannedView view={view} />}
+        {view === "audits" && <AuditsView />}
+        {view !== "dashboard" && view !== "workers" && view !== "builds" && view !== "packages" && view !== "audits" && <PlannedView view={view} />}
       </main>
     </div>
   );
@@ -286,6 +287,24 @@ function PackagesView() {
       {subscriptions.length === 0 ? <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未订阅软件包</strong><p>先部署并注册在线 Publisher，然后从上方搜索 AUR。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>pkgbase</th><th>来源</th><th>版本 / outputs</th><th>状态</th><th>引用</th><th /></tr></thead><tbody>{subscriptions.map((subscription) => <tr key={subscription.id}><td><strong>{subscription.package_base}</strong><small className="cell-note">{subscription.description}</small></td><td>{subscription.kind === "direct" ? "用户订阅" : "隐式依赖"}</td><td><code>{subscription.version ?? "等待同步"}</code><small className="cell-note">{subscription.outputs.join(" · ") || "—"}</small></td><td><span className={`state ${subscription.state}`}>{subscription.state}</span></td><td>{subscription.reference_count}</td><td><div className="row-actions">{subscription.kind === "direct" && <button className="text-button" onClick={() => void operate(`refresh-${subscription.id}`, () => api.refreshPackage(subscription.package_base))}>检查</button>}{subscription.kind === "direct" && subscription.state === "active" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.pauseSubscription(subscription.package_base))}>暂停</button>}{subscription.kind === "direct" && subscription.state === "paused" && <button className="text-button" onClick={() => void operate(subscription.id, () => api.resumeSubscription(subscription.package_base))}>恢复</button>}{subscription.kind === "direct" && <button className="text-button danger" onClick={() => void operate(subscription.id, () => api.unsubscribe(subscription.package_base))}>退订</button>}</div></td></tr>)}</tbody></table></div>}
     </section>
   </>;
+}
+
+function AuditsView() {
+  const [audits, setAudits] = useState<Audit[]>([]);
+  const [error, setError] = useState("");
+  const [rationale, setRationale] = useState<Record<string, string>>({});
+  const refresh = () => void api.audits().then((response) => setAudits(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  const decide = async (audit: Audit, approve: boolean) => {
+    setError("");
+    try {
+      await api.decideAudit(audit.sha256, approve, rationale[audit.sha256] ?? "");
+      refresh();
+    } catch (reason) {
+      setError(messageOf(reason));
+    }
+  };
+  return <><header className="page-header compact"><div><p className="eyebrow">A01 / A02 / A04</p><h1>审计</h1><p className="lede">确定性阻断、三低成本 Agent 投票和高成本复核均绑定不可变 AuditBundle。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{audits.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>没有审计任务</strong><p>订阅固定 Revision 后会自动生成覆盖范围明确的 AuditBundle。</p></div></div> : audits.map((audit) => <article className="audit-card" key={audit.sha256}><div className="audit-title"><div><p className="eyebrow">{audit.policy_version} · {audit.aur_commit.slice(0, 12)}</p><h2>{audit.package_base}</h2></div><span className={`state ${audit.state}`}>{audit.state}</span></div><p className="coverage-note">{audit.coverage.upstream_source?.statement}</p><div className="finding-list">{audit.findings.length === 0 ? <p>确定性扫描未发现阻断或可疑项。</p> : audit.findings.map((finding, index) => <div key={`${finding.rule_id}-${index}`}><code>{finding.rule_id}</code><span>{finding.path}</span><strong>{finding.summary}</strong></div>)}</div>{audit.state === "manual_review" && <div className="manual-decision"><label>人工判断理由<input value={rationale[audit.sha256] ?? ""} onChange={(event) => setRationale((current) => ({ ...current, [audit.sha256]: event.target.value }))} placeholder="至少 8 个字符，只对当前 Revision 有效" /></label><div><button className="secondary-button" onClick={() => void decide(audit, true)}>批准当前 Revision</button><button className="secondary-button danger" onClick={() => void decide(audit, false)}>拒绝当前 Revision</button></div></div>}</article>)}</section></>;
 }
 
 function PlannedView({ view }: { view: View }) {

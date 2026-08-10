@@ -19,6 +19,11 @@ services:
       AURSMITH_SSH_IDENTITY_FILE: /run/aursmith-private/worker_ssh_key
       AURSMITH_SSH_KNOWN_HOSTS_FILE: /run/secrets/worker_known_hosts
       AURSMITH_SECURE_COOKIES: ${AURSMITH_SECURE_COOKIES:-true}
+      AURSMITH_LOW_AGENT_ENDPOINTS: http://agent-low-1:8090,http://agent-low-2:8090,http://agent-low-3:8090
+      AURSMITH_HIGH_AGENT_ENDPOINT: http://agent-high:8090
+      AURSMITH_AGENT_DAILY_CALL_LIMIT: ${AURSMITH_AGENT_DAILY_CALL_LIMIT:-300}
+      AURSMITH_AGENT_MONTHLY_CALL_LIMIT: ${AURSMITH_AGENT_MONTHLY_CALL_LIMIT:-3000}
+      AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD: ${AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD:-5000000}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
       - setup_token
@@ -30,7 +35,7 @@ services:
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
-    networks: [control]
+    networks: [control, agent]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]
       interval: 30s
@@ -59,6 +64,65 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  agent-low-1: &agent-runner
+    build:
+      context: ../..
+      dockerfile: deploy/images/agent-runner.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment: &low-agent-environment
+      AURSMITH_AGENT_ADAPTER: ${AURSMITH_LOW_AGENT_ADAPTER:-codex}
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_MODEL:-gpt-5.6-terra}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low/
+    tmpfs:
+      - /tmp:uid=10002,gid=10002,mode=0700,size=32m
+    networks: [agent]
+    restart: unless-stopped
+
+  agent-low-2:
+    <<: *agent-runner
+    environment: *low-agent-environment
+
+  agent-low-3:
+    <<: *agent-runner
+    environment: *low-agent-environment
+
+  agent-high:
+    <<: *agent-runner
+    environment:
+      AURSMITH_AGENT_ADAPTER: ${AURSMITH_HIGH_AGENT_ADAPTER:-claude_code}
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_HIGH_AGENT_PROVIDER:-anthropic}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_HIGH_AGENT_MODEL:-claude-sonnet-4-6}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/high/
+
+  agent-credential-gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/images/agent-gateway.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_LOW_AGENT_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_BASE_URL:-https://api.openai.com/v1/}
+      AURSMITH_LOW_AGENT_AUTH_STYLE: ${AURSMITH_LOW_AGENT_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_API_KEY_FILE: /run/secrets/low_agent_api_key
+      AURSMITH_HIGH_AGENT_PROVIDER_BASE_URL: ${AURSMITH_HIGH_AGENT_BASE_URL:-https://api.anthropic.com/}
+      AURSMITH_HIGH_AGENT_AUTH_STYLE: ${AURSMITH_HIGH_AGENT_AUTH_STYLE:-x-api-key}
+      AURSMITH_HIGH_AGENT_API_KEY_FILE: /run/secrets/high_agent_api_key
+    secrets:
+      - low_agent_api_key
+      - high_agent_api_key
+    tmpfs:
+      - /tmp:uid=10003,gid=10003,mode=0700,size=8m
+    networks: [agent, egress]
+    restart: unless-stopped
+
 secrets:
   setup_token:
     file: ${AURSMITH_SETUP_TOKEN_FILE:-./secrets/setup_token}
@@ -68,6 +132,10 @@ secrets:
     file: ${AURSMITH_WORKER_SSH_KEY_FILE:-./secrets/worker_ssh_key}
   worker_known_hosts:
     file: ${AURSMITH_WORKER_KNOWN_HOSTS_FILE:-./secrets/worker_known_hosts}
+  low_agent_api_key:
+    file: ${AURSMITH_LOW_AGENT_API_KEY_FILE:-./secrets/low_agent_api_key}
+  high_agent_api_key:
+    file: ${AURSMITH_HIGH_AGENT_API_KEY_FILE:-./secrets/high_agent_api_key}
 
 volumes:
   controller-data:
@@ -75,3 +143,6 @@ volumes:
 networks:
   control:
     internal: true
+  agent:
+    internal: true
+  egress:
