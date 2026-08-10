@@ -51,6 +51,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/requirements", get(requirements))
+        .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/client-bootstrap", get(client_bootstrap))
         .route("/api/v1/doctor", get(doctor_status))
         .route("/api/v1/metrics", get(metrics_status))
@@ -150,6 +151,140 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "service": "controller", "version": env!("CARGO_PKG_VERSION")}))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSettingsRequest {
+    agent_daily_call_limit: i64,
+    agent_monthly_call_limit: i64,
+    agent_monthly_cost_limit_microusd: i64,
+}
+
+async fn settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let daily_limit = effective_i64_setting(
+        &state,
+        "agent_daily_call_limit",
+        state.config.agent_daily_call_limit,
+    )
+    .await?;
+    let monthly_limit = effective_i64_setting(
+        &state,
+        "agent_monthly_call_limit",
+        state.config.agent_monthly_call_limit,
+    )
+    .await?;
+    let cost_limit = effective_i64_setting(
+        &state,
+        "agent_monthly_cost_limit_microusd",
+        state.config.agent_monthly_cost_limit_microusd,
+    )
+    .await?;
+    let daily_used: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runs WHERE started_at >= datetime('now', 'start of day')",
+    )
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let monthly_used: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runs WHERE started_at >= datetime('now', 'start of month')",
+    )
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let monthly_cost: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(cost_microusd), 0) FROM agent_runs WHERE started_at >= datetime('now', 'start of month')")
+        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "agents": {
+            "supported_adapters": ["codex", "claude_code"],
+            "low_runner_count": state.config.low_agent_endpoints.len(),
+            "high_runner_configured": !state.config.high_agent_endpoint.is_empty(),
+            "configuration_source": "docker_compose_environment_and_secrets",
+            "api_keys_exposed": false
+        },
+        "budget": {
+            "agent_daily_call_limit": daily_limit,
+            "agent_monthly_call_limit": monthly_limit,
+            "agent_monthly_cost_limit_microusd": cost_limit,
+            "daily_used": daily_used,
+            "monthly_used": monthly_used,
+            "monthly_cost_microusd": monthly_cost
+        },
+        "notifications": {
+            "webhook_configured": state.config.webhook_url.is_some(),
+            "ntfy_configured": state.config.ntfy_url.is_some()
+        },
+        "repository": {
+            "name": state.config.repository_name,
+            "base_url": state.config.repository_base_url,
+            "publisher_compatibility_days": 30
+        }
+    })))
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateSettingsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let values = [
+        ("agent_daily_call_limit", request.agent_daily_call_limit),
+        ("agent_monthly_call_limit", request.agent_monthly_call_limit),
+        (
+            "agent_monthly_cost_limit_microusd",
+            request.agent_monthly_cost_limit_microusd,
+        ),
+    ];
+    if values
+        .iter()
+        .any(|(_, value)| !(0..=1_000_000_000).contains(value))
+    {
+        return Err(ApiError::bad_request(
+            "INVALID_AGENT_BUDGET",
+            "Agent 调用与成本限制必须位于 0 到 1000000000",
+        ));
+    }
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    for (key, value) in values {
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
+            .bind(key).bind(json!(value).to_string()).bind(Utc::now())
+            .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    }
+    append_event_in_transaction(
+        &mut transaction,
+        "system_settings",
+        "agent_budget",
+        "agent_budget_changed",
+        json!({
+            "daily": request.agent_daily_call_limit,
+            "monthly": request.agent_monthly_call_limit,
+            "monthly_cost_microusd": request.agent_monthly_cost_limit_microusd
+        }),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    settings(State(state), headers).await
+}
+
+pub(crate) async fn effective_i64_setting(
+    state: &AppState,
+    key: &str,
+    default: i64,
+) -> Result<i64, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value_json FROM system_settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&state.database)
+            .await
+            .map_err(ApiError::internal)?;
+    value.map_or(Ok(default), |value| {
+        serde_json::from_str(&value).map_err(ApiError::internal)
+    })
 }
 
 async fn client_bootstrap(
@@ -1161,6 +1296,28 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(requirements).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        let update_settings = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/settings")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "agent_daily_call_limit": 12,
+                    "agent_monthly_call_limit": 120,
+                    "agent_monthly_cost_limit_microusd": 3400
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(update_settings).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["budget"]["agent_daily_call_limit"], 12);
+        assert_eq!(body["agents"]["api_keys_exposed"], false);
 
         let profile = Request::builder()
             .method("POST")

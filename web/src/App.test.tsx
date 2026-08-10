@@ -66,4 +66,21 @@ describe("AURsmith 控制台", () => {
     fireEvent.click(await screen.findByRole("button", { name: "禁用 check()" }));
     expect(await screen.findByText("已显式禁用")).toBeInTheDocument();
   });
+
+  it("设置页显示 Agent 预算且不回显密钥", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/setup/status") ? { initialized: true }
+        : url.endsWith("/auth/me") ? { id: "admin-id", username: "admin" }
+          : url.endsWith("/settings") ? { agents: { supported_adapters: ["codex", "claude_code"], low_runner_count: 3, high_runner_configured: true, configuration_source: "docker_compose_environment_and_secrets", api_keys_exposed: false }, budget: { agent_daily_call_limit: 300, agent_monthly_call_limit: 3000, agent_monthly_cost_limit_microusd: 5000000, daily_used: 1, monthly_used: 2, monthly_cost_microusd: 3 }, notifications: { webhook_configured: false, ntfy_configured: false }, repository: { name: "aursmith", base_url: "https://repo.test", publisher_compatibility_days: 30 } }
+            : url.endsWith("/client-bootstrap") ? { repository_config: "[aursmith]", gpg_fingerprint: "ABCD", gpg_key_url: "https://repo.test/key", commands: [], warnings: [] }
+              : { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /设置/ }));
+    expect(await screen.findByText("API key 不可见")).toBeInTheDocument();
+    expect(screen.getByLabelText("每日调用上限")).toHaveValue(300);
+    expect(screen.queryByText(/sk-/)).not.toBeInTheDocument();
+  });
 });

@@ -204,3 +204,11 @@
 - 空仓库：如果清除最后一个包，Signer 为 db/files 各创建一个空 gzip tar，继续执行 GPG 签名、Manifest、原子发布和归档流程。没有 Artifact 且没有清除目标的普通空授权仍被拒绝。
 - 验证：单元测试覆盖同时清除两个 split outputs、保留其他包以及清除后为空；Signer 测试确认空数据库是可读归档。另在独立 Arch Linux 容器中，用真实 pacman 对该空数据库执行 `-Sy` 成功，随后 `-Sl aursmith` 正常返回空列表。第一次在宿主直接运行因 pacman 要求 root 被明确拒绝，改为一次性容器后通过；临时目录因 `/tmp` 不支持桌面回收站而在确认精确路径后删除。
 - 边界：本条尚未重新启动完整 Publisher/Signer Stack 执行一次带 GPG `DatabaseRequired` 的最后一包清除；已验证调度数据、签名端构造逻辑、空归档和 pacman 无签名解析，签名发布链继续依赖上一条已通过的真实 Release E2E。
+
+## 2026-08-10：设置页与运行时 Agent 预算
+
+- API：新增认证设置读写接口，只接受每日调用、每月调用和每月成本三个非负上限；更新写入 SQLite 并追加事件。返回值只包含 Runner 数量、Codex/Claude Code 支持状态、预算使用量、通知是否配置和仓库公开信息，明确 `api_keys_exposed=false`。
+- 调度：预算判定改为优先读取持久化覆盖值，而不是只读取启动环境；测试把每日上限写为 0 后确认新 Agent 调用不可用。
+- Web：设置页不再只有客户端引导，新增预算表单、当前使用量、provider 配置方式、通知和 30 天仓库兼容窗口；页面明确 provider/Base URL/API key 必须通过 Compose 与 secret 修改。前端测试打开设置页，确认预算值可见、Codex/Claude Code 状态可见且不存在类似 API key 的内容。
+- 验证：认证路由测试实际登录后 PUT 设置并核对响应中的新限额及 `api_keys_exposed=false`；Controller 33 个测试、TypeScript 检查、5 个前端测试和生产构建通过。第一次把 npm 串在仓库根目录命令后再次得到 ENOENT，随后在 `web/` 目录纠正并通过；该重复操作失误不计为验证成功。
+- 边界：设置页不热更新 Agent 容器的 provider 与 Base URL，也不接收 API key；这是刻意的 secret 边界。尚未用真实 provider key 执行模型调用，Agent 外部服务 E2E 仍未验证。

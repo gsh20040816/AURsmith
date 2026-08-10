@@ -111,9 +111,25 @@ async fn budget_available(state: &AppState) -> Result<bool, ApiError> {
     .map_err(ApiError::internal)?;
     let monthly_cost: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(cost_microusd), 0) FROM agent_runs WHERE started_at >= datetime('now', 'start of month')")
         .fetch_one(&state.database).await.map_err(ApiError::internal)?;
-    Ok(daily < state.config.agent_daily_call_limit
-        && monthly < state.config.agent_monthly_call_limit
-        && monthly_cost < state.config.agent_monthly_cost_limit_microusd)
+    let daily_limit = crate::routes::effective_i64_setting(
+        state,
+        "agent_daily_call_limit",
+        state.config.agent_daily_call_limit,
+    )
+    .await?;
+    let monthly_limit = crate::routes::effective_i64_setting(
+        state,
+        "agent_monthly_call_limit",
+        state.config.agent_monthly_call_limit,
+    )
+    .await?;
+    let monthly_cost_limit = crate::routes::effective_i64_setting(
+        state,
+        "agent_monthly_cost_limit_microusd",
+        state.config.agent_monthly_cost_limit_microusd,
+    )
+    .await?;
+    Ok(daily < daily_limit && monthly < monthly_limit && monthly_cost < monthly_cost_limit)
 }
 
 async fn invoke_runner(endpoint: &str, request: &Value) -> Result<RunnerResponse, String> {
@@ -523,8 +539,9 @@ mod tests {
 
     #[tokio::test]
     async fn exhausted_budget_is_not_available() {
-        let mut state = fixture(["approve", "approve", "approve"]).await;
-        std::sync::Arc::make_mut(&mut state.config).agent_daily_call_limit = 0;
+        let state = fixture(["approve", "approve", "approve"]).await;
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('agent_daily_call_limit', '0', ?)")
+            .bind(Utc::now()).execute(&state.database).await.unwrap();
         assert!(!budget_available(&state).await.unwrap());
     }
 }

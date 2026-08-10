@@ -41,6 +41,7 @@
 - ADR-037：Controller、Web 和仓库 Caddy 镜像必须在构建时建立固定 UID/GID 10001 的非 root 用户，并预创建需要由命名卷覆盖的可写目录。官方 Caddy 二进制自带 `cap_net_bind_service` 文件 capability，在 `cap_drop: ALL` 与 `no-new-privileges` 下会于 exec 阶段失败，因此 AURsmith 的派生镜像显式移除该 capability，并只监听容器内非特权端口；不会为方便启动而恢复 capability 或 root。
 - ADR-038：split outputs 与 `check()` 策略属于每个 Build Job 的不可变授权输入。Controller 从对应 Revision 快照取完整 outputs，而不是用户关注的子集；按包策略默认启用 `check()`，只有显式操作才冻结为禁用。Guest 必须核对实际包名集合，执行 namcap，并把 check 状态与 namcap 摘要写入 provenance，避免 UI 配置、Job 和实际 makepkg 行为彼此脱节。
 - ADR-039：清除软件包必须通过新的完整 Release 生效，禁止直接删除 hot set 或修改当前数据库。授权同时记录被移除的全部 split output 名称；当结果为空时，Signer 生成可被 pacman 读取的空 tar 数据库并正常签名。空仓库是清除最后一个包的合法状态，但没有 Artifact 且没有清除目标的授权仍失败关闭。
+- ADR-040：Agent 的调用和成本预算允许通过认证 Web API 在运行时覆盖，调度器直接读取持久化值；provider、Base URL、模型和 API key 不做热更新，继续由 Compose 环境与 Docker secret 管理。这样设置页可处理日常限额，又不会把 provider 凭据复制进 Controller 数据库或浏览器。
 
 ## 已拒绝
 

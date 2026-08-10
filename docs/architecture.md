@@ -121,6 +121,8 @@ Runner 只支持 `codex` 与 `claude_code` 两种适配器，不接受用户提�
 
 每次报告保存适配器、provider 名称、模型、CLI 版本、文件阅读范围、结构化发现、原始结构化输出、起止时间、退出状态、成本和报告摘要。API key、认证头和内部凭据不进入日志、数据库或报告。每日/月度调用次数与月度成本任一达到上限时，剩余任务进入人工队列，不会跳过审计。
 
+设置 API 只允许在登录后读取安全摘要和修改三项 Agent 预算。运行时覆盖值保存在 SQLite `system_settings`，Agent 调度每次执行前读取，因此无需重启 Controller；值为 0 表示立即停止新的自动 Agent 调用。适配器、provider、模型和 Base URL 仍由 Compose 环境固定，API key 仍只来自凭据网关 secret。设置 API 只返回 Runner 数量、支持的适配器及“是否配置”状态，绝不返回 key、认证头或 secret 路径内容。
+
 ## 无特权 Web 与控制面容器
 
 Controller 镜像在切换到 UID/GID 10001 前预创建 `/run/aursmith`，保证第一次挂载空的命名卷后仍能创建 Unix Socket；数据库、运行目录和备份目录分别使用独立卷。Web 与仓库服务使用 AURsmith 派生的 Caddy 镜像，构建时移除上游二进制的 `cap_net_bind_service` 文件 capability，并以同一固定非 root 用户运行。两者只监听 8080 等非特权端口，由宿主端口映射承担对外 80/443。

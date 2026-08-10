@@ -45,6 +45,8 @@ Controller Stack 内固定运行三个低成本 Runner、一个高成本 Runner�
 
 默认低成本层使用 Codex 和 `https://api.openai.com/v1/`，高成本层使用 Claude Code 和 `https://api.anthropic.com/`。自建兼容网关也必须使用 HTTPS；第一版不允许明文 HTTP upstream。自定义 Base URL 只配置在凭据网关，Runner 实际看到的是 `http://agent-credential-gateway:8091/low/` 或 `/high/`，且只处于 Compose 内部网络。
 
+Web 设置页可以修改每日调用数、每月调用数和每月成本上限；这三项立即作用于后续调度并写入事件日志。设置页只显示 provider 配置来源和 Runner 状态。修改适配器、provider、模型或 Base URL 后需要重新创建 Agent Stack；更新 API key 时只替换对应 secret 并重启凭据网关，不能把 key 粘贴到 Web 表单。
+
 将低成本 key 写入 `deploy/controller/secrets/low_agent_api_key`，高成本 key 写入 `deploy/controller/secrets/high_agent_api_key`，权限设为仅部署账户可读。不要把 key 写进 `.env`、Compose environment、Controller 设置、Agent prompt 或日志。凭据网关读取 secret 后删除 Runner 发送的 `Authorization`、`x-api-key`、Host 和 hop-by-hop 头，再按配置注入真实凭据；Runner 子进程中只有无权限占位令牌。
 
 Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自定义 Base URL 需要提供 Anthropic Messages API 兼容接口。provider 名称只是可追踪标签，不会自动转换 API 协议。部署 Doctor 后续阶段会对两层分别执行不含软件包内容的结构化输出探测。

@@ -220,6 +220,25 @@ export type ArchiveInventory = {
   failure_count: number;
   checked_at: string;
 };
+export type Settings = {
+  agents: {
+    supported_adapters: string[];
+    low_runner_count: number;
+    high_runner_configured: boolean;
+    configuration_source: string;
+    api_keys_exposed: false;
+  };
+  budget: {
+    agent_daily_call_limit: number;
+    agent_monthly_call_limit: number;
+    agent_monthly_cost_limit_microusd: number;
+    daily_used: number;
+    monthly_used: number;
+    monthly_cost_microusd: number;
+  };
+  notifications: { webhook_configured: boolean; ntfy_configured: boolean };
+  repository: { name: string; base_url: string; publisher_compatibility_days: number };
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -235,6 +254,9 @@ export const api = {
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   me: () => request<Session>("/api/v1/auth/me"),
   requirements: () => request<{ items: Requirement[] }>("/api/v1/requirements"),
+  settings: () => request<Settings>("/api/v1/settings"),
+  updateSettings: (budget: Pick<Settings["budget"], "agent_daily_call_limit" | "agent_monthly_call_limit" | "agent_monthly_cost_limit_microusd">) =>
+    request<Settings>("/api/v1/settings", { method: "PUT", body: JSON.stringify(budget) }),
   workers: () => request<{ items: Worker[] }>("/api/v1/workers"),
   registerWorker: (worker: {
     name: string;
