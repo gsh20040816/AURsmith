@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/release-batches",
             get(crate::packages::list_batches),
         )
+        .route("/api/v1/releases", get(crate::packages::list_releases))
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -725,6 +726,8 @@ mod tests {
             agent_daily_call_limit: 300,
             agent_monthly_call_limit: 3000,
             agent_monthly_cost_limit_microusd: 5_000_000,
+            repository_name: "aursmith".into(),
+            source_git_commit: "test".into(),
         };
         router(AppState::new(
             database,

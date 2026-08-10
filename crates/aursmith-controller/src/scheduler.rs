@@ -1,14 +1,14 @@
 use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
 use aursmith_protocol::{
-    DependencyInput, DependencySource, GuestResult, JobKind, JobSpec, ResourceLimits,
-    SignedEnvelope,
+    ArtifactRecord, DependencyInput, DependencySource, GuestResult, JobKind, JobSpec,
+    ReleaseAuthorization, ResourceLimits, SignedEnvelope,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
 
@@ -62,8 +62,204 @@ pub fn spawn(state: AppState) {
             if let Err(error) = dispatch_transfer_one(&state).await {
                 tracing::warn!(%error, "Artifact 传输调度失败");
             }
+            if let Err(error) = dispatch_release_one(&state).await {
+                tracing::warn!(%error, "Release 发布调度失败");
+            }
         }
     });
+}
+
+async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
+    let pending = sqlx::query("SELECT release_authorizations.release_id, release_authorizations.state, release_authorizations.envelope_json, release_authorizations.attempt_count, workers.endpoint FROM release_authorizations JOIN workers ON workers.id = release_authorizations.publisher_worker_id WHERE release_authorizations.state IN ('issued', 'awaiting_signer') ORDER BY release_authorizations.updated_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    if let Some(row) = pending {
+        let release_id: String = row.get("release_id");
+        let authorization_state: String = row.get("state");
+        let endpoint: String = row.get("endpoint");
+        if authorization_state == "issued" {
+            let envelope: SignedEnvelope =
+                serde_json::from_str(row.get("envelope_json")).map_err(ApiError::internal)?;
+            match transport::authorize_release(&state.config, &endpoint, &envelope).await {
+                Ok(_) => {
+                    sqlx::query("UPDATE release_authorizations SET state = 'awaiting_signer', last_error = NULL, updated_at = ? WHERE release_id = ?")
+                        .bind(Utc::now()).bind(release_id).execute(&state.database).await.map_err(ApiError::internal)?;
+                }
+                Err(error) => {
+                    let attempts: i64 = row.get("attempt_count");
+                    let terminal = attempts + 1 >= 3;
+                    sqlx::query("UPDATE release_authorizations SET state = CASE WHEN ? THEN 'failed' ELSE state END, attempt_count = attempt_count + 1, last_error = ?, updated_at = ? WHERE release_id = ?")
+                        .bind(terminal).bind(error.to_string()).bind(Utc::now()).bind(&release_id)
+                        .execute(&state.database).await.map_err(ApiError::internal)?;
+                    if terminal {
+                        fail_release(state, &release_id, &error.to_string()).await?;
+                    }
+                }
+            }
+        } else {
+            match transport::query_release(&state.config, &endpoint, &release_id).await {
+                Ok(reply) if reply.data["state"].as_str() == Some("published") => {
+                    let manifest_sha256 = reply.data["manifest_sha256"]
+                        .as_str()
+                        .filter(|value| value.len() == 64)
+                        .ok_or_else(|| {
+                            ApiError::internal("Publisher 没有返回有效 Release Manifest 摘要")
+                        })?;
+                    let mut transaction =
+                        state.database.begin().await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE releases SET state = 'committed', manifest_sha256 = ?, committed_at = ? WHERE id = ?")
+                        .bind(manifest_sha256).bind(Utc::now()).bind(&release_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE release_authorizations SET state = 'published', last_error = NULL, updated_at = ? WHERE release_id = ?")
+                        .bind(Utc::now()).bind(&release_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    sqlx::query("UPDATE release_batches SET state = 'published', current_release_id = ?, failure_reason = NULL, updated_at = ? WHERE id = (SELECT batch_id FROM releases WHERE id = ?)")
+                        .bind(&release_id).bind(Utc::now()).bind(&release_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    transaction.commit().await.map_err(ApiError::internal)?;
+                }
+                Ok(reply) if reply.data["state"].as_str() == Some("failed") => {
+                    fail_release(
+                        state,
+                        &release_id,
+                        reply.data["last_error"]
+                            .as_str()
+                            .unwrap_or("Publisher 发布失败"),
+                    )
+                    .await?;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    sqlx::query("UPDATE release_authorizations SET last_error = ?, updated_at = ? WHERE release_id = ?")
+                        .bind(error.to_string()).bind(Utc::now()).bind(release_id).execute(&state.database).await.map_err(ApiError::internal)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let batch = sqlx::query("SELECT id FROM release_batches WHERE state = 'artifacts_ready' AND NOT EXISTS (SELECT 1 FROM releases WHERE releases.batch_id = release_batches.id) ORDER BY created_at LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+    let publisher = sqlx::query("SELECT id, writer_epoch FROM workers WHERE role = 'publisher' AND state = 'online' ORDER BY name LIMIT 1")
+        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
+    let Some(publisher) = publisher else {
+        return Ok(());
+    };
+    let batch_id: String = batch.get("id");
+    let artifact_rows = sqlx::query("SELECT artifacts.path, artifacts.sha256, artifacts.size, artifacts.package_name, artifacts.package_version, artifacts.architecture FROM artifacts JOIN jobs ON jobs.id = artifacts.job_id WHERE jobs.batch_id = ? AND jobs.kind = 'build' AND jobs.status = 'succeeded' ORDER BY artifacts.path")
+        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    if artifact_rows.is_empty() {
+        return Err(ApiError::conflict(
+            "ARTIFACTS_MISSING",
+            "ReleaseBatch 没有可发布 Artifact",
+        ));
+    }
+    let previous_rows = sqlx::query("SELECT artifacts.path, artifacts.sha256, artifacts.size, artifacts.package_name, artifacts.package_version, artifacts.architecture FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 JOIN releases ON releases.id = release_artifacts.release_id WHERE releases.id = (SELECT id FROM releases WHERE state = 'committed' ORDER BY committed_at DESC LIMIT 1) ORDER BY artifacts.path")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let parse_artifact = |row: sqlx::sqlite::SqliteRow| -> Result<ArtifactRecord, ApiError> {
+        Ok(ArtifactRecord {
+            path: row.get("path"),
+            sha256: row.get("sha256"),
+            size: u64::try_from(row.get::<i64, _>("size")).map_err(ApiError::internal)?,
+            package_name: row.get("package_name"),
+            package_version: row.get("package_version"),
+            architecture: row.get("architecture"),
+        })
+    };
+    let previous_artifacts = previous_rows
+        .into_iter()
+        .map(&parse_artifact)
+        .collect::<Result<Vec<_>, _>>()?;
+    let changed_artifacts = artifact_rows
+        .into_iter()
+        .map(parse_artifact)
+        .collect::<Result<Vec<_>, _>>()?;
+    let artifacts = merge_release_artifacts(previous_artifacts, changed_artifacts);
+    let revision_sha256s = sqlx::query_scalar::<_, String>("SELECT DISTINCT revisions.input_sha256 FROM revisions JOIN jobs ON jobs.revision_id = revisions.id WHERE jobs.batch_id = ? ORDER BY revisions.input_sha256")
+        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let audit_report_sha256s = sqlx::query_scalar::<_, String>("SELECT DISTINCT audit_decisions.report_sha256 FROM audit_decisions JOIN jobs ON jobs.revision_id = audit_decisions.revision_id WHERE jobs.batch_id = ? ORDER BY audit_decisions.report_sha256")
+        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let release_id = Uuid::new_v4();
+    let writer_epoch =
+        u64::try_from(publisher.get::<i64, _>("writer_epoch")).map_err(ApiError::internal)?;
+    let now = Utc::now();
+    let authorization = ReleaseAuthorization {
+        release_id,
+        batch_id: Uuid::parse_str(&batch_id).map_err(ApiError::internal)?,
+        writer_epoch,
+        repository_name: state.config.repository_name.clone(),
+        source_git_commit: state.config.source_git_commit.clone(),
+        revision_sha256s,
+        audit_report_sha256s,
+        artifacts,
+        issued_at: now,
+        expires_at: now + Duration::hours(1),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.release_authorization",
+        &authorization,
+        &state.signing_key,
+    )
+    .map_err(ApiError::internal)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO releases(id, batch_id, state, manifest_sha256, source_git_commit, writer_epoch, created_at) VALUES (?, ?, 'authorizing', ?, ?, ?, ?)")
+        .bind(release_id.to_string()).bind(&batch_id).bind(format!("pending:{release_id}"))
+        .bind(&state.config.source_git_commit).bind(i64::try_from(writer_epoch).map_err(ApiError::internal)?).bind(now)
+        .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO release_authorizations(release_id, publisher_worker_id, state, envelope_json, expires_at, created_at, updated_at) VALUES (?, ?, 'issued', ?, ?, ?, ?)")
+        .bind(release_id.to_string()).bind(publisher.get::<String,_>("id"))
+        .bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+        .bind(authorization.expires_at).bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    for artifact in &authorization.artifacts {
+        sqlx::query("INSERT INTO release_artifacts(release_id, artifact_sha256) VALUES (?, ?)")
+            .bind(release_id.to_string())
+            .bind(&artifact.sha256)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    sqlx::query("UPDATE release_batches SET state = 'publishing', updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(batch_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn fail_release(state: &AppState, release_id: &str, error: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE releases SET state = 'failed' WHERE id = ?")
+        .bind(release_id)
+        .execute(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE release_authorizations SET state = 'failed', last_error = ?, updated_at = ? WHERE release_id = ?")
+        .bind(error).bind(Utc::now()).bind(release_id).execute(&state.database).await.map_err(ApiError::internal)?;
+    sqlx::query("UPDATE release_batches SET state = 'publish_failed', failure_reason = ?, updated_at = ? WHERE id = (SELECT batch_id FROM releases WHERE id = ?)")
+        .bind(error).bind(Utc::now()).bind(release_id).execute(&state.database).await.map_err(ApiError::internal)?;
+    let fingerprint = format!("release-publish-failed:{release_id}");
+    sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
+        .bind(Uuid::new_v4().to_string()).bind(fingerprint).bind("Release 发布失败")
+        .bind(json!({"release_id": release_id, "error": error}).to_string()).bind(Utc::now())
+        .execute(&state.database).await.map_err(ApiError::internal)?;
+    Ok(())
+}
+
+fn merge_release_artifacts(
+    previous: Vec<ArtifactRecord>,
+    changed: Vec<ArtifactRecord>,
+) -> Vec<ArtifactRecord> {
+    let mut complete = BTreeMap::new();
+    for artifact in previous.into_iter().chain(changed) {
+        complete.insert(
+            artifact
+                .package_name
+                .clone()
+                .unwrap_or_else(|| artifact.path.clone()),
+            artifact,
+        );
+    }
+    complete.into_values().collect()
 }
 
 async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
@@ -648,4 +844,32 @@ async fn load_batch_dependency_attempts(
         .into_iter()
         .map(|value| Uuid::parse_str(&value).map_err(ApiError::internal))
         .collect()
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    fn artifact(name: &str, version: &str) -> ArtifactRecord {
+        ArtifactRecord {
+            path: format!("{name}-{version}-x86_64.pkg.tar.zst"),
+            sha256: format!("{version:0>64}"),
+            size: 1,
+            package_name: Some(name.into()),
+            package_version: Some(version.into()),
+            architecture: Some("x86_64".into()),
+        }
+    }
+
+    #[test]
+    fn complete_release_keeps_unchanged_packages_and_replaces_changed_package() {
+        let merged = merge_release_artifacts(
+            vec![artifact("alpha", "1"), artifact("beta", "1")],
+            vec![artifact("alpha", "2")],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].package_name.as_deref(), Some("alpha"));
+        assert_eq!(merged[0].package_version.as_deref(), Some("2"));
+        assert_eq!(merged[1].package_name.as_deref(), Some("beta"));
+    }
 }

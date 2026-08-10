@@ -19,6 +19,8 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 每个 Worker 首次启动时在 SQLite Journal 中生成持久化实例 UUID，Controller 注册前必须通过固定 host key 探测并采用该 UUID；名称、角色、协议、Publisher writer epoch 或后续心跳 UUID 不一致时标记为 incompatible。TransferCapability 绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限，Publisher 必须核对本地配置的 writer epoch。Builder 把清单中逐个复验的文件复制到只读 export 目录；SSH forced command 只接受固定 rsync sender 参数和 `/jobs/transfers/<capability UUID>`。Publisher 通过静态 UUID→SSH 端点映射和独立只读拉取密钥直接 rsync，落入 partial 目录，全部摘要复验后才 rename 为 landing。Controller 不转发包字节。
 
+ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
+
 ## 状态模型
 
 `Revision`、`Job`、`Attempt`、`Artifact`、`Release` 和 `ArchiveCopy` 是相互独立的聚合。已提交的 Release 不会因为 ArchiveCopy 等待或失败而退回未发布状态。任务采用至少一次投递，Attempt token 用于保证结果接收幂等并拒绝迟到结果。

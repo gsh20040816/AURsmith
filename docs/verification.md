@@ -50,3 +50,13 @@
 - 接管：文件先进入 `.9108d8ad-7931-4398-a405-7eceae3e35fa.partial`，完整核对文件集合、普通文件类型、大小和摘要后才原子改名到 landing 目录。Worker 返回 `IMPORT_VERIFIED`，文件 SHA-256 为 `744859e3eceb7675962040dc91150b1cef219936e1ad4a11bec5d630119ee24b`，与原 KVM Artifact 一致。
 - 实际发现并修复：rsync 3.4.4 调用自定义远程 Shell 时使用 `-l 用户 主机` 参数形态；包装器最初安全失败关闭，随后改为显式识别该形态并继续严格拒绝未知远端命令。
 - 边界：尚未覆盖 Controller 定时调度实际签发 Capability，也未覆盖 Publisher 调用 Signer、公开 hot set 原子切换和 Archiver Receipt。
+
+## 2026-08-10：Publisher 与离线 Signer 原子发布
+
+- 输入：复用 KVM 构建并经 TransferCapability 落地的真实 Arch 包；测试 Controller 分别签发两个完整 ReleaseAuthorization，均绑定 writer epoch、Artifact 元数据、Revision/Audit 摘要和源码提交。
+- 隔离：Signer 只读取 inbox、写 signed output，并使用测试 GPG 私钥；Publisher 只导入对应公钥，未读取私钥。Signer 使用官方 `repo-add` 生成 `.db.tar.gz` 和 `.files.tar.gz`，两者、软件包及 Release Manifest 均生成并验证分离签名。
+- 首次发布：Release `9ee7eedf-6fc2-4715-b624-95d6c9750f6d` 返回 `published`，Manifest SHA-256 为 `b6141c81d2d98e7f69ce97e9247161fbbc1bf0efd277bfa804cedd13f6ba7b98`。Publisher 先提交不可变 Release 目录和包 hot set，再依次切换数据库签名、files 数据库，最后原子切换 `aursmith.db`。
+- 再次发布：相同软件包进入 Release `ba886982-3484-47e4-9e06-caed2f5d5955`，Manifest SHA-256 为 `cd443f23412dc70a73ce1f256e4a7f39e0cd50df9d2bee1bdf16b7a25abfaef9`。包签名因重新签署可能不同，Publisher 复验并保留已公开的有效旧签名；数据库链接成功指向新 Release，前一 Release 目录仍完整保留。
+- 实际覆盖：真实 `gpg --verify`、`repo-add`、Publisher Journal、Signer inbox 原子接管、签名输出复验、同名包摘要冲突保护、Release 目录持久化和数据库最后切换。
+- 容器：修改后的 Publisher Worker 与 Signer 镜像均通过实际 Docker 构建；Publisher Worker 镜像包含验签所需的 GnuPG，Compose 安全检查确认它只挂载公钥，而断网 Signer 只挂载私钥且不挂载公开仓库。
+- 边界：尚未用独立 Arch 客户端执行 `pacman -Syu`，也未完成服务端回滚、30 天兼容窗口清理和 Archiver Receipt。

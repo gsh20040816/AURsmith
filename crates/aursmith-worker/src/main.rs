@@ -3,7 +3,10 @@ mod builder;
 
 use anyhow::{Context, bail};
 use aursmith_domain::{JobStatus, WorkerRole, WorkerState};
-use aursmith_protocol::{JobSpec, PROTOCOL_MAJOR, SignedEnvelope, TransferCapability};
+use aursmith_protocol::{
+    JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, SignedEnvelope,
+    TransferCapability,
+};
 use chrono::Utc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -68,6 +71,22 @@ struct Cli {
     landing_dir: PathBuf,
     #[arg(long, env = "AURSMITH_WRITER_EPOCH", default_value_t = 0)]
     writer_epoch: u64,
+    #[arg(long, env = "AURSMITH_SIGNER_INBOX", default_value = "/signer-inbox")]
+    signer_inbox: PathBuf,
+    #[arg(long, env = "AURSMITH_SIGNER_OUTPUT", default_value = "/signer-output")]
+    signer_output: PathBuf,
+    #[arg(long, env = "AURSMITH_REPOSITORY_DIR", default_value = "/repository")]
+    repository_dir: PathBuf,
+    #[arg(long, env = "AURSMITH_REPOSITORY_ARCH", default_value = "x86_64")]
+    repository_arch: String,
+    #[arg(long, env = "AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE")]
+    repository_gpg_public_key_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "AURSMITH_PUBLISHER_GPG_HOME",
+        default_value = "/run/aursmith-gpg"
+    )]
+    publisher_gpg_home: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -100,6 +119,11 @@ struct Worker {
     transfer_ssh_known_hosts_file: Option<PathBuf>,
     landing_dir: PathBuf,
     writer_epoch: u64,
+    signer_inbox: PathBuf,
+    signer_output: PathBuf,
+    repository_dir: PathBuf,
+    repository_arch: String,
+    publisher_gpg_home: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +141,8 @@ enum WorkerCommand {
     AuthorizeExport { envelope: SignedEnvelope },
     ResolveExport { capability_id: String },
     AuthorizeImport { envelope: SignedEnvelope },
+    AuthorizeRelease { envelope: SignedEnvelope },
+    QueryRelease { release_id: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +210,11 @@ async fn main() -> anyhow::Result<()> {
         transfer_ssh_known_hosts_file: cli.transfer_ssh_known_hosts_file,
         landing_dir: cli.landing_dir,
         writer_epoch: cli.writer_epoch,
+        signer_inbox: cli.signer_inbox,
+        signer_output: cli.signer_output,
+        repository_dir: cli.repository_dir,
+        repository_arch: cli.repository_arch,
+        publisher_gpg_home: cli.publisher_gpg_home,
     });
     if worker.builder.is_some() {
         builder::spawn(
@@ -191,6 +222,14 @@ async fn main() -> anyhow::Result<()> {
             worker.trusted_controller_key.clone(),
             worker.builder.clone().expect("已检查 Builder runtime"),
         );
+    }
+    if worker.role == WorkerRole::Publisher {
+        let public_key = cli
+            .repository_gpg_public_key_file
+            .as_deref()
+            .context("Publisher 必须配置仓库 GPG 公钥")?;
+        initialize_publisher_gpg(&worker.publisher_gpg_home, public_key)?;
+        spawn_publisher(worker.clone());
     }
     prepare_socket(&cli.socket).await?;
     let listener = UnixListener::bind(&cli.socket)
@@ -228,6 +267,11 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS transfer_imports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS publisher_releases(release_id TEXT PRIMARY KEY, writer_epoch INTEGER NOT NULL, envelope_sha256 TEXT NOT NULL, authorization_json TEXT NOT NULL, state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
     )
     .execute(&pool)
     .await?;
@@ -306,6 +350,8 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
             resolve_export(worker, &capability_id).await
         }
         WorkerCommand::AuthorizeImport { envelope } => authorize_import(worker, envelope).await,
+        WorkerCommand::AuthorizeRelease { envelope } => authorize_release(worker, envelope).await,
+        WorkerCommand::QueryRelease { release_id } => query_release(worker, &release_id).await,
     }
 }
 
@@ -600,6 +646,474 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         ),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
+}
+
+async fn authorize_release(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以提交 Release");
+    }
+    if envelope.verifying_key != worker.trusted_controller_key {
+        return WorkerResponse::error("UNTRUSTED_CONTROLLER", "ReleaseAuthorization 签名无效");
+    }
+    let authorization: ReleaseAuthorization =
+        match envelope.verify("aursmith.release_authorization") {
+            Ok(value) => value,
+            Err(error) => return WorkerResponse::error("INVALID_RELEASE", error.to_string()),
+        };
+    if authorization.writer_epoch != worker.writer_epoch
+        || authorization.expires_at < Utc::now()
+        || authorization.artifacts.is_empty()
+    {
+        return WorkerResponse::error(
+            "INVALID_RELEASE",
+            "ReleaseAuthorization 已过期、为空或 writer epoch 不匹配",
+        );
+    }
+    if let Err(error) = validate_release_authorization_for_publisher(&authorization) {
+        return WorkerResponse::error("INVALID_RELEASE", error.to_string());
+    }
+    let release_id = authorization.release_id.to_string();
+    let existing =
+        sqlx::query("SELECT envelope_sha256, state FROM publisher_releases WHERE release_id = ?")
+            .bind(&release_id)
+            .fetch_optional(&worker.database)
+            .await;
+    match existing {
+        Ok(Some(row)) if row.get::<String, _>("envelope_sha256") == envelope.payload_sha256 => {
+            return WorkerResponse::ok(
+                "IDEMPOTENT_RELEASE",
+                serde_json::json!({"release_id": release_id, "state": row.get::<String,_>("state")}),
+            );
+        }
+        Ok(Some(_)) => {
+            return WorkerResponse::error("RELEASE_CONFLICT", "同一 Release ID 已绑定其他授权");
+        }
+        Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+        Ok(None) => {}
+    }
+    let staging = worker.signer_inbox.join(format!(".{release_id}.staging"));
+    let committed = worker.signer_inbox.join(&release_id);
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    if committed.exists() {
+        let recovered: Result<SignedEnvelope, _> =
+            std::fs::read(committed.join("authorization.json"))
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(std::io::Error::other));
+        if !matches!(recovered.as_ref(), Ok(value) if value.payload_sha256 == envelope.payload_sha256)
+        {
+            return WorkerResponse::error("RELEASE_CONFLICT", "Signer inbox 已存在其他授权");
+        }
+        let now = Utc::now();
+        let inserted = sqlx::query("INSERT INTO publisher_releases(release_id, writer_epoch, envelope_sha256, authorization_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'awaiting_signer', ?, ?)")
+            .bind(&release_id).bind(i64::try_from(authorization.writer_epoch).unwrap_or(i64::MAX))
+            .bind(&envelope.payload_sha256).bind(serde_json::to_string(&envelope).unwrap_or_default())
+            .bind(now).bind(now).execute(&worker.database).await;
+        return match inserted {
+            Ok(_) => WorkerResponse::ok(
+                "RELEASE_RECOVERED",
+                serde_json::json!({"release_id": release_id}),
+            ),
+            Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+        };
+    }
+    if let Err(error) = materialize_release_inbox(worker, &authorization, &envelope, &staging).await
+    {
+        let _ = std::fs::remove_dir_all(&staging);
+        return WorkerResponse::error("RELEASE_INPUT_INVALID", error.to_string());
+    }
+    if let Err(error) = std::fs::rename(&staging, &committed) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return WorkerResponse::error("SIGNER_INBOX_ERROR", error.to_string());
+    }
+    let now = Utc::now();
+    let inserted = sqlx::query("INSERT INTO publisher_releases(release_id, writer_epoch, envelope_sha256, authorization_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'awaiting_signer', ?, ?)")
+        .bind(&release_id).bind(i64::try_from(authorization.writer_epoch).unwrap_or(i64::MAX))
+        .bind(&envelope.payload_sha256).bind(serde_json::to_string(&envelope).unwrap_or_default())
+        .bind(now).bind(now).execute(&worker.database).await;
+    match inserted {
+        Ok(_) => WorkerResponse::ok(
+            "RELEASE_QUEUED",
+            serde_json::json!({"release_id": release_id}),
+        ),
+        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    }
+}
+
+fn validate_release_authorization_for_publisher(
+    authorization: &ReleaseAuthorization,
+) -> anyhow::Result<()> {
+    let mut paths = std::collections::BTreeSet::new();
+    for artifact in &authorization.artifacts {
+        aursmith_protocol::validate_relative_path(&artifact.path)?;
+        let file_name = Path::new(&artifact.path)
+            .file_name()
+            .context("Artifact 缺少文件名")?
+            .to_string_lossy();
+        if file_name != artifact.path
+            || !paths.insert(artifact.path.clone())
+            || !artifact.path.contains(".pkg.tar.")
+            || artifact.sha256.len() != 64
+            || artifact.size == 0
+            || artifact.package_name.is_none()
+            || artifact.package_version.is_none()
+            || artifact.architecture.is_none()
+        {
+            bail!("Release Artifact 元数据无效：{}", artifact.path);
+        }
+    }
+    Ok(())
+}
+
+async fn materialize_release_inbox(
+    worker: &Worker,
+    authorization: &ReleaseAuthorization,
+    envelope: &SignedEnvelope,
+    staging: &Path,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(staging)?;
+    let imports = sqlx::query(
+        "SELECT directory, manifest_json FROM transfer_imports WHERE state = 'verified'",
+    )
+    .fetch_all(&worker.database)
+    .await?;
+    let mut used_paths = std::collections::BTreeSet::new();
+    for artifact in &authorization.artifacts {
+        aursmith_protocol::validate_relative_path(&artifact.path)?;
+        if !used_paths.insert(artifact.path.clone()) {
+            bail!("Release 包含重复 Artifact 路径：{}", artifact.path);
+        }
+        let mut source = None;
+        for row in &imports {
+            let manifest: Vec<aursmith_protocol::ManifestEntry> =
+                serde_json::from_str(row.get("manifest_json"))?;
+            if let Some(entry) = manifest.iter().find(|entry| {
+                entry.sha256 == artifact.sha256
+                    && entry.size == artifact.size
+                    && entry.path == artifact.path
+            }) {
+                source = Some(PathBuf::from(row.get::<String, _>("directory")).join(&entry.path));
+                break;
+            }
+        }
+        if source.is_none() {
+            let hot = worker
+                .repository_dir
+                .join(&worker.repository_arch)
+                .join(&artifact.path);
+            if hot.is_file() {
+                source = Some(hot);
+            }
+        }
+        let source = source.context("Release Artifact 没有已验证的 TransferCapability")?;
+        let metadata = std::fs::symlink_metadata(&source)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != artifact.size
+            || file_sha256(&source)? != artifact.sha256
+        {
+            bail!("Release Artifact 落地内容不匹配：{}", artifact.path);
+        }
+        let target = staging.join(&artifact.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, target)?;
+    }
+    std::fs::write(
+        staging.join("authorization.json"),
+        serde_json::to_vec(envelope)?,
+    )?;
+    Ok(())
+}
+
+async fn query_release(worker: &Worker, release_id: &str) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher || uuid::Uuid::parse_str(release_id).is_err() {
+        return WorkerResponse::error("INVALID_RELEASE", "Release ID 或 Worker 角色无效");
+    }
+    match sqlx::query("SELECT state, manifest_sha256, last_error, updated_at FROM publisher_releases WHERE release_id = ?")
+        .bind(release_id).fetch_optional(&worker.database).await
+    {
+        Ok(Some(row)) => WorkerResponse::ok("RELEASE_STATUS", serde_json::json!({
+            "release_id": release_id,
+            "state": row.get::<String,_>("state"),
+            "manifest_sha256": row.get::<Option<String>,_>("manifest_sha256"),
+            "last_error": row.get::<Option<String>,_>("last_error"),
+            "updated_at": row.get::<String,_>("updated_at"),
+        })),
+        Ok(None) => WorkerResponse::error("RELEASE_NOT_FOUND", "Release 不存在"),
+        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    }
+}
+
+fn initialize_publisher_gpg(home: &Path, public_key: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(home)?;
+    let metadata = std::fs::symlink_metadata(public_key)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 1024 * 1024 {
+        bail!("仓库 GPG 公钥类型或大小无效");
+    }
+    let status = std::process::Command::new("/usr/bin/gpg")
+        .args([
+            "--homedir",
+            home.to_string_lossy().as_ref(),
+            "--batch",
+            "--import",
+        ])
+        .arg(public_key)
+        .stdin(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        bail!("无法导入仓库 GPG 公钥");
+    }
+    Ok(())
+}
+
+fn spawn_publisher(worker: Arc<Worker>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Err(error) = reconcile_publisher_one(&worker).await {
+                tracing::warn!(%error, "Publisher 对账失败");
+            }
+        }
+    });
+}
+
+async fn reconcile_publisher_one(worker: &Worker) -> anyhow::Result<()> {
+    let row = sqlx::query("SELECT release_id, authorization_json FROM publisher_releases WHERE state = 'awaiting_signer' ORDER BY created_at LIMIT 1")
+        .fetch_optional(&worker.database).await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let release_id: String = row.get("release_id");
+    let signed = worker.signer_output.join(&release_id);
+    if !signed.is_dir() {
+        return Ok(());
+    }
+    let envelope: SignedEnvelope = serde_json::from_str(row.get("authorization_json"))?;
+    let authorization: ReleaseAuthorization = envelope.verify("aursmith.release_authorization")?;
+    match verify_and_publish_release(worker, &authorization, &envelope, &signed) {
+        Ok(manifest_sha256) => {
+            sqlx::query("UPDATE publisher_releases SET state = 'published', manifest_sha256 = ?, last_error = NULL, updated_at = ? WHERE release_id = ?")
+                .bind(manifest_sha256).bind(Utc::now()).bind(release_id).execute(&worker.database).await?;
+        }
+        Err(error) => {
+            sqlx::query("UPDATE publisher_releases SET state = 'failed', last_error = ?, updated_at = ? WHERE release_id = ?")
+                .bind(error.to_string()).bind(Utc::now()).bind(release_id).execute(&worker.database).await?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_and_publish_release(
+    worker: &Worker,
+    authorization: &ReleaseAuthorization,
+    envelope: &SignedEnvelope,
+    signed: &Path,
+) -> anyhow::Result<String> {
+    if authorization.writer_epoch != worker.writer_epoch {
+        bail!("签名完成后 writer epoch 已变化");
+    }
+    let manifest_path = signed.join("release-manifest.json");
+    verify_gpg_signature(
+        &worker.publisher_gpg_home,
+        &manifest_path,
+        &signed.join("release-manifest.json.sig"),
+    )?;
+    let manifest_bytes = std::fs::read(&manifest_path)?;
+    let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)?;
+    if manifest.release_id != authorization.release_id
+        || manifest.batch_id != authorization.batch_id
+        || manifest.writer_epoch != authorization.writer_epoch
+        || manifest.repository_name != authorization.repository_name
+        || manifest.source_git_commit != authorization.source_git_commit
+        || manifest.artifacts != authorization.artifacts
+    {
+        bail!("ReleaseManifest 与 Controller 授权不一致");
+    }
+    let database_name = format!("{}.db.tar.gz", authorization.repository_name);
+    let files_name = format!("{}.files.tar.gz", authorization.repository_name);
+    if manifest.repository_database.path != database_name
+        || manifest.repository_files.path != files_name
+    {
+        bail!("ReleaseManifest 仓库数据库名称无效");
+    }
+    for entry in [&manifest.repository_database, &manifest.repository_files] {
+        verify_signed_entry(worker, signed, entry)?;
+    }
+    let mut package_names = std::collections::BTreeSet::new();
+    for artifact in &authorization.artifacts {
+        aursmith_protocol::validate_relative_path(&artifact.path)?;
+        let file_name = Path::new(&artifact.path)
+            .file_name()
+            .context("Artifact 缺少文件名")?
+            .to_string_lossy()
+            .into_owned();
+        if artifact.path != file_name || !package_names.insert(file_name.clone()) {
+            bail!("Release Artifact 必须使用唯一的纯文件名");
+        }
+        verify_signed_entry(
+            worker,
+            signed,
+            &aursmith_protocol::ManifestEntry {
+                path: file_name,
+                sha256: artifact.sha256.clone(),
+                size: artifact.size,
+            },
+        )?;
+    }
+
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
+    let releases_root = arch_root.join("releases");
+    let release_id = authorization.release_id.to_string();
+    let committed = releases_root.join(&release_id);
+    let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+    if committed.exists() {
+        let existing = committed.join("release-manifest.json");
+        if file_sha256(&existing)? == manifest_sha256 {
+            return Ok(manifest_sha256);
+        }
+        bail!("公开 Release ID 已存在不同 Manifest");
+    }
+    let staging = releases_root.join(format!(".{release_id}.staging"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::create_dir_all(&staging)?;
+    let mut release_files = vec![
+        database_name.clone(),
+        format!("{database_name}.sig"),
+        files_name.clone(),
+        format!("{files_name}.sig"),
+        "release-manifest.json".into(),
+        "release-manifest.json.sig".into(),
+    ];
+    for name in &package_names {
+        release_files.push(name.clone());
+        release_files.push(format!("{name}.sig"));
+    }
+    for name in &release_files {
+        copy_regular_synced(&signed.join(name), &staging.join(name))?;
+    }
+    std::fs::write(
+        staging.join("authorization.json"),
+        serde_json::to_vec(envelope)?,
+    )?;
+    sync_directory(&staging)?;
+    std::fs::create_dir_all(&releases_root)?;
+    std::fs::rename(&staging, &committed)?;
+    sync_directory(&releases_root)?;
+
+    std::fs::create_dir_all(&arch_root)?;
+    for name in &package_names {
+        copy_new_or_verify(&committed.join(name), &arch_root.join(name))?;
+        let hot_signature = arch_root.join(format!("{name}.sig"));
+        if hot_signature.exists() {
+            verify_gpg_signature(
+                &worker.publisher_gpg_home,
+                &arch_root.join(name),
+                &hot_signature,
+            )?;
+        } else {
+            copy_regular_synced(&committed.join(format!("{name}.sig")), &hot_signature)?;
+        }
+    }
+    atomic_release_link(
+        &arch_root,
+        &format!("{}.db.sig", authorization.repository_name),
+        &format!("releases/{release_id}/{database_name}.sig"),
+    )?;
+    atomic_release_link(
+        &arch_root,
+        &format!("{}.files.sig", authorization.repository_name),
+        &format!("releases/{release_id}/{files_name}.sig"),
+    )?;
+    atomic_release_link(
+        &arch_root,
+        &format!("{}.files", authorization.repository_name),
+        &format!("releases/{release_id}/{files_name}"),
+    )?;
+    atomic_release_link(
+        &arch_root,
+        &format!("{}.db", authorization.repository_name),
+        &format!("releases/{release_id}/{database_name}"),
+    )?;
+    sync_directory(&arch_root)?;
+    Ok(manifest_sha256)
+}
+
+fn verify_signed_entry(
+    worker: &Worker,
+    root: &Path,
+    entry: &aursmith_protocol::ManifestEntry,
+) -> anyhow::Result<()> {
+    aursmith_protocol::validate_relative_path(&entry.path)?;
+    let path = root.join(&entry.path);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != entry.size
+        || file_sha256(&path)? != entry.sha256
+    {
+        bail!("Signer 输出与 Manifest 不匹配：{}", entry.path);
+    }
+    verify_gpg_signature(
+        &worker.publisher_gpg_home,
+        &path,
+        &root.join(format!("{}.sig", entry.path)),
+    )
+}
+
+fn verify_gpg_signature(home: &Path, data: &Path, signature: &Path) -> anyhow::Result<()> {
+    let signature_metadata = std::fs::symlink_metadata(signature)?;
+    if !signature_metadata.file_type().is_file() {
+        bail!("GPG 签名不是普通文件");
+    }
+    let status = std::process::Command::new("/usr/bin/gpg")
+        .arg("--homedir")
+        .arg(home)
+        .args(["--batch", "--verify"])
+        .arg(signature)
+        .arg(data)
+        .stdin(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        bail!("GPG 签名验证失败：{}", data.display());
+    }
+    Ok(())
+}
+
+fn copy_regular_synced(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if !std::fs::symlink_metadata(source)?.file_type().is_file() {
+        bail!("拒绝复制非普通文件：{}", source.display());
+    }
+    std::fs::copy(source, target)?;
+    std::fs::File::open(target)?.sync_all()?;
+    Ok(())
+}
+
+fn copy_new_or_verify(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if target.exists() {
+        if file_sha256(source)? != file_sha256(target)? {
+            bail!("公开 hot set 存在同名不同内容：{}", target.display());
+        }
+        return Ok(());
+    }
+    copy_regular_synced(source, target)
+}
+
+fn atomic_release_link(root: &Path, name: &str, target: &str) -> anyhow::Result<()> {
+    let temporary = root.join(format!(".{name}.new"));
+    if temporary.exists() || std::fs::symlink_metadata(&temporary).is_ok() {
+        std::fs::remove_file(&temporary)?;
+    }
+    std::os::unix::fs::symlink(target, &temporary)?;
+    std::fs::rename(temporary, root.join(name))?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 fn verify_manifest_directory(
@@ -1026,5 +1540,31 @@ mod transfer_tests {
             size: entry.size,
         };
         assert!(materialize_export(&source, &root.path().join("bad"), &[traversal]).is_err());
+    }
+
+    #[test]
+    fn release_authorization_requires_complete_flat_package_metadata() {
+        let mut authorization = ReleaseAuthorization {
+            release_id: uuid::Uuid::new_v4(),
+            batch_id: uuid::Uuid::new_v4(),
+            writer_epoch: 1,
+            repository_name: "aursmith".into(),
+            source_git_commit: "a".repeat(40),
+            revision_sha256s: vec!["b".repeat(64)],
+            audit_report_sha256s: vec!["c".repeat(64)],
+            artifacts: vec![aursmith_protocol::ArtifactRecord {
+                path: "fixture-1-1-any.pkg.tar.zst".into(),
+                sha256: "d".repeat(64),
+                size: 1,
+                package_name: Some("fixture".into()),
+                package_version: Some("1-1".into()),
+                architecture: Some("any".into()),
+            }],
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+        };
+        assert!(validate_release_authorization_for_publisher(&authorization).is_ok());
+        authorization.artifacts[0].path = "nested/fixture-1-1-any.pkg.tar.zst".into();
+        assert!(validate_release_authorization_for_publisher(&authorization).is_err());
     }
 }

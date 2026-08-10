@@ -17,6 +17,8 @@ pub struct Config {
     pub agent_daily_call_limit: i64,
     pub agent_monthly_call_limit: i64,
     pub agent_monthly_cost_limit_microusd: i64,
+    pub repository_name: String,
+    pub source_git_commit: String,
 }
 
 impl Config {
@@ -70,6 +72,10 @@ impl Config {
                 "AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD",
                 5_000_000,
             ),
+            repository_name: env::var("AURSMITH_REPOSITORY_NAME")
+                .unwrap_or_else(|_| "aursmith".into()),
+            source_git_commit: env::var("AURSMITH_SOURCE_GIT_COMMIT")
+                .unwrap_or_else(|_| "development".into()),
         })
     }
 

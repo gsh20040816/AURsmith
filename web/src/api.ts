@@ -106,6 +106,19 @@ export type BuildProfile = {
   last_verified_at: string | null;
   failure_reason: string | null;
 };
+export type Release = {
+  id: string;
+  batch_id: string;
+  state: string;
+  manifest_sha256: string;
+  source_git_commit: string;
+  writer_epoch: number;
+  artifact_count: number;
+  authorization_state: string | null;
+  last_error: string | null;
+  committed_at: string | null;
+  created_at: string;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -128,6 +141,7 @@ export const api = {
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
   profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
+  releases: () => request<{ items: Release[] }>("/api/v1/releases"),
   activateProfile: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>

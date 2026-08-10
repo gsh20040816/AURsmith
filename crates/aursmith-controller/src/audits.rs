@@ -438,6 +438,8 @@ mod tests {
             agent_daily_call_limit: 300,
             agent_monthly_call_limit: 3000,
             agent_monthly_cost_limit_microusd: 5_000_000,
+            repository_name: "aursmith".into(),
+            source_git_commit: "test".into(),
         };
         AppState::new(
             database,

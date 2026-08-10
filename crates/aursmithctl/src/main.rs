@@ -89,6 +89,8 @@ enum WorkerCommand {
     AurSnapshot { package_base: String },
     AuthorizeExport { envelope_file: PathBuf },
     AuthorizeImport { envelope_file: PathBuf },
+    AuthorizeRelease { envelope_file: PathBuf },
+    QueryRelease { release_id: String },
 }
 
 #[tokio::main]
@@ -132,6 +134,14 @@ async fn main() -> anyhow::Result<()> {
                     let bytes = tokio::fs::read(&envelope_file).await?;
                     let envelope: Value = serde_json::from_slice(&bytes)?;
                     json!({"command": "authorize_import", "envelope": envelope})
+                }
+                WorkerCommand::AuthorizeRelease { envelope_file } => {
+                    let bytes = tokio::fs::read(&envelope_file).await?;
+                    let envelope: Value = serde_json::from_slice(&bytes)?;
+                    json!({"command": "authorize_release", "envelope": envelope})
+                }
+                WorkerCommand::QueryRelease { release_id } => {
+                    json!({"command": "query_release", "release_id": release_id})
                 }
             };
             let response = worker_request(&socket, request).await?;
@@ -425,19 +435,36 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
         ["aur-providers"] => read_limited_json_command("aur_providers").await?,
         ["official-info"] => read_limited_json_command("official_info").await?,
         ["aur-snapshot"] => read_limited_json_command("aur_snapshot").await?,
-        ["authorize-export"] | ["authorize-import"] => {
+        ["authorize-export"] | ["authorize-import"] | ["authorize-release"] => {
             let mut bytes = Vec::new();
             tokio::io::stdin()
                 .take(4 * 1024 * 1024)
                 .read_to_end(&mut bytes)
                 .await
-                .context("读取 TransferCapability Envelope 失败")?;
-            let envelope: Value = serde_json::from_slice(&bytes)
-                .context("TransferCapability Envelope 不是有效 JSON")?;
+                .context("读取签名授权 Envelope 失败")?;
+            let envelope: Value =
+                serde_json::from_slice(&bytes).context("签名授权 Envelope 不是有效 JSON")?;
             json!({
-                "command": if parts[0] == "authorize-export" { "authorize_export" } else { "authorize_import" },
+                "command": match parts[0] {
+                    "authorize-export" => "authorize_export",
+                    "authorize-import" => "authorize_import",
+                    _ => "authorize_release",
+                },
                 "envelope": envelope
             })
+        }
+        ["query-release"] => {
+            let mut bytes = Vec::new();
+            tokio::io::stdin()
+                .take(64)
+                .read_to_end(&mut bytes)
+                .await
+                .context("读取 Release ID 失败")?;
+            let release_id = String::from_utf8(bytes)?.trim().to_owned();
+            if !uuid_like(&release_id) {
+                bail!("Release ID 无效");
+            }
+            json!({"command": "query_release", "release_id": release_id})
         }
         _ => bail!("SSH 命令未被允许"),
     };

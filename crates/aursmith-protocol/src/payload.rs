@@ -231,6 +231,7 @@ pub struct ReleaseManifest {
     pub writer_epoch: u64,
     pub artifacts: Vec<ArtifactRecord>,
     pub repository_database: ManifestEntry,
+    pub repository_files: ManifestEntry,
     pub committed_at: DateTime<Utc>,
 }
 

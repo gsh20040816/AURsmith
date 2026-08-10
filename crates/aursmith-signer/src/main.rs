@@ -70,7 +70,10 @@ fn initialize_gpg(cli: &Cli) -> anyhow::Result<()> {
 fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
     let Some(entry) = fs::read_dir(&cli.inbox)?
         .filter_map(Result::ok)
-        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .find(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !entry.file_name().to_string_lossy().starts_with('.')
+        })
     else {
         return Ok(());
     };
@@ -112,6 +115,8 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
     repo_arguments.extend(package_paths.iter().map(|path| path.as_os_str().to_owned()));
     run_checked("/usr/bin/repo-add", &repo_arguments)?;
     gpg_sign(cli, &database)?;
+    let files_database = staging.join(format!("{}.files.tar.gz", authorization.repository_name));
+    gpg_sign(cli, &files_database)?;
     let manifest = ReleaseManifest {
         release_id: authorization.release_id,
         batch_id: authorization.batch_id,
@@ -120,6 +125,7 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         writer_epoch: authorization.writer_epoch,
         artifacts: authorization.artifacts,
         repository_database: file_entry(&database)?,
+        repository_files: file_entry(&files_database)?,
         committed_at: Utc::now(),
     };
     fs::write(
@@ -146,9 +152,17 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
     if authorization.artifacts.is_empty() {
         bail!("Release 不包含软件包");
     }
+    let mut artifact_paths = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         aursmith_protocol::validate_relative_path(&artifact.path)?;
-        if !artifact.path.contains(".pkg.tar.") {
+        let file_name = Path::new(&artifact.path)
+            .file_name()
+            .context("Artifact 缺少文件名")?
+            .to_string_lossy();
+        if file_name != artifact.path
+            || !artifact_paths.insert(artifact.path.clone())
+            || !artifact.path.contains(".pkg.tar.")
+        {
             bail!("Artifact 不是 Arch 软件包");
         }
         let path = root.join(&artifact.path);

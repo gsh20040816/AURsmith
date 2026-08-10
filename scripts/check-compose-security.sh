@@ -53,5 +53,17 @@ if jq -e '.services.signer.volumes[]? | select(.target == "/repository")' <<<"${
   echo "Signer 禁止挂载公开仓库" >&2
   exit 1
 fi
+if jq -e '.services.worker.secrets[]? | select(.source == "repository_gpg_private_key")' <<<"${publisher_json}" >/dev/null; then
+  echo "Publisher Worker 禁止挂载仓库 GPG 私钥" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_public_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
+  echo "Publisher Worker 必须只获得仓库 GPG 公钥" >&2
+  exit 1
+fi
+if jq -e '.services.signer.secrets[]? | select(.source == "repository_gpg_public_key")' <<<"${publisher_json}" >/dev/null; then
+  echo "Signer 不需要挂载仓库 GPG 公钥 secret" >&2
+  exit 1
+fi
 
 echo "Compose 安全策略检查通过"

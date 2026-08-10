@@ -1008,6 +1008,28 @@ pub async fn list_batches(
     })).collect::<Vec<_>>() })))
 }
 
+pub async fn list_releases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let rows = sqlx::query("SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.source_git_commit, releases.writer_epoch, releases.committed_at, releases.created_at, release_authorizations.state AS authorization_state, release_authorizations.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count FROM releases LEFT JOIN release_authorizations ON release_authorizations.release_id = releases.id ORDER BY releases.created_at DESC LIMIT 200")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
+        "id": row.get::<String,_>("id"),
+        "batch_id": row.get::<String,_>("batch_id"),
+        "state": row.get::<String,_>("state"),
+        "manifest_sha256": row.get::<String,_>("manifest_sha256"),
+        "source_git_commit": row.get::<String,_>("source_git_commit"),
+        "writer_epoch": row.get::<i64,_>("writer_epoch"),
+        "artifact_count": row.get::<i64,_>("artifact_count"),
+        "authorization_state": row.get::<Option<String>,_>("authorization_state"),
+        "last_error": row.get::<Option<String>,_>("last_error"),
+        "committed_at": row.get::<Option<String>,_>("committed_at"),
+        "created_at": row.get::<String,_>("created_at"),
+    })).collect::<Vec<_>>() })))
+}
+
 pub async fn refresh_package(
     State(state): State<AppState>,
     headers: HeaderMap,

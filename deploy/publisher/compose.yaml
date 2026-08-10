@@ -21,6 +21,12 @@ services:
       AURSMITH_TRANSFER_SSH_IDENTITY_FILE: /run/secrets/builder_pull_key
       AURSMITH_TRANSFER_SSH_KNOWN_HOSTS_FILE: /run/secrets/builder_known_hosts
       AURSMITH_WRITER_EPOCH: ${AURSMITH_WRITER_EPOCH:-0}
+      AURSMITH_SIGNER_INBOX: /signer-inbox
+      AURSMITH_SIGNER_OUTPUT: /signer-output
+      AURSMITH_REPOSITORY_DIR: /repository
+      AURSMITH_REPOSITORY_ARCH: ${AURSMITH_REPOSITORY_ARCH:-x86_64}
+      AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE: /run/secrets/repository_gpg_public_key
+      AURSMITH_PUBLISHER_GPG_HOME: /run/aursmith-gpg
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
       - worker-run:/run/aursmith
@@ -33,8 +39,10 @@ services:
     secrets:
       - builder_pull_key
       - builder_known_hosts
+      - repository_gpg_public_key
     tmpfs:
       - /tmp:size=256m,mode=1777
+      - /run/aursmith-gpg:uid=10001,gid=10001,mode=0700,size=16m
     networks: [control, egress]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, worker, --socket, /run/aursmith/worker.sock, status]
@@ -123,6 +131,8 @@ secrets:
     file: ${AURSMITH_AUTHORIZED_KEYS_FILE:-./secrets/authorized_keys}
   repository_gpg_private_key:
     file: ${AURSMITH_GPG_PRIVATE_KEY_FILE:-./secrets/repository_gpg_private_key.asc}
+  repository_gpg_public_key:
+    file: ${AURSMITH_GPG_PUBLIC_KEY_FILE:-./secrets/repository_gpg_public_key.asc}
   builder_pull_key:
     file: ${AURSMITH_BUILDER_PULL_KEY_FILE:-./secrets/builder_pull_key}
   builder_known_hosts:
