@@ -139,6 +139,44 @@ impl BuilderRuntime {
         let input_root = staging.join("input");
         fs::create_dir(&input_root)?;
         let copied = copy_prepared_tree(&completed.join("output/prepared"), &input_root);
+        let copied = copied.and_then(|()| {
+            let dependency_root = input_root.join(".aursmith-batch-dependencies");
+            for dependency_attempt in &spec.dependency_attempt_ids {
+                let dependency_output = self
+                    .jobs_dir
+                    .join("completed")
+                    .join(dependency_attempt.to_string())
+                    .join("output");
+                let raw = fs::read(dependency_output.join("build-result.json"))?;
+                let GuestResult::Build(result) = serde_json::from_slice(&raw)? else {
+                    bail!("DEPENDENCY_ATTEMPT_NOT_BUILD");
+                };
+                validate_output_entries(
+                    &dependency_output,
+                    &result
+                        .artifacts
+                        .iter()
+                        .map(|artifact| ManifestEntry {
+                            path: artifact.path.clone(),
+                            sha256: artifact.sha256.clone(),
+                            size: artifact.size,
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+                fs::create_dir_all(&dependency_root)?;
+                for artifact in result.artifacts {
+                    let name = Path::new(&artifact.path)
+                        .file_name()
+                        .context("DEPENDENCY_ARTIFACT_NAME_INVALID")?;
+                    let destination = dependency_root.join(name);
+                    if destination.exists() {
+                        bail!("DEPENDENCY_ARTIFACT_COLLISION");
+                    }
+                    fs::copy(dependency_output.join(&artifact.path), destination)?;
+                }
+            }
+            Ok(())
+        });
         if copied.is_err() {
             let _ = fs::remove_dir_all(&staging);
         }
@@ -797,6 +835,8 @@ mod tests {
             dependency_snapshot_sha256: None,
             profile_sha256: Some("a".repeat(64)),
             source_attempt_id: None,
+            dependency_attempt_ids: vec![],
+            dependencies: vec![],
             inputs: vec![],
             inline_inputs: vec![],
             limits: ResourceLimits {
@@ -945,6 +985,7 @@ mod tests {
                 },
             ],
             audit_files: vec![],
+            resolved_dependencies: vec![],
             resolved_pkgver: None,
             dependency_snapshot_sha256: "c".repeat(64),
             log_sha256: "d".repeat(64),
@@ -958,6 +999,46 @@ mod tests {
         let mut spec = job(JobKind::Build);
         spec.source_attempt_id = Some(source_attempt);
         spec.source_manifest_sha256 = Some(source_manifest);
+        let dependency_attempt = Uuid::new_v4();
+        let dependency_output = runtime
+            .jobs_dir
+            .join("completed")
+            .join(dependency_attempt.to_string())
+            .join("output");
+        fs::create_dir_all(&dependency_output).unwrap();
+        let dependency_bytes = b"batch dependency";
+        let dependency_name = "dependency-1-1-any.pkg.tar.zst";
+        fs::write(dependency_output.join(dependency_name), dependency_bytes).unwrap();
+        let dependency_job = Uuid::new_v4();
+        let dependency_result = GuestResult::Build(aursmith_protocol::BuildResult {
+            job_id: dependency_job,
+            attempt: AttemptRef {
+                job_id: dependency_job,
+                attempt_id: dependency_attempt,
+                generation: 0,
+            },
+            revision_sha256: "e".repeat(64),
+            source_manifest_sha256: "f".repeat(64),
+            dependency_snapshot_sha256: "1".repeat(64),
+            profile_sha256: "a".repeat(64),
+            artifacts: vec![aursmith_protocol::ArtifactRecord {
+                path: dependency_name.into(),
+                sha256: hex::encode(Sha256::digest(dependency_bytes)),
+                size: dependency_bytes.len() as u64,
+                package_name: Some("dependency".into()),
+                package_version: Some("1-1".into()),
+                architecture: Some("any".into()),
+            }],
+            provenance: Default::default(),
+            log_sha256: "2".repeat(64),
+            finished_at: Utc::now(),
+        });
+        fs::write(
+            dependency_output.join("build-result.json"),
+            serde_json::to_vec(&dependency_result).unwrap(),
+        )
+        .unwrap();
+        spec.dependency_attempt_ids.push(dependency_attempt);
 
         runtime.materialize_prepared_source(&spec).unwrap();
         let copied = runtime
@@ -966,6 +1047,18 @@ mod tests {
             .join(spec.attempt.attempt_id.to_string())
             .join("input/PKGBUILD");
         assert_eq!(fs::read(copied).unwrap(), b"pkgname=fixture\n");
+        assert_eq!(
+            fs::read(
+                runtime
+                    .jobs_dir
+                    .join("staging")
+                    .join(spec.attempt.attempt_id.to_string())
+                    .join("input/.aursmith-batch-dependencies")
+                    .join(dependency_name)
+            )
+            .unwrap(),
+            dependency_bytes
+        );
     }
 
     #[test]

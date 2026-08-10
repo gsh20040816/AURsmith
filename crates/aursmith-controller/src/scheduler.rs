@@ -1,6 +1,9 @@
 use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
-use aursmith_protocol::{GuestResult, JobKind, JobSpec, ResourceLimits, SignedEnvelope};
+use aursmith_protocol::{
+    DependencyInput, DependencySource, GuestResult, JobKind, JobSpec, ResourceLimits,
+    SignedEnvelope,
+};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -212,6 +215,8 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
             .map(|value| Uuid::parse_str(&value))
             .transpose()
             .map_err(ApiError::internal)?,
+        dependency_attempt_ids: load_batch_dependency_attempts(state, &job_id).await?,
+        dependencies: load_job_dependencies(state, &job_id).await?,
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
         inline_inputs: serde_json::from_str(job.get("inline_inputs_json"))
             .map_err(ApiError::internal)?,
@@ -478,4 +483,39 @@ fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
         "profile_fixture" => Ok(JobKind::ProfileFixture),
         _ => Err(ApiError::internal("数据库包含未知 Job 类型")),
     }
+}
+
+async fn load_job_dependencies(
+    state: &AppState,
+    job_id: &str,
+) -> Result<Vec<DependencyInput>, ApiError> {
+    let rows = sqlx::query("SELECT revision_dependencies.dependency_name, revision_dependencies.dependency_kind, revision_dependencies.target_package_base FROM jobs JOIN revision_dependencies ON revision_dependencies.revision_id = jobs.revision_id WHERE jobs.id = ? ORDER BY revision_dependencies.dependency_name, revision_dependencies.dependency_kind")
+        .bind(job_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DependencyInput {
+            name: row.get("dependency_name"),
+            kind: row.get("dependency_kind"),
+            source: if row
+                .get::<Option<String>, _>("target_package_base")
+                .is_some()
+            {
+                DependencySource::AurBatch
+            } else {
+                DependencySource::Official
+            },
+        })
+        .collect())
+}
+
+async fn load_batch_dependency_attempts(
+    state: &AppState,
+    job_id: &str,
+) -> Result<Vec<Uuid>, ApiError> {
+    let attempts: Vec<String> = sqlx::query_scalar("SELECT DISTINCT attempts.id FROM jobs AS current_job JOIN revision_dependencies ON revision_dependencies.revision_id = current_job.revision_id JOIN revisions AS dependency_revision ON dependency_revision.package_base = revision_dependencies.target_package_base JOIN jobs AS dependency_job ON dependency_job.batch_id = current_job.batch_id AND dependency_job.revision_id = dependency_revision.id AND dependency_job.kind = 'build' AND dependency_job.status = 'succeeded' JOIN attempts ON attempts.job_id = dependency_job.id AND attempts.status = 'succeeded' WHERE current_job.id = ? ORDER BY attempts.id")
+        .bind(job_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    attempts
+        .into_iter()
+        .map(|value| Uuid::parse_str(&value).map_err(ApiError::internal))
+        .collect()
 }

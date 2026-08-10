@@ -19,6 +19,7 @@
 - ADR-015：Profile 使用一次性 Compose 构建镜像生成，不给常驻 Builder 增加 root 或联网能力。Guest Agent 固定为 PID 1 并再次验证 Controller JobSpec；任何 Guest 失败都关闭 VM，不回退到宿主 makepkg。
 - ADR-016：AUR 包装层扫描结果建模为 `AuditPreScan`，它不是 Agent 的最终审计输入。只有 Fetch VM 产生完整 Source Manifest、Builder 与 Controller 双重验证结果后，系统才创建内容寻址的 `AuditBundle` 和三路低成本 Agent 任务，避免把“尚未取得上游源码”误报成已完成审计。
 - ADR-017：首个可运行的 Fetch/Build 接力以 ReleaseBatch 为单位固定 Builder 亲和性。Build Job 引用已验证的 Fetch Attempt 和 Source Manifest，不允许重新下载。跨 Builder 接力必须等待受签名 `TransferCapability` 约束的 rsync 路径完成，不能用共享可写卷或临时联网代替。
+- ADR-018：官方依赖只允许 Fetch Guest 通过 pacman 和固定代理下载，并进入 Source Manifest；批次内 AUR 依赖只允许来自较早的成功 Build Attempt。Build Guest 在无网状态使用 pacman 安装两类包，禁止把 AUR 依赖固化进 Profile 或在构建失败后临时放开网络。
 
 ## 已拒绝
 

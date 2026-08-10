@@ -14,6 +14,28 @@ pub enum JobKind {
     ProfileFixture,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencySource {
+    Official,
+    AurBatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyInput {
+    pub name: String,
+    pub kind: String,
+    pub source: DependencySource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedDependency {
+    pub name: String,
+    pub version: String,
+    pub source: DependencySource,
+    pub package: ManifestEntry,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub cpu_count: u16,
@@ -74,6 +96,10 @@ pub struct JobSpec {
     pub profile_sha256: Option<String>,
     #[serde(default)]
     pub source_attempt_id: Option<Uuid>,
+    #[serde(default)]
+    pub dependency_attempt_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub dependencies: Vec<DependencyInput>,
     pub inputs: Vec<ManifestEntry>,
     #[serde(default)]
     pub inline_inputs: Vec<InlineInput>,
@@ -156,6 +182,7 @@ pub struct FetchResult {
     pub source_manifest_sha256: String,
     pub sources: Vec<SourceManifestEntry>,
     pub audit_files: Vec<AuditSourceFile>,
+    pub resolved_dependencies: Vec<ResolvedDependency>,
     pub resolved_pkgver: Option<String>,
     pub dependency_snapshot_sha256: String,
     pub log_sha256: String,
@@ -238,6 +265,8 @@ mod tests {
             dependency_snapshot_sha256: None,
             profile_sha256: None,
             source_attempt_id: None,
+            dependency_attempt_ids: Vec::new(),
+            dependencies: Vec::new(),
             inputs: Vec::new(),
             inline_inputs: Vec::new(),
             limits: ResourceLimits {

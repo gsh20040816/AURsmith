@@ -1,7 +1,8 @@
 use anyhow::{Context, bail};
 use aursmith_protocol::{
-    ArtifactRecord, AuditSourceFile, BuildResult, FetchResult, GuestResult, JobKind, JobSpec,
-    SignedEnvelope, SourceEntryKind, SourceManifestEntry,
+    ArtifactRecord, AuditSourceFile, BuildResult, DependencySource, FetchResult, GuestResult,
+    JobKind, JobSpec, ManifestEntry, ResolvedDependency, SignedEnvelope, SourceEntryKind,
+    SourceManifestEntry,
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -70,6 +71,9 @@ fn run() -> anyhow::Result<()> {
             b"pkgname=aursmith-profile-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-profile-fixture/os-release\"; }\n",
         )?;
     }
+    if spec.kind == JobKind::Build {
+        install_offline_dependencies(Path::new(BUILD))?;
+    }
     run_checked("/usr/bin/chown", &["-R", "builder:builder", BUILD], None)?;
     let result = match spec.kind {
         JobKind::Fetch => GuestResult::Fetch(fetch(&spec)?),
@@ -79,6 +83,44 @@ fn run() -> anyhow::Result<()> {
     let result_path = format!("{OUTPUT}/build-result.json");
     fs::write(&result_path, serde_json::to_vec(&result)?)?;
     sync_filesystem()?;
+    Ok(())
+}
+
+fn install_offline_dependencies(build: &Path) -> anyhow::Result<()> {
+    let mut packages = Vec::new();
+    for directory in [
+        build.join(".aursmith-official-dependencies"),
+        build.join(".aursmith-batch-dependencies"),
+    ] {
+        if !directory.exists() {
+            continue;
+        }
+        for item in fs::read_dir(directory)? {
+            let path = item?.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.contains(".pkg.tar."))
+            {
+                packages.push(path);
+            }
+        }
+    }
+    if packages.is_empty() {
+        return Ok(());
+    }
+    packages.sort();
+    let status = Command::new("/usr/bin/pacman")
+        .args(["-U", "--noconfirm", "--needed"])
+        .args(packages)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/bin")
+        .status()?;
+    if !status.success() {
+        bail!("离线依赖安装失败，状态 {status}");
+    }
     Ok(())
 }
 
@@ -92,6 +134,7 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     let prepared = Path::new(OUTPUT).join("prepared");
     fs::create_dir_all(&prepared)?;
     copy_tree(Path::new(BUILD), &prepared, false)?;
+    let resolved_dependencies = download_official_dependencies(spec, &prepared)?;
     let sources = manifest(&prepared, Path::new(OUTPUT))?;
     let source_manifest_sha256 = manifest_digest(&sources)?;
     let audit_files = select_audit_files(&prepared, &sources)?;
@@ -102,14 +145,95 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
         source_manifest_sha256,
         sources,
         audit_files,
+        resolved_dependencies: resolved_dependencies.clone(),
         resolved_pkgver: None,
-        dependency_snapshot_sha256: spec
-            .dependency_snapshot_sha256
-            .clone()
-            .context("Fetch Job 缺少依赖快照")?,
+        dependency_snapshot_sha256: hex::encode(Sha256::digest(serde_json::to_vec(
+            &serde_json::json!({"requested": spec.dependencies, "resolved": resolved_dependencies}),
+        )?)),
         log_sha256: file_digest(&log)?,
         finished_at: Utc::now(),
     })
+}
+
+fn download_official_dependencies(
+    spec: &JobSpec,
+    prepared: &Path,
+) -> anyhow::Result<Vec<ResolvedDependency>> {
+    let names = spec
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.source == DependencySource::Official)
+        .map(|dependency| dependency.name.as_str())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    if names.iter().any(|name| {
+        name.is_empty()
+            || name.starts_with('-')
+            || !name
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || "@._+:-".contains(value))
+    }) {
+        bail!("官方依赖包名包含非法字符");
+    }
+    let cache = prepared.join(".aursmith-official-dependencies");
+    fs::create_dir(&cache)?;
+    let mut command = Command::new("/usr/bin/pacman");
+    command
+        .args(["-Sw", "--noconfirm", "--needed", "--cachedir"])
+        .arg(&cache)
+        .args(&names)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/bin")
+        .env("http_proxy", "http://10.0.2.100:8080")
+        .env("https_proxy", "http://10.0.2.100:8080");
+    let status = command.status()?;
+    if !status.success() {
+        bail!("官方依赖下载失败，状态 {status}");
+    }
+    let mut resolved = Vec::new();
+    for item in fs::read_dir(&cache)? {
+        let path = item?.path();
+        if !path.is_file()
+            || !path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.contains(".pkg.tar."))
+        {
+            continue;
+        }
+        let metadata = fs::metadata(&path)?;
+        let output = Command::new("/usr/bin/pacman")
+            .args(["-Qp", "--print-format", "%n\t%v"])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            bail!("无法读取官方依赖包元数据");
+        }
+        let metadata_line = String::from_utf8(output.stdout)?;
+        let (name, version) = metadata_line
+            .trim()
+            .split_once('\t')
+            .context("官方依赖包元数据格式无效")?;
+        resolved.push(ResolvedDependency {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: DependencySource::Official,
+            package: ManifestEntry {
+                path: path
+                    .strip_prefix(Path::new(OUTPUT))?
+                    .to_string_lossy()
+                    .into_owned(),
+                sha256: file_digest(&path)?,
+                size: metadata.len(),
+            },
+        });
+    }
+    resolved.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(resolved)
 }
 
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
@@ -132,13 +256,14 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         let destination = Path::new(OUTPUT).join(name);
         fs::copy(&package, &destination)?;
         let metadata = fs::metadata(&destination)?;
+        let package_metadata = read_package_metadata(&destination)?;
         artifacts.push(ArtifactRecord {
             path: name.to_owned(),
             sha256: file_digest(&destination)?,
             size: metadata.len(),
-            package_name: None,
-            package_version: None,
-            architecture: None,
+            package_name: Some(package_metadata.0),
+            package_version: Some(package_metadata.1),
+            architecture: Some(package_metadata.2),
         });
     }
     Ok(BuildResult {
@@ -168,6 +293,26 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         log_sha256: file_digest(&log)?,
         finished_at: Utc::now(),
     })
+}
+
+fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)> {
+    let output = Command::new("/usr/bin/bsdtar")
+        .args(["-xOf"])
+        .arg(path)
+        .arg(".PKGINFO")
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("无法读取构建产物 .PKGINFO");
+    }
+    let text = String::from_utf8(output.stdout)?;
+    let value = |name: &str| {
+        text.lines()
+            .filter_map(|line| line.split_once(" = "))
+            .find_map(|(key, value)| (key == name).then_some(value.to_owned()))
+            .with_context(|| format!(".PKGINFO 缺少 {name}"))
+    };
+    Ok((value("pkgname")?, value("pkgver")?, value("arch")?))
 }
 
 fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyhow::Result<()> {

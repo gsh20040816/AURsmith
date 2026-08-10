@@ -59,6 +59,8 @@ fn main() -> anyhow::Result<()> {
         dependency_snapshot_sha256: Some("0".repeat(64)),
         profile_sha256: Some(candidate.spec.profile_sha256.clone()),
         source_attempt_id: None,
+        dependency_attempt_ids: vec![],
+        dependencies: vec![],
         inputs: vec![],
         inline_inputs: vec![],
         limits: ResourceLimits {

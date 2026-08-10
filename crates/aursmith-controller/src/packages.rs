@@ -658,6 +658,8 @@ pub(crate) async fn complete_fetch(
     payload["source_manifest_sha256"] = json!(result.source_manifest_sha256);
     payload["resolved_pkgver"] = json!(result.resolved_pkgver);
     payload["dependency_snapshot_sha256"] = json!(result.dependency_snapshot_sha256);
+    payload["resolved_dependencies"] =
+        serde_json::to_value(&result.resolved_dependencies).map_err(ApiError::internal)?;
     payload["selected_upstream_source_files"] =
         serde_json::to_value(&result.audit_files).map_err(ApiError::internal)?;
     let coverage = json!({
@@ -700,14 +702,19 @@ pub(crate) async fn complete_fetch(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query(
-        "UPDATE revisions SET state = 'audit_pending', source_manifest_sha256 = ? WHERE id = ?",
-    )
+    sqlx::query("UPDATE revisions SET state = 'audit_pending', source_manifest_sha256 = ?, dependency_snapshot_sha256 = ? WHERE id = ?")
     .bind(&result.source_manifest_sha256)
+    .bind(&result.dependency_snapshot_sha256)
     .bind(revision_id)
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
+    for dependency in &result.resolved_dependencies {
+        sqlx::query("INSERT INTO dependency_observations(id, job_id, package_name, official_repository, download_bytes, download_milliseconds, install_milliseconds, cache_hit, observed_at) VALUES (?, ?, ?, 1, ?, 0, 0, 0, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(result.job_id.to_string()).bind(&dependency.name)
+            .bind(i64::try_from(dependency.package.size).map_err(ApiError::internal)?)
+            .bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+    }
     Ok(())
 }
 
@@ -746,13 +753,15 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
             .ok_or_else(|| ApiError::conflict("FETCH_RESULT_MISSING", "审计已批准，但找不到可供 Build 使用的 Fetch Attempt"))?;
         let worker_id: String = fetch.get("worker_id");
         let profile_sha256: String = fetch.get("profile_sha256");
-        let source_manifest_sha256: String =
-            sqlx::query_scalar("SELECT source_manifest_sha256 FROM revisions WHERE id = ?")
-                .bind(&revision_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(ApiError::internal)?;
-        let dependency_snapshot_sha256: String = fetch.get("dependency_snapshot_sha256");
+        let revision_digests = sqlx::query(
+            "SELECT source_manifest_sha256, dependency_snapshot_sha256 FROM revisions WHERE id = ?",
+        )
+        .bind(&revision_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+        let source_manifest_sha256: String = revision_digests.get("source_manifest_sha256");
+        let dependency_snapshot_sha256: String = revision_digests.get("dependency_snapshot_sha256");
         let source_attempt_id: String = fetch.get("attempt_id");
         let now = Utc::now();
         sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?, ?)")
@@ -1852,6 +1861,7 @@ mod tests {
                     link_target: None,
                 }],
                 audit_files: vec![],
+                resolved_dependencies: vec![],
                 resolved_pkgver: None,
                 dependency_snapshot_sha256: "c".repeat(64),
                 log_sha256: "d".repeat(64),

@@ -53,6 +53,8 @@ Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日�
 
 Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
 
+JobSpec 同时固定直接运行、构建和检查依赖及其来源。Fetch Guest 只对 `official` 依赖使用 pacman 下载，包文件进入 prepared source、完整 Source Manifest 和解析后的名称/版本/摘要清单；AUR 依赖不会伪装成官方依赖下载。Controller 使用 Fetch 实际结果替换预估的依赖快照摘要。按 DAG 构建时，Builder 从同批次已成功 Build Attempt 中重新验证并复制直接 AUR 依赖产物。Build Guest 以 PID 1 身份先用 pacman 离线安装两类依赖，再降权执行 makepkg；依赖缺失时确定性失败，绝不临时添加网卡。
+
 Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段安装完整且同步的 Arch 根文件系统、嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 virtiofs 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate。
 
 开发期 KVM 冒烟使用协议 crate 下的 `prepare_kvm_fixture` example。它只使用固定测试密钥，在用户指定的临时目录中复用正式 Envelope 代码签署 ProfileFixture，不参与镜像或生产 Stack。验证结束必须删除临时运行目录；正式环境只能由 Controller 签发 Profile 和 JobSpec。
