@@ -129,3 +129,11 @@
 - 版本测试确认首次发布保留上游 `pkgrel`，同一上游完整版本的新 AUR commit 或依赖重建派生 `.1` 后缀；支持带 epoch 的版本。签名 JobSpec 把派生 `pkgrel` 交给 Guest，Guest 单测确认只改写构建工作副本，并拒绝多个或歧义 `pkgrel` 赋值。Controller 还会拒绝 `.PKGINFO` 版本与授权值不一致的 BuildResult。
 - 已运行 `cargo test -p aursmith-domain -p aursmith-protocol -p aursmith-guest-agent -p aursmith-controller`；补充单个动态 `pkgrel` 失败关闭及上游元数据缺失不误清除建议的用例后，四个相关 crate 共 59 个测试全部通过。随后执行 `bash scripts/test-all.sh`，全仓库 83 个 Rust 测试、前端类型检查、Vitest、生产构建和四套 Compose 安全策略检查全部通过。
 - 未覆盖：尚未用真实官方包升级触发一次完整的“检测→七天合批→KVM 重新下载依赖→Agent 审计→pacman 客户端升级”端到端流程，因此当前验证覆盖领域规则、数据库状态机、协议约束和 Guest 工作副本改写，不声称真实 ABI 或客户端升级已经验收。
+
+## 2026-08-10：Publisher 软件包归档检查
+
+- Publisher 在复制到 Signer inbox 后独立调用固定路径的 `bsdtar`，核对归档普通路径、文件类型、唯一必需元数据及 `.PKGINFO` 中包名、版本、架构。单元测试覆盖路径逃逸和字符设备阻断，也确认 INSTALL、pacman hook、systemd 单元、setuid 和内核模块只记录为结构化事实。
+- 集成测试实际创建含 `.PKGINFO`、`.BUILDINFO` 和 `.MTREE` 的 tar 软件包，再通过正式检查入口读取三份清单和元数据；这不是只对手工构造的字符串测试解析器。
+- `artifact-inspections.json` 被复制进 Signer 输出，其大小和报告数量由断网 Signer 复验，文件摘要进入 GPG 签名的 Release Manifest。Publisher 激活或回滚 Release 时重新核对该摘要，归档的完整 Release 文件清单自然包含检查报告。
+- 执行 `bash scripts/test-all.sh` 后，全仓库 86 个 Rust 测试、前端类型检查、Vitest、生产构建和 Compose 安全策略检查全部通过；修改后的 Worker 与 Signer 镜像分别实际构建为 `aursmith-worker:test` 和 `aursmith-signer:test`。
+- 未覆盖：当前检查尚未解析 ELF `DT_NEEDED`、文件 capabilities 或实际执行 namcap；这些仍是 R01/B03 后续实现项。也尚未用含上述风险内容的真实 pacman 包完成 Publisher→Signer→Archiver 端到端演练。

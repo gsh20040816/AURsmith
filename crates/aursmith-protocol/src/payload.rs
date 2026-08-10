@@ -241,6 +241,8 @@ pub struct ReleaseManifest {
     pub artifacts: Vec<ArtifactRecord>,
     pub repository_database: ManifestEntry,
     pub repository_files: ManifestEntry,
+    #[serde(default)]
+    pub artifact_inspections: Option<ManifestEntry>,
     pub committed_at: DateTime<Utc>,
 }
 

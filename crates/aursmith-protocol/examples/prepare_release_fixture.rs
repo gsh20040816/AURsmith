@@ -65,6 +65,13 @@ fn main() -> anyhow::Result<()> {
         directory.join("authorization.json"),
         serde_json::to_vec(&envelope)?,
     )?;
+    fs::write(
+        directory.join("artifact-inspections.json"),
+        serde_json::to_vec_pretty(&vec![serde_json::json!({
+            "artifact_sha256": authorization.artifacts[0].sha256,
+            "fixture": true
+        })])?,
+    )?;
     println!(
         "{}",
         serde_json::json!({

@@ -117,6 +117,16 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
     gpg_sign(cli, &database)?;
     let files_database = staging.join(format!("{}.files.tar.gz", authorization.repository_name));
     gpg_sign(cli, &files_database)?;
+    let inspection_source = entry.path().join("artifact-inspections.json");
+    let inspection_bytes = fs::read(&inspection_source)?;
+    let inspections: Vec<serde_json::Value> = serde_json::from_slice(&inspection_bytes)?;
+    if inspection_bytes.len() > 10 * 1024 * 1024
+        || inspections.len() != authorization.artifacts.len()
+    {
+        bail!("Publisher Artifact 检查报告数量或大小无效");
+    }
+    let inspection_destination = staging.join("artifact-inspections.json");
+    fs::write(&inspection_destination, inspection_bytes)?;
     let manifest = ReleaseManifest {
         release_id: authorization.release_id,
         batch_id: authorization.batch_id,
@@ -126,6 +136,7 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         artifacts: authorization.artifacts,
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
+        artifact_inspections: Some(file_entry(&inspection_destination)?),
         committed_at: Utc::now(),
     };
     fs::write(

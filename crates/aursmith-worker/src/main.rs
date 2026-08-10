@@ -1,5 +1,6 @@
 mod aur;
 mod builder;
+mod package_inspection;
 
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
@@ -1292,6 +1293,7 @@ async fn materialize_release_inbox(
     staging: &Path,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(staging)?;
+    let mut inspections = Vec::new();
     let imports = sqlx::query(
         "SELECT directory, manifest_json FROM transfer_imports WHERE state = 'verified'",
     )
@@ -1337,8 +1339,13 @@ async fn materialize_release_inbox(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(source, target)?;
+        std::fs::copy(source, &target)?;
+        inspections.push(package_inspection::inspect_package(&target, artifact)?);
     }
+    std::fs::write(
+        staging.join("artifact-inspections.json"),
+        serde_json::to_vec_pretty(&inspections)?,
+    )?;
     std::fs::write(
         staging.join("authorization.json"),
         serde_json::to_vec(envelope)?,
@@ -1561,12 +1568,24 @@ fn verify_and_publish_release(
     let files_name = format!("{}.files.tar.gz", authorization.repository_name);
     if manifest.repository_database.path != database_name
         || manifest.repository_files.path != files_name
+        || manifest
+            .artifact_inspections
+            .as_ref()
+            .map(|entry| entry.path.as_str())
+            != Some("artifact-inspections.json")
     {
         bail!("ReleaseManifest 仓库数据库名称无效");
     }
     for entry in [&manifest.repository_database, &manifest.repository_files] {
         verify_signed_entry(worker, signed, entry)?;
     }
+    verify_manifest_entry(
+        signed,
+        manifest
+            .artifact_inspections
+            .as_ref()
+            .context("ReleaseManifest 缺少 Artifact 检查报告")?,
+    )?;
     let mut package_names = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         aursmith_protocol::validate_relative_path(&artifact.path)?;
@@ -1614,6 +1633,7 @@ fn verify_and_publish_release(
         format!("{files_name}.sig"),
         "release-manifest.json".into(),
         "release-manifest.json.sig".into(),
+        "artifact-inspections.json".into(),
     ];
     for name in &package_names {
         release_files.push(name.clone());
@@ -1651,6 +1671,9 @@ fn activate_committed_release(
     }
     verify_signed_entry(worker, committed, &manifest.repository_database)?;
     verify_signed_entry(worker, committed, &manifest.repository_files)?;
+    if let Some(inspection) = &manifest.artifact_inspections {
+        verify_manifest_entry(committed, inspection)?;
+    }
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
     for artifact in &manifest.artifacts {
@@ -1718,6 +1741,19 @@ fn verify_signed_entry(
     root: &Path,
     entry: &aursmith_protocol::ManifestEntry,
 ) -> anyhow::Result<()> {
+    verify_manifest_entry(root, entry)?;
+    let path = root.join(&entry.path);
+    verify_gpg_signature(
+        &worker.publisher_gpg_home,
+        &path,
+        &root.join(format!("{}.sig", entry.path)),
+    )
+}
+
+fn verify_manifest_entry(
+    root: &Path,
+    entry: &aursmith_protocol::ManifestEntry,
+) -> anyhow::Result<()> {
     aursmith_protocol::validate_relative_path(&entry.path)?;
     let path = root.join(&entry.path);
     let metadata = std::fs::symlink_metadata(&path)?;
@@ -1727,11 +1763,7 @@ fn verify_signed_entry(
     {
         bail!("Signer 输出与 Manifest 不匹配：{}", entry.path);
     }
-    verify_gpg_signature(
-        &worker.publisher_gpg_home,
-        &path,
-        &root.join(format!("{}.sig", entry.path)),
-    )
+    Ok(())
 }
 
 fn verify_gpg_signature(home: &Path, data: &Path, signature: &Path) -> anyhow::Result<()> {
