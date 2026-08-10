@@ -1,0 +1,22 @@
+[package]
+name = "aursmith-signer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aursmith-protocol = { path = "../aursmith-protocol" }
+chrono.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true

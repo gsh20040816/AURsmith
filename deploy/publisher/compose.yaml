@@ -24,6 +24,8 @@ services:
       - publisher-landing:/landing
       - publisher-staging:/staging
       - publisher-hot:/repository
+      - signer-inbox:/signer-inbox
+      - signer-output:/signer-output:ro
     tmpfs:
       - /tmp:size=256m,mode=1777
     networks: [control, egress]
@@ -32,6 +34,32 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    restart: unless-stopped
+
+  signer:
+    build:
+      context: ../..
+      dockerfile: deploy/images/signer.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    environment:
+      AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
+      AURSMITH_GPG_PRIVATE_KEY_FILE: /run/secrets/repository_gpg_private_key
+      AURSMITH_GPG_HOME: /run/aursmith-gnupg
+      AURSMITH_SIGNER_INBOX: /inbox
+      AURSMITH_SIGNER_OUTPUT: /signed
+    secrets:
+      - repository_gpg_private_key
+    volumes:
+      - signer-inbox:/inbox:ro
+      - signer-output:/signed
+    tmpfs:
+      - /run/aursmith-gnupg:uid=10001,gid=10001,mode=0700,size=16m
+      - /tmp:uid=10001,gid=10001,mode=0700,size=64m
     restart: unless-stopped
 
   ssh:
@@ -86,6 +114,8 @@ secrets:
     file: ${AURSMITH_SSH_HOST_KEY_FILE:-./secrets/ssh_host_ed25519_key}
   authorized_keys:
     file: ${AURSMITH_AUTHORIZED_KEYS_FILE:-./secrets/authorized_keys}
+  repository_gpg_private_key:
+    file: ${AURSMITH_GPG_PRIVATE_KEY_FILE:-./secrets/repository_gpg_private_key.asc}
 
 volumes:
   worker-run:
@@ -93,6 +123,8 @@ volumes:
   publisher-landing:
   publisher-staging:
   publisher-hot:
+  signer-inbox:
+  signer-output:
 
 networks:
   control:

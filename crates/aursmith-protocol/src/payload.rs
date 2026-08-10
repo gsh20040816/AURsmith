@@ -213,6 +213,8 @@ pub struct ReleaseAuthorization {
     pub release_id: Uuid,
     pub batch_id: Uuid,
     pub writer_epoch: u64,
+    pub repository_name: String,
+    pub source_git_commit: String,
     pub revision_sha256s: Vec<String>,
     pub audit_report_sha256s: Vec<String>,
     pub artifacts: Vec<ArtifactRecord>,

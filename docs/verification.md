@@ -22,3 +22,12 @@
 - Build：新的 Job `74881cb7-c2be-49e4-96e7-f6a7b4b0f07c` 只引用上述 Fetch Attempt 和摘要；Worker 从 completed 目录重新验证并创建新 overlay。Build VM 使用 `network=none`，成功生成 `aursmith-fetch-fixture-1-1-any.pkg.tar.zst`，解析到包名、版本 `1-1`、架构 `any`，SHA-256 为 `744859e3eceb7675962040dc91150b1cef219936e1ad4a11bec5d630119ee24b`。
 - 边界：fixture 没有实际下载官方依赖，因此验证了依赖为空时的快照与离线安装路径，但未验证 pacman 经 source proxy 下载真实官方包的网络行为。
 - 清理：Worker 和临时监听器已停止；本次 Profile 与 runtime 目录移动到回收站后再确认无 QEMU/virtiofsd 残留。
+
+## 2026-08-10：离线 Signer
+
+- 输入：复用上一条 KVM Build 产生的真实 Arch 包；`prepare_release_fixture` 使用正式 Envelope 代码和固定测试 Controller 密钥生成十分钟有效的 ReleaseAuthorization。
+- 密钥：在临时 GPG home 中生成一天有效的 Ed25519 测试密钥并导出私钥文件，只交给 Signer 进程；没有使用仓库或用户生产密钥。
+- 执行：Signer 复验包 SHA-256、大小以及 `.PKGINFO` 的包名、版本和架构；生成包 `.sig`、`aursmith.db.tar.gz`、数据库 `.sig`、`release-manifest.json` 和 Manifest `.sig`，再原子提交完整 Release 目录。
+- 验证：对最终 `release-manifest.json.sig` 实际执行 `gpg --verify`，签名有效，测试指纹为 `2AB6 48B7 402E 9526 9411 4A92 BCD2 FD6F 30E9 C801`。
+- 边界：尚未覆盖 Publisher 从 Builder 拉取 Artifact、公开 hot set 切换、客户端 pacman 安装或生产 GPG 指纹引导。
+- 清理：Signer 进程已停止；包含临时测试私钥、GPG home、inbox 和 signed Release 的目录已整体移动到回收站，可恢复。

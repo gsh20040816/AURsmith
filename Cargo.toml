@@ -8,6 +8,7 @@ members = [
   "crates/aursmith-agent-runner",
   "crates/aursmith-agent-gateway",
   "crates/aursmith-guest-agent",
+  "crates/aursmith-signer",
 ]
 resolver = "2"
 

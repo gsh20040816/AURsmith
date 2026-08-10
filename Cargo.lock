@@ -217,6 +217,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aursmith-signer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aursmith-protocol",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "aursmith-worker"
 version = "0.1.0"
 dependencies = [

@@ -37,6 +37,8 @@ Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包�
 
 受影响的依赖闭包组成一个 `ReleaseBatch`。系统完整暂存该批次，根据完整 Manifest 签名并验证，然后最后切换仓库数据库。失败批次不能修改当前 Release。
 
+Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publisher 只能向只写 inbox 投递软件包和 Controller 签名的 `ReleaseAuthorization`，不能访问 Signer 的 GPG home；Signer 只能只读 inbox 并写独立 signed volume。Signer 再次验证 Controller Ed25519 公钥、授权期限、writer epoch 对应的授权内容、每个包的相对路径、大小、SHA-256 和 `.PKGINFO`，随后用固定 argv 调用 GPG 与官方 `repo-add`。包、仓库数据库和 Release Manifest 均生成 GPG 分离签名，完整 staging 最后通过目录 rename 提交。Publisher 仍须在公开前复验签名并执行 hot set/数据库切换；Signer 自身不拥有公开仓库卷。
+
 ## Builder KVM 执行内核
 
 Builder Worker 的 Journal 保存完整签名 JobSpec。执行循环以条件更新认领 queued Attempt，重启后会继续处理尚未认领的任务；同一 generation 的重放仍由 Journal 幂等规则约束。任务分为 Fetch、Build 和 ProfileFixture 三种，协议字段带默认值仅用于同一 major 版本内读取早期 Build 任务。
