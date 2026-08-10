@@ -21,6 +21,13 @@ for stack in controller builder publisher archiver; do
   fi
 done
 
+while IFS= read -r from_line; do
+  if [[ "${from_line}" != *"@sha256:"* ]]; then
+    echo "Dockerfile 基础镜像必须固定 digest: ${from_line}" >&2
+    exit 1
+  fi
+done < <(rg '^FROM ' deploy/images)
+
 builder_json="$(docker compose -f deploy/builder/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.devices[]? | select(.source == "/dev/kvm")] | length' <<<"${builder_json}")" != "1" ]]; then
   echo "Builder 必须且只能显式获得 /dev/kvm 构建设备" >&2

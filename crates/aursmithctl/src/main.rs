@@ -1,7 +1,8 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
-use std::{env, path::PathBuf};
+use std::{env, io::Read, path::PathBuf};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -31,6 +32,8 @@ enum Command {
         #[arg(long, default_value = "/run/aursmith/worker.sock")]
         socket: PathBuf,
     },
+    /// 生成 Controller Ed25519 密钥；私钥只输出一次，必须写入 secret。
+    GenerateControllerKey,
 }
 
 #[derive(Debug, Subcommand)]
@@ -67,7 +70,25 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Doctor { role } => doctor(&role)?,
         Command::SshGateway { socket } => ssh_gateway(&socket).await?,
+        Command::GenerateControllerKey => generate_controller_key()?,
     }
+    Ok(())
+}
+
+fn generate_controller_key() -> anyhow::Result<()> {
+    let mut secret = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .context("无法打开系统随机源")?
+        .read_exact(&mut secret)
+        .context("无法从系统随机源读取密钥")?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "private_key_hex": hex::encode(secret),
+            "public_key_hex": hex::encode(signing_key.verifying_key().to_bytes()),
+        }))?
+    );
     Ok(())
 }
 
@@ -123,6 +144,13 @@ fn doctor(role: &str) -> anyhow::Result<()> {
     checks.push(json!({"check": "proc", "ok": std::path::Path::new("/proc").exists()}));
     if role == "builder" {
         checks.push(json!({"check": "kvm", "ok": std::path::Path::new("/dev/kvm").exists()}));
+        checks.push(json!({"check": "qemu-system-x86_64", "ok": command_works("/usr/bin/qemu-system-x86_64", "--version")}));
+        checks.push(
+            json!({"check": "qemu-img", "ok": command_works("/usr/bin/qemu-img", "--version")}),
+        );
+        checks.push(
+            json!({"check": "virtiofsd", "ok": command_works("/usr/lib/virtiofsd", "--version")}),
+        );
     }
     let ok = checks.iter().all(|check| check["ok"] == true);
     println!(
@@ -133,4 +161,14 @@ fn doctor(role: &str) -> anyhow::Result<()> {
         bail!("Doctor 检查失败");
     }
     Ok(())
+}
+
+fn command_works(program: &str, argument: &str) -> bool {
+    std::process::Command::new(program)
+        .arg(argument)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }

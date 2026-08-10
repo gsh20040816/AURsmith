@@ -3,6 +3,8 @@ mod config;
 mod db;
 mod error;
 mod routes;
+mod scheduler;
+mod transport;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -37,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let database = db::connect(&config.database_url).await?;
-    let state = routes::AppState::new(database, config.clone());
+    let signing_key = config.load_signing_key()?;
+    let state = routes::AppState::new(database, config.clone(), signing_key);
+    scheduler::spawn(state.clone());
     let app = routes::router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_address)
         .await

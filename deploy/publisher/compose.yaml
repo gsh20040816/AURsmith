@@ -5,6 +5,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/images/worker.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -35,6 +37,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/images/worker.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
     entrypoint: [/usr/bin/sshd]
     command: [-D, -e, -f, /etc/ssh/sshd_config]
     read_only: true
@@ -43,7 +47,15 @@ services:
     volumes:
       - worker-run:/run/aursmith
       - ../common/sshd_config:/etc/ssh/sshd_config:ro
-    secrets: [ssh_host_ed25519_key, authorized_keys]
+    secrets:
+      - source: ssh_host_ed25519_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: authorized_keys
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     tmpfs: [/tmp:size=16m,mode=1777]
     ports:
       - ${AURSMITH_SSH_BIND:-127.0.0.1:2223}:2222
@@ -54,7 +66,7 @@ services:
     restart: unless-stopped
 
   repository:
-    image: caddy:2.10.2-alpine
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

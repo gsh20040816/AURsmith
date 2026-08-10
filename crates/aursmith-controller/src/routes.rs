@@ -1,5 +1,6 @@
 use crate::{auth, config::Config, error::ApiError};
 use aursmith_domain::{REQUIREMENTS, WorkerRole, WorkerState};
+use aursmith_protocol::ResourceLimits;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -8,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,13 +25,15 @@ use uuid::Uuid;
 pub struct AppState {
     pub database: SqlitePool,
     pub config: Arc<Config>,
+    pub signing_key: Arc<SigningKey>,
 }
 
 impl AppState {
-    pub fn new(database: SqlitePool, config: Config) -> Self {
+    pub fn new(database: SqlitePool, config: Config, signing_key: SigningKey) -> Self {
         Self {
             database,
             config: Arc::new(config),
+            signing_key: Arc::new(signing_key),
         }
     }
 }
@@ -45,6 +49,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/requirements", get(requirements))
         .route("/api/v1/workers", get(list_workers).post(register_worker))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
+        .route("/api/v1/workers/{id}/probe", post(probe_worker))
+        .route("/api/v1/jobs", get(list_jobs).post(create_job))
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -343,6 +349,121 @@ async fn drain_worker(
     ))
 }
 
+async fn probe_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let worker_state = crate::scheduler::probe_worker(&state, &id).await?;
+    Ok(Json(json!({"id": id, "state": worker_state})))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateJobRequest {
+    required_role: WorkerRole,
+    revision_sha256: String,
+    #[serde(default)]
+    required_labels: Vec<String>,
+    limits: Option<ResourceLimits>,
+    #[serde(default)]
+    priority: i32,
+}
+
+async fn create_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateJobRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let administrator_id = auth::require_administrator(&state, &headers).await?;
+    if request.revision_sha256.len() != 64
+        || !request
+            .revision_sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(ApiError::bad_request(
+            "INVALID_REVISION_DIGEST",
+            "revision_sha256 必须是 64 位十六进制 SHA-256",
+        ));
+    }
+    let limits = request.limits.unwrap_or(ResourceLimits {
+        cpu_count: 1,
+        memory_mib: 1024,
+        disk_mib: 4096,
+        timeout_seconds: 600,
+    });
+    if limits.cpu_count == 0
+        || limits.memory_mib < 256
+        || limits.disk_mib < 512
+        || limits.timeout_seconds == 0
+    {
+        return Err(ApiError::bad_request(
+            "INVALID_RESOURCE_LIMITS",
+            "任务资源限制超出允许范围",
+        ));
+    }
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(role_name(request.required_role))
+    .bind(request.priority)
+    .bind(request.revision_sha256.to_ascii_lowercase())
+    .bind(serde_json::to_string(&request.required_labels).map_err(ApiError::internal)?)
+    .bind(serde_json::to_string(&limits).map_err(ApiError::internal)?)
+    .bind(now)
+    .bind(now)
+    .execute(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    append_event(
+        &state.database,
+        "job",
+        &id,
+        "job_created",
+        json!({"required_role": role_name(request.required_role)}),
+        &administrator_id,
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"id": id, "status": "queued"})),
+    ))
+}
+
+async fn list_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT jobs.id, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.created_at, jobs.updated_at, workers.name AS worker_name FROM jobs LEFT JOIN workers ON workers.id = jobs.worker_id ORDER BY jobs.created_at DESC LIMIT 200",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "required_role": row.get::<String, _>("required_role"),
+                "status": row.get::<String, _>("status"),
+                "priority": row.get::<i64, _>("priority"),
+                "failure_code": row.get::<Option<String>, _>("failure_code"),
+                "revision_sha256": row.get::<Option<String>, _>("revision_sha256"),
+                "worker_name": row.get::<Option<String>, _>("worker_name"),
+                "created_at": row.get::<String, _>("created_at"),
+                "updated_at": row.get::<String, _>("updated_at"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": items})))
+}
+
 fn role_name(role: WorkerRole) -> &'static str {
     match role {
         WorkerRole::Builder => "builder",
@@ -407,4 +528,79 @@ async fn append_event_in_transaction(
     .await
     .map_err(ApiError::internal)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    async fn test_router() -> Router {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let config = Config {
+            bind_address: "127.0.0.1:0".into(),
+            database_url: "sqlite::memory:".into(),
+            setup_token: "测试初始化令牌-至少二十个字符".into(),
+            signing_key_file: "/不存在".into(),
+            ssh_identity_file: "/不存在".into(),
+            ssh_known_hosts_file: "/不存在".into(),
+            secure_cookies: false,
+            session_hours: 1,
+        };
+        router(AppState::new(
+            database,
+            config,
+            SigningKey::from_bytes(&[9_u8; 32]),
+        ))
+    }
+
+    #[tokio::test]
+    async fn setup_login_and_authenticated_requirements_flow() {
+        let app = test_router().await;
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/v1/setup")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "token": "测试初始化令牌-至少二十个字符",
+                    "username": "admin",
+                    "password": "足够长的测试密码-123456"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(setup).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"username": "admin", "password": "足够长的测试密码-123456"}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let requirements = Request::builder()
+            .uri("/api/v1/requirements")
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(requirements).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

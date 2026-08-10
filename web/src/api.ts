@@ -42,6 +42,17 @@ export type Worker = {
   labels: string[];
   last_seen_at: string | null;
 };
+export type Job = {
+  id: string;
+  required_role: Worker["role"];
+  status: string;
+  priority: number;
+  failure_code: string | null;
+  revision_sha256: string | null;
+  worker_name: string | null;
+  created_at: string;
+  updated_at: string;
+};
 export const api = {
   setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
   setup: (input: { token: string; username: string; password: string }) =>
@@ -58,6 +69,11 @@ export const api = {
   me: () => request<Session>("/api/v1/auth/me"),
   requirements: () => request<{ items: Requirement[] }>("/api/v1/requirements"),
   workers: () => request<{ items: Worker[] }>("/api/v1/workers"),
+  jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
+  probeWorker: (id: string) =>
+    request<{ id: string; state: string }>(`/api/v1/workers/${id}/probe`, {
+      method: "POST"
+    }),
   drainWorker: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/workers/${id}/drain`, {
       method: "POST"

@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiError, Requirement, Session, Worker, api } from "./api";
+import { ApiError, Job, Requirement, Session, Worker, api } from "./api";
 
 type View =
   | "dashboard"
@@ -106,7 +106,8 @@ export function App() {
       <main className="workspace">
         {view === "dashboard" && <Dashboard />}
         {view === "workers" && <WorkersView />}
-        {view !== "dashboard" && view !== "workers" && <PlannedView view={view} />}
+        {view === "builds" && <BuildsView />}
+        {view !== "dashboard" && view !== "workers" && view !== "builds" && <PlannedView view={view} />}
       </main>
     </div>
   );
@@ -215,12 +216,20 @@ function WorkersView() {
           <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未注册 Worker</strong><p>先部署对应 Compose Stack，再固定 SSH host key 并注册端点。</p></div></div>
         ) : (
           <div className="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>端点</th><th>标签</th><th /></tr></thead><tbody>
-            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}</td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td><code>{worker.endpoint}</code></td><td>{worker.labels.join(" · ") || "—"}</td><td>{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</td></tr>)}
+            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}</td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td><code>{worker.endpoint}</code></td><td>{worker.labels.join(" · ") || "—"}</td><td><div className="row-actions"><button className="text-button" onClick={() => void api.probeWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>探测</button>{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</div></td></tr>)}
           </tbody></table></div>
         )}
       </section>
     </>
   );
+}
+
+function BuildsView() {
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [error, setError] = useState("");
+  const refresh = () => void api.jobs().then((response) => setJobs(response.items)).catch((reason) => setError(messageOf(reason)));
+  useEffect(refresh, []);
+  return <><header className="page-header compact"><div><p className="eyebrow">W04 / B03</p><h1>构建任务</h1><p className="lede">Controller 签发 JobSpec；Worker Journal 拒绝冲突和迟到 Attempt。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="table-panel"><div className="section-heading"><h2>任务队列</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>{jobs.length === 0 ? <div className="empty-state"><span className="empty-symbol">◇</span><div><strong>没有构建任务</strong><p>订阅产生通过审计的 Revision 后，完整依赖闭包会显示在这里。</p></div></div> : <div className="table-scroll"><table><thead><tr><th>任务</th><th>角色</th><th>状态</th><th>Worker</th><th>Revision</th><th>更新时间</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td><code>{job.id.slice(0, 8)}</code></td><td>{roleLabel(job.required_role)}</td><td><span className={`state ${job.status}`}>{job.failure_code ?? job.status}</span></td><td>{job.worker_name ?? "—"}</td><td><code>{job.revision_sha256?.slice(0, 12) ?? "—"}</code></td><td>{new Date(job.updated_at).toLocaleString("zh-CN")}</td></tr>)}</tbody></table></div>}</section></>;
 }
 
 function PlannedView({ view }: { view: View }) {

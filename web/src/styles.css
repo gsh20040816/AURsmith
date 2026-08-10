@@ -83,6 +83,7 @@ td { padding: 14px 12px; border-bottom: 1px solid var(--line); font-size: .84rem
 .state.online { color: #36714a; border-color: #8bb197; }
 .state.degraded, .state.draining { color: #91651d; border-color: #c8a76d; }
 .state.offline, .state.incompatible { color: #9a4935; border-color: #c69083; }
+.row-actions { display: flex; gap: 8px; }
 .secondary-button, .primary-button { border: 1px solid var(--ink); padding: 10px 16px; background: transparent; color: var(--ink); }
 .primary-button { width: 100%; margin-top: 9px; background: var(--ink); color: white; }
 .primary-button:hover { background: #2b3933; }

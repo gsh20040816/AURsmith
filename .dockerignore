@@ -1,0 +1,11 @@
+.git
+.gitignore
+target
+web/node_modules
+web/dist
+web/*.tsbuildinfo
+runtime
+deploy/*/secrets
+*.db
+*.db-shm
+*.db-wal

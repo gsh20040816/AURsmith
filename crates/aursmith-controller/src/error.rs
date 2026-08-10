@@ -8,6 +8,14 @@ pub struct ApiError {
     pub message: String,
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     code: &'a str,
