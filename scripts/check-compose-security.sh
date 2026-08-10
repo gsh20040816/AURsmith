@@ -45,6 +45,14 @@ if [[ "$(jq '[.services.worker.devices[]? | select(.source == "/dev/kvm")] | len
 fi
 
 publisher_json="$(docker compose -f deploy/publisher/compose.yaml config --format json)"
+if [[ "$(jq -r '.services.repository.build.dockerfile // ""' <<<"${publisher_json}")" != "deploy/images/repository.Dockerfile" ]]; then
+  echo "仓库 Caddy 必须使用移除文件 capability 的派生镜像" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services.repository.tmpfs[]? | select(test("^/(config|data):.*uid=10001,.*gid=10001"))] | length' <<<"${publisher_json}")" != "2" ]]; then
+  echo "仓库 Caddy 的可写 tmpfs 必须属于无特权用户" >&2
+  exit 1
+fi
 if [[ "$(jq '[.services.signer | select(.network_mode == "none")] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "Signer 必须完全断网" >&2
   exit 1
@@ -63,6 +71,16 @@ if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_pu
 fi
 if jq -e '.services.signer.secrets[]? | select(.source == "repository_gpg_public_key")' <<<"${publisher_json}" >/dev/null; then
   echo "Signer 不需要挂载仓库 GPG 公钥 secret" >&2
+  exit 1
+fi
+
+controller_json="$(docker compose -f deploy/controller/compose.yaml config --format json)"
+if [[ "$(jq -r '.services.web.build.dockerfile // ""' <<<"${controller_json}")" != "deploy/images/web.Dockerfile" ]]; then
+  echo "Web Caddy 必须使用无特权派生镜像" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services.web.tmpfs[]? | select(test("^/(config|data):.*uid=10001,.*gid=10001"))] | length' <<<"${controller_json}")" != "2" ]]; then
+  echo "Web Caddy 的可写 tmpfs 必须属于无特权用户" >&2
   exit 1
 fi
 

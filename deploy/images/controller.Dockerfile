@@ -11,7 +11,8 @@ ARG AURSMITH_SOURCE_GIT_COMMIT
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates openssh-client openssh-server rsync util-linux \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home --home-dir /var/lib/aursmith --shell /bin/sh aursmith
+    && useradd --system --uid 10001 --create-home --home-dir /var/lib/aursmith --shell /bin/sh aursmith \
+    && install -d -o aursmith -g aursmith /run/aursmith
 COPY --from=builder /src/target/release/aursmith-controller /usr/local/bin/aursmith-controller
 COPY --from=builder /src/target/release/aursmithctl /usr/local/bin/aursmithctl
 USER 10001:10001

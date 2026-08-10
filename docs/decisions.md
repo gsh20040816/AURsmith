@@ -38,6 +38,7 @@
 - ADR-034：第一版先用独立、无缓存的 Squid 容器补齐 Fetch VM 的实际外网出口，只允许 80/443 并拒绝全部本地和保留目标。pacoloco 命中率、按 Revision 自动下发精确域名 ACL 属于后续优化；Build VM 无网边界不因此变化。
 - ADR-035：Arch 软件仓库镜像在不可变 Profile 构建时配置，而不是作为每个 Build Job 的可变参数。镜像必须是 HTTPS Base URL，同时写入 Guest mirrorlist 和签名 Profile 清单；Fetch Guest 用它下载官方依赖，Build Guest 继续使用已准备好的离线包。这样镜像选择可追溯，也不会破坏无网构建边界。
 - ADR-036：以 QEMU 内置 virtio-9p `mapped-xattr` 取代原计划的两个 virtiofsd 进程。真实容器验证确认当前 Rust virtiofsd 在非 root、`cap_drop: ALL` 条件下无法初始化共享目录，而官方文档也把 root 作为常规运行前提；给 Builder 增加 root 或 capability 与既定安全边界冲突。9p 输入固定只读，输出限于 Attempt 目录，Guest 仍处于 KVM 边界，Worker 对全部输出重新验证。以后若 virtiofsd 提供经过验证的无特权模式，可通过新 ADR 重新评估。
+- ADR-037：Controller、Web 和仓库 Caddy 镜像必须在构建时建立固定 UID/GID 10001 的非 root 用户，并预创建需要由命名卷覆盖的可写目录。官方 Caddy 二进制自带 `cap_net_bind_service` 文件 capability，在 `cap_drop: ALL` 与 `no-new-privileges` 下会于 exec 阶段失败，因此 AURsmith 的派生镜像显式移除该 capability，并只监听容器内非特权端口；不会为方便启动而恢复 capability 或 root。
 
 ## 已拒绝
 

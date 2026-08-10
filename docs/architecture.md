@@ -118,3 +118,9 @@ Runner 只支持 `codex` 与 `claude_code` 两种适配器，不接受用户提�
 真实 provider API key 不进入 Runner 容器。独立 `agent-credential-gateway` 挂载 low/high 两份 Docker secret，Runner 只连接内部 Agent 网络中的网关路径并使用无权限占位令牌。网关按静态配置的 upstream Base URL 转发流式响应，删除调用方的认证头后重新注入对应的 bearer 或 `x-api-key`，且不接受请求指定目标主机。这样既支持 Codex/Claude Code 的自定义 provider 与 Base URL，也避免模型通过工具或环境读取真实密钥。网关是唯一拥有 Agent 外网的容器。
 
 每次报告保存适配器、provider 名称、模型、CLI 版本、文件阅读范围、结构化发现、原始结构化输出、起止时间、退出状态、成本和报告摘要。API key、认证头和内部凭据不进入日志、数据库或报告。每日/月度调用次数与月度成本任一达到上限时，剩余任务进入人工队列，不会跳过审计。
+
+## 无特权 Web 与控制面容器
+
+Controller 镜像在切换到 UID/GID 10001 前预创建 `/run/aursmith`，保证第一次挂载空的命名卷后仍能创建 Unix Socket；数据库、运行目录和备份目录分别使用独立卷。Web 与仓库服务使用 AURsmith 派生的 Caddy 镜像，构建时移除上游二进制的 `cap_net_bind_service` 文件 capability，并以同一固定非 root 用户运行。两者只监听 8080 等非特权端口，由宿主端口映射承担对外 80/443。
+
+这三个常驻服务均保持只读根文件系统、`cap_drop: ALL` 和 `no-new-privileges`。Caddy 的 `/config`、`/data` 使用指定 UID/GID 的 tmpfs；公开仓库只读挂载到仓库 Caddy。上述目录所有权属于镜像和 Compose 契约的一部分，不能依赖容器首次以 root 启动后再修复权限。

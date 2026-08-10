@@ -175,3 +175,15 @@
 - 清理缺陷：首次成功复验发现 completed 目录仍包含 qcow2 overlay，随后改为结果验证成功后、原子接管前删除 overlay 和控制 Socket。使用修复后的 Worker 再次执行 Fetch Job `812b36c9-163f-42a2-92ae-c9d02a4223d0` 和 Build Job `c9acb9bf-596f-4e12-82d9-ba5930e5f6af`，两者成功；Build Attempt `7857d4f3-f425-4048-89d1-3ba73a60ea84` 生成 1252 字节、SHA-256 为 `30eaae8d9f82972b9c3c209862b8f6077cf8aa4cca88b329007be03f9bd25b79` 的包。随后实际检查全部 completed 目录，不再存在 overlay 或 Socket，也没有残留 QEMU/virtiofsd 进程。
 - 测试结束后已停止并删除临时 Worker、source proxy 和 Docker 网络；两个仅用于本轮 Profile 导出的 Docker volume 已删除且不可恢复，缓存目录已移动到桌面环境回收站，可恢复。
 - 边界：测试 PKGBUILD 不含外部 source 和官方依赖；代理 TCP 路径和镜像构建已实际运行，但 Fetch Guest 通过代理下载真实 source/官方依赖仍未在这条 fixture 中覆盖。
+
+## 2026-08-10：跨角色发布、归档与 pacman 客户端闭环
+
+- 拓扑：在同一临时 Docker 网络中分别启动 Builder、Builder SSH、Publisher、Publisher SSH、断网 Signer、仓库 Caddy、Archiver、Controller、Web 和独立 Arch Linux 客户端；大文件均由目标角色使用 OpenSSH forced command 与 rsync 拉取，没有经过 Controller。
+- Artifact 传输：Builder 完成目录中的 `aursmith-e2e-fixture` 通过绑定 Attempt、源/目标 Worker、文件摘要和 writer epoch 1 的 TransferCapability 进入 Publisher。首次使用旧 fixture 固定的 epoch 0 被 Publisher 以 `WRITER_EPOCH_MISMATCH` 拒绝；fixture 随后改为显式接收 epoch，正确授权返回 `IMPORT_VERIFIED`，证明失败没有被静默降级。
+- 发布：第一个不可变 Release 为 `b14e27db-d7ac-4894-bd90-c4096ab07747`，Manifest SHA-256 为 `ad7be669a97c8e05f949f68ff90b5ee8fae4ee6cec4dedb4c9aa3b48e4314210`；第二个为 `dca84e41-b05e-41a6-a796-5cf9453e1d67`，Manifest SHA-256 为 `a4d1e9987dc5abbdba22a27c0718b95ee518ea94e43b05b7dbf16e2ee8c3ea22`。Publisher 对软件包归档重新检查，断网 Signer 使用测试 GPG 指纹 `7FDE0628CE05A1E752E80C8C8F4E27E3DC73CD20` 执行 repo-add 和签名，Publisher 再验后原子切换数据库。
+- 归档：两个 Release 均经独立 Capability 拉取并返回 `ARCHIVE_VERIFIED`。第一次完整库存巡检统计 1 个 Release、10 个文件、8157 字节、0 个失败；第二个 Release 也形成独立不可变快照。
+- 客户端：独立 Arch 容器从仓库下载公钥，人工核对后导入并本地信任；pacman 配置使用 `SigLevel = Required DatabaseRequired`。客户端先安装 `1.0-1`，第二次 `pacman -Syu` 升级到 `1.1-1`。Publisher 使用签名回滚授权切回第一个 Release 后，保留 1.1 状态的客户端通过历史 Release 的显式 `pacman -U` 命令降级到 `1.0-1`；pacman 明确输出 downgrade 警告，没有把服务端回滚误报成客户端自动降级。
+- 控制面：Controller 在只读、零 capability、no-new-privileges 容器中完成一次性令牌初始化和管理员登录；鉴权后的 `/api/v1/requirements` 返回包括 B05 与 O02 的完整总账。实际创建并再次验证控制面备份 `9bfa4fcd-2018-4f57-ae65-e96333713daa`，数据库为 483328 字节，SHA-256 为 `a8479d97a7120f2c9825b13a512d72c91ea8706684dee79afc640a9290dc19b2`。
+- 容器缺陷：首次按 Compose 安全策略运行仓库 Caddy 时，因官方二进制携带 `cap_net_bind_service` 而在 exec 阶段得到 `operation not permitted`；派生镜像移除文件 capability、使用 UID/GID 10001 并监听非特权端口后，真实仓库请求成功。Controller 首次运行也因空命名卷把 `/run/aursmith` 变为 root 属主而失败；在镜像内预创建并交给 UID 10001 后，`/healthz` 返回正常。Web Caddy 在相同限制下返回 HTTP 200 和预期 CSP、DENY frame、nosniff 响应头。
+- 清理：验证结束后已停止并删除前缀为 `aursmith-release-e2e` 的 10 个临时容器、16 个临时卷和独立 Docker 网络；卷不可恢复，包含测试密钥和 fixture 的临时目录已移动到桌面环境回收站，可恢复。
+- 边界：本条把真实 Artifact 传输到 pacman 升级/降级串成一个闭环，但软件包在该临时拓扑中由 Arch 容器生成；KVM Fetch→Build 已在上一条独立真实验证。Controller 尚未自动调度这次完整链路，真实 Codex/Claude provider 也因没有可用 API key 未调用，因此不能把两条相邻验证合并宣称为订阅到发布的无人值守端到端验收。

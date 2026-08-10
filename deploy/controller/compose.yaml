@@ -97,8 +97,8 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs:
-      - /config:size=16m,mode=0700
-      - /data:size=16m,mode=0700
+      - /config:uid=10001,gid=10001,size=16m,mode=0700
+      - /data:uid=10001,gid=10001,size=16m,mode=0700
       - /tmp:size=16m,mode=1777
     ports:
       - ${AURSMITH_WEB_BIND:-127.0.0.1:8080}:8080

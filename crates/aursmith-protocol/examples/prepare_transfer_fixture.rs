@@ -9,9 +9,9 @@ use uuid::Uuid;
 
 fn main() -> anyhow::Result<()> {
     let arguments = env::args().collect::<Vec<_>>();
-    if arguments.len() != 7 {
+    if !(arguments.len() == 7 || arguments.len() == 8) {
         bail!(
-            "用法：prepare_transfer_fixture <source-worker-id> <destination-worker-id> <job-id> <attempt-id> <artifact> <envelope-output>"
+            "用法：prepare_transfer_fixture <source-worker-id> <destination-worker-id> <job-id> <attempt-id> <artifact> <envelope-output> [writer-epoch]"
         );
     }
     let artifact = Path::new(&arguments[5]);
@@ -27,7 +27,12 @@ fn main() -> anyhow::Result<()> {
         }),
         release_id: None,
         backup_id: None,
-        writer_epoch: 0,
+        writer_epoch: arguments
+            .get(7)
+            .map(|value| value.parse())
+            .transpose()
+            .context("writer epoch 无效")?
+            .unwrap_or(0),
         files: vec![ManifestEntry {
             path: artifact
                 .file_name()

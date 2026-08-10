@@ -72,6 +72,10 @@ pub const REQUIREMENTS: &[Requirement] = &[
         title: "动态依赖 Profile",
     },
     Requirement {
+        id: "B05",
+        title: "构建镜像源配置与溯源",
+    },
+    Requirement {
         id: "W01",
         title: "全部服务 Docker Compose 部署",
     },
