@@ -24,9 +24,11 @@ services:
       AURSMITH_AGENT_DAILY_CALL_LIMIT: ${AURSMITH_AGENT_DAILY_CALL_LIMIT:-300}
       AURSMITH_AGENT_MONTHLY_CALL_LIMIT: ${AURSMITH_AGENT_MONTHLY_CALL_LIMIT:-3000}
       AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD: ${AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD:-5000000}
+      AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS: ${AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS:-0}
       AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
       AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
       AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
+      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: /run/aursmith-caddy-data/caddy/pki/authorities/local/root.crt
       AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
       AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
       AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
@@ -43,6 +45,7 @@ services:
     volumes:
       - controller-data:/var/lib/aursmith
       - controller-run:/run/aursmith
+      - caddy-data:/run/aursmith-caddy-data:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
@@ -96,12 +99,15 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_WEB_HOST: ${AURSMITH_WEB_HOST:-aursmith.lan}
+    volumes:
+      - caddy-data:/data
     tmpfs:
       - /config:uid=10001,gid=10001,size=16m,mode=0700
-      - /data:uid=10001,gid=10001,size=16m,mode=0700
       - /tmp:size=16m,mode=1777
     ports:
-      - ${AURSMITH_WEB_BIND:-127.0.0.1:8080}:8080
+      - ${AURSMITH_WEB_BIND:-0.0.0.0:8443}:8443
     networks: [control]
     depends_on:
       controller:
@@ -190,6 +196,7 @@ secrets:
 volumes:
   controller-data:
   controller-run:
+  caddy-data:
 
 networks:
   control:

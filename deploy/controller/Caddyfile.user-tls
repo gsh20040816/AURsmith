@@ -2,7 +2,7 @@
 	admin off
 }
 https://{$AURSMITH_WEB_HOST:aursmith.lan}:8443 {
-	tls internal
+	tls /run/secrets/web_tls_certificate /run/secrets/web_tls_private_key
 	encode zstd gzip
 	handle /api/* {
 		reverse_proxy controller:8080

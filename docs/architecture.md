@@ -13,6 +13,8 @@
 
 系统由 Controller、Builder、Publisher 和 Archiver 四套 Docker Compose Stack 组成，每个 Worker 实例只承担一个角色。同一物理设备可以运行多套 Stack，但不能共享可写服务状态。
 
+Controller Web Caddy 默认在 8443 使用内部 CA，CA 状态持久化到专用 `caddy-data` 卷；Controller 只能只读访问根证书，不能读取 CA 私钥。管理员会话可以下载根证书，Doctor 使用固定 openssl 参数检查格式和未来 30 天有效期。已有受信任证书时使用 `compose.user-tls.yaml` 覆盖：证书与私钥作为 Docker secret 只进入 Web Caddy，同时关闭内部 CA 下载。DNS、根证书首次分发和根 CA 轮换仍是明确的人工运维动作。
+
 Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docker Socket、libvirt Socket、TUN 或 privileged 权限。受限联网的 Fetch Guest 通过 Publisher 代理获取源码；全新的 Build Guest 不带网卡，只接收不可变且已经审计的输入。
 
 第一版 Publisher 提供两个职责分离的网络服务。无特权 Squid source-proxy 供 Fetch VM 获取 AUR source，QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。pacoloco 只缓存 Arch 官方仓库文件，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。仓库 Caddy 在 `/arch-cache/` 下反向代理 pacoloco；部署者可以把该稳定 HTTPS 地址写入新 Profile，Fetch Guest 随后沿同一镜像下载官方依赖，Build Guest 仍然无网。
@@ -137,10 +139,10 @@ Runner 只支持 `codex` 与 `claude_code` 两种适配器，不接受用户提�
 
 每次报告保存适配器、provider 名称、模型、CLI 版本、文件阅读范围、结构化发现、原始结构化输出、起止时间、退出状态、成本和报告摘要。API key、认证头和内部凭据不进入日志、数据库或报告。每日/月度调用次数与月度成本任一达到上限时，剩余任务进入人工队列，不会跳过审计。
 
-设置 API 只允许在登录后读取安全摘要和修改三项 Agent 预算。运行时覆盖值保存在 SQLite `system_settings`，Agent 调度每次执行前读取，因此无需重启 Controller；值为 0 表示立即停止新的自动 Agent 调用。适配器、provider、模型和 Base URL 仍由 Compose 环境固定，API key 仍只来自凭据网关 secret。设置 API 只返回 Runner 数量、支持的适配器及“是否配置”状态，绝不返回 key、认证头或 secret 路径内容。
+设置 API 只允许在登录后读取安全摘要，修改三项 Agent 预算和随机高成本复查率。运行时覆盖值保存在 SQLite `system_settings`，Agent 调度每次执行前读取，因此无需重启 Controller；预算值为 0 表示立即停止新的自动 Agent 调用。随机复查以基点表示，默认 0；非零时按 AuditBundle SHA-256 确定性抽样，命中的三票通过项进入一次高成本审计，只有明确通过才放行。适配器、provider、模型和 Base URL 仍由 Compose 环境固定，API key 仍只来自凭据网关 secret。设置 API 只返回 Runner 数量、支持的适配器及“是否配置”状态，绝不返回 key、认证头或 secret 路径内容。
 
 ## 无特权 Web 与控制面容器
 
 Controller 镜像在切换到 UID/GID 10001 前预创建 `/run/aursmith`，保证第一次挂载空的命名卷后仍能创建 Unix Socket；数据库、运行目录和备份目录分别使用独立卷。Web 与仓库服务使用 AURsmith 派生的 Caddy 镜像，构建时移除上游二进制的 `cap_net_bind_service` 文件 capability，并以同一固定非 root 用户运行。两者只监听 8080 等非特权端口，由宿主端口映射承担对外 80/443。
 
-这三个常驻服务均保持只读根文件系统、`cap_drop: ALL` 和 `no-new-privileges`。Caddy 的 `/config`、`/data` 使用指定 UID/GID 的 tmpfs；公开仓库只读挂载到仓库 Caddy。上述目录所有权属于镜像和 Compose 契约的一部分，不能依赖容器首次以 root 启动后再修复权限。
+这三个常驻服务均保持只读根文件系统、`cap_drop: ALL` 和 `no-new-privileges`。仓库 Caddy 的 `/config`、`/data` 使用指定 UID/GID 的 tmpfs；Controller Web Caddy 的 `/config` 使用同样的 tmpfs，而 `/data` 为持久化内部 CA 的专用命名卷。公开仓库只读挂载到仓库 Caddy。上述目录所有权属于镜像和 Compose 契约的一部分，不能依赖容器首次以 root 启动后再修复权限。

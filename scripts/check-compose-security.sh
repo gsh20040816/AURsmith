@@ -88,8 +88,13 @@ if [[ "$(jq -r '.services.web.build.dockerfile // ""' <<<"${controller_json}")" 
   echo "Web Caddy 必须使用无特权派生镜像" >&2
   exit 1
 fi
-if [[ "$(jq '[.services.web.tmpfs[]? | select(test("^/(config|data):.*uid=10001,.*gid=10001"))] | length' <<<"${controller_json}")" != "2" ]]; then
-  echo "Web Caddy 的可写 tmpfs 必须属于无特权用户" >&2
+if [[ "$(jq '[.services.web.tmpfs[]? | select(test("^/config:.*uid=10001,.*gid=10001"))] | length' <<<"${controller_json}")" != "1" ]]; then
+  echo "Web Caddy 的配置 tmpfs 必须属于无特权用户" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services.web.volumes[]? | select(.target == "/data" and .type == "volume")] | length' <<<"${controller_json}")" != "1" ]] \
+  || [[ "$(jq '[.services.controller.volumes[]? | select(.target == "/run/aursmith-caddy-data" and .read_only == true)] | length' <<<"${controller_json}")" != "1" ]]; then
+  echo "内部 CA 数据必须由 Caddy 持久写入，并只读共享给 Controller" >&2
   exit 1
 fi
 

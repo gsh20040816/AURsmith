@@ -292,3 +292,11 @@
 - 排查中先后真实暴露并修复了旧 Profile 缺少 9p 网络模块、`pacman.conf`、virtio 网卡驱动和初始化 keyring的问题。最后一个失败来自误把 pacman 的非 Query 选项用于 `-Qp`；正式实现改为用固定 argv 的 bsdtar 从已验签包读取 `.PKGINFO`，并排除 `.sig` 文件。只有上述最终成功 Attempt 计入 B02/B05 验收。
 - 最终执行 `bash scripts/test-all.sh`：全仓库 110 个 Rust 测试、前端 TypeScript 检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
 - 边界：该 fixture 没有额外 AUR source URL，因此本条严格证明的是同一个 Fetch KVM 内的受限网络、官方包下载、签名校验和溯源记录；AUR source 的实际 HTTPS 路径由同一代理机制和既有 Publisher Doctor覆盖，但不把二者合并声称为任意上游源码均已安全审计。
+
+## 2026-08-11：随机高成本复查与 Controller TLS
+
+- Agent 设置新增 0～10000 基点的随机高成本复查率，环境和认证设置 API 的默认值均为 0。测试确认默认三票通过不创建高成本任务、10000 基点必定创建一次高成本任务，同一 AuditBundle 在任意重启后映射到相同抽样结果；2 票和不超过 1 票的原规则不受影响。
+- Controller Web Caddy 改为默认监听 `https://aursmith.lan:8443` 并使用内部 CA，`/data` 进入独立持久卷。真实无特权、只读、零 capability 容器成功生成站点证书和根 CA，经 HTTPS 返回 Web 页面；根证书主题为 `Caddy Local Authority - 2026 ECC Root`，有效期到 2036 年，固定 openssl `-checkend 2592000` 验证通过。
+- Controller 提供只接受管理员会话的 `/api/v1/client-ca.crt`；路由测试确认未登录返回 401，登录后返回 PEM 下载响应。设置页只在内部 CA 文件可用时显示下载按钮；用户证书 override 把证书和私钥作为 Docker secret 仅挂载给 Caddy，并让 Controller 进入外部信任链模式。
+- 默认和用户证书两套 Compose 均通过渲染；安全检查确认 CA 数据由 Caddy 持久写入且只读共享给 Controller。内部 CA 私钥不会进入 Controller 数据库或备份，必须按 README 单独离线备份。DNS、系统信任库导入和根 CA 轮换仍是部署验收，不声称已在当前开发机的其他客户端完成。
+- Controller 与 Web 两个派生镜像均实际构建成功，用户证书 Caddyfile 使用临时一天证书通过真实 `caddy validate`。最终执行 `bash scripts/test-all.sh`：全仓库 113 个 Rust 测试、前端 TypeScript 检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。

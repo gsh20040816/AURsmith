@@ -17,9 +17,11 @@ pub struct Config {
     pub agent_daily_call_limit: i64,
     pub agent_monthly_call_limit: i64,
     pub agent_monthly_cost_limit_microusd: i64,
+    pub agent_random_high_cost_review_basis_points: i64,
     pub repository_name: String,
     pub source_git_commit: String,
     pub repository_base_url: String,
+    pub client_ca_certificate_file: Option<String>,
     pub webhook_url: Option<String>,
     pub webhook_hmac_secret_file: String,
     pub ntfy_url: Option<String>,
@@ -79,12 +81,18 @@ impl Config {
                 "AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD",
                 5_000_000,
             ),
+            agent_random_high_cost_review_basis_points: parse_bounded_nonnegative(
+                "AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS",
+                0,
+                10_000,
+            ),
             repository_name: env::var("AURSMITH_REPOSITORY_NAME")
                 .unwrap_or_else(|_| "aursmith".into()),
             source_git_commit: env::var("AURSMITH_SOURCE_GIT_COMMIT")
                 .unwrap_or_else(|_| "development".into()),
             repository_base_url: env::var("AURSMITH_REPOSITORY_BASE_URL")
                 .unwrap_or_else(|_| "https://repo.aursmith.lan".into()),
+            client_ca_certificate_file: optional_env("AURSMITH_CLIENT_CA_CERTIFICATE_FILE"),
             webhook_url: optional_env("AURSMITH_WEBHOOK_URL"),
             webhook_hmac_secret_file: env::var("AURSMITH_WEBHOOK_HMAC_SECRET_FILE")
                 .unwrap_or_else(|_| "/run/secrets/webhook_hmac_secret".into()),
@@ -145,4 +153,8 @@ fn parse_nonnegative(name: &str, default: i64) -> i64 {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value >= 0)
         .unwrap_or(default)
+}
+
+fn parse_bounded_nonnegative(name: &str, default: i64, maximum: i64) -> i64 {
+    parse_nonnegative(name, default).min(maximum)
 }

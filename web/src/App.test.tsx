@@ -72,8 +72,8 @@ describe("AURsmith 控制台", () => {
       const url = String(input);
       const body = url.endsWith("/setup/status") ? { initialized: true }
         : url.endsWith("/auth/me") ? { id: "admin-id", username: "admin" }
-          : url.endsWith("/settings") ? { agents: { supported_adapters: ["codex", "claude_code"], low_runner_count: 3, high_runner_configured: true, configuration_source: "docker_compose_environment_and_secrets", api_keys_exposed: false }, budget: { agent_daily_call_limit: 300, agent_monthly_call_limit: 3000, agent_monthly_cost_limit_microusd: 5000000, daily_used: 1, monthly_used: 2, monthly_cost_microusd: 3 }, notifications: { webhook_configured: false, ntfy_configured: false }, repository: { name: "aursmith", base_url: "https://repo.test", publisher_compatibility_days: 30 } }
-            : url.endsWith("/client-bootstrap") ? { repository_config: "[aursmith]", gpg_fingerprint: "ABCD", gpg_key_url: "https://repo.test/key", commands: [], warnings: [] }
+          : url.endsWith("/settings") ? { agents: { supported_adapters: ["codex", "claude_code"], low_runner_count: 3, high_runner_configured: true, configuration_source: "docker_compose_environment_and_secrets", api_keys_exposed: false }, budget: { agent_daily_call_limit: 300, agent_monthly_call_limit: 3000, agent_monthly_cost_limit_microusd: 5000000, agent_random_high_cost_review_basis_points: 0, daily_used: 1, monthly_used: 2, monthly_cost_microusd: 3 }, notifications: { webhook_configured: false, ntfy_configured: false }, repository: { name: "aursmith", base_url: "https://repo.test", publisher_compatibility_days: 30 } }
+            : url.endsWith("/client-bootstrap") ? { repository_config: "[aursmith]", gpg_fingerprint: "ABCD", gpg_key_url: "https://repo.test/key", client_ca_url: "/api/v1/client-ca.crt", commands: [], warnings: [] }
               : { items: [] };
       return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
     }));

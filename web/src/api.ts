@@ -198,6 +198,7 @@ export type ClientBootstrap = {
   repository_config: string;
   gpg_fingerprint: string;
   gpg_key_url: string;
+  client_ca_url: string | null;
   commands: string[];
   warnings: string[];
 };
@@ -252,6 +253,7 @@ export type Settings = {
     agent_daily_call_limit: number;
     agent_monthly_call_limit: number;
     agent_monthly_cost_limit_microusd: number;
+    agent_random_high_cost_review_basis_points: number;
     daily_used: number;
     monthly_used: number;
     monthly_cost_microusd: number;
@@ -275,7 +277,7 @@ export const api = {
   me: () => request<Session>("/api/v1/auth/me"),
   requirements: () => request<{ items: Requirement[] }>("/api/v1/requirements"),
   settings: () => request<Settings>("/api/v1/settings"),
-  updateSettings: (budget: Pick<Settings["budget"], "agent_daily_call_limit" | "agent_monthly_call_limit" | "agent_monthly_cost_limit_microusd">) =>
+  updateSettings: (budget: Pick<Settings["budget"], "agent_daily_call_limit" | "agent_monthly_call_limit" | "agent_monthly_cost_limit_microusd" | "agent_random_high_cost_review_basis_points">) =>
     request<Settings>("/api/v1/settings", { method: "PUT", body: JSON.stringify(budget) }),
   workers: () => request<{ items: Worker[] }>("/api/v1/workers"),
   registerWorker: (worker: {

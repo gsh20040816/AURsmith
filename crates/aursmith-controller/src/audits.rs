@@ -227,14 +227,42 @@ async fn evaluate(state: &AppState, bundle: &str, tier: &str) -> Result<(), ApiE
             };
     }
     match LowCostRoute::from_verdicts(verdicts) {
-        LowCostRoute::Approved => finalize(state, bundle, AuditDecision::ApprovedByLowCost).await?,
-        LowCostRoute::EscalateHighCost => {
-            sqlx::query("INSERT OR IGNORE INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'high', 1, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
-                .bind(Uuid::new_v4().to_string()).bind(bundle).execute(&state.database).await.map_err(ApiError::internal)?;
+        LowCostRoute::Approved => {
+            let basis_points = crate::routes::effective_i64_setting(
+                state,
+                "agent_random_high_cost_review_basis_points",
+                state.config.agent_random_high_cost_review_basis_points,
+            )
+            .await?;
+            if random_high_cost_review_selected(bundle, basis_points) {
+                schedule_high_cost(state, bundle).await?;
+            } else {
+                finalize(state, bundle, AuditDecision::ApprovedByLowCost).await?;
+            }
         }
+        LowCostRoute::EscalateHighCost => schedule_high_cost(state, bundle).await?,
         LowCostRoute::ManualReview => finalize(state, bundle, AuditDecision::ManualReview).await?,
     }
     Ok(())
+}
+
+async fn schedule_high_cost(state: &AppState, bundle: &str) -> Result<(), ApiError> {
+    sqlx::query("INSERT OR IGNORE INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'high', 1, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
+        .bind(Uuid::new_v4().to_string()).bind(bundle).execute(&state.database).await.map_err(ApiError::internal)?;
+    Ok(())
+}
+
+fn random_high_cost_review_selected(bundle: &str, basis_points: i64) -> bool {
+    let basis_points = basis_points.clamp(0, 10_000) as u64;
+    if basis_points == 0 {
+        return false;
+    }
+    if basis_points == 10_000 {
+        return true;
+    }
+    let digest = Sha256::digest(bundle.as_bytes());
+    let bucket = u64::from_be_bytes(digest[..8].try_into().unwrap()) % 10_000;
+    bucket < basis_points
 }
 
 async fn finalize(state: &AppState, bundle: &str, decision: AuditDecision) -> Result<(), ApiError> {
@@ -454,9 +482,11 @@ mod tests {
             agent_daily_call_limit: 300,
             agent_monthly_call_limit: 3000,
             agent_monthly_cost_limit_microusd: 5_000_000,
+            agent_random_high_cost_review_basis_points: 0,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            client_ca_certificate_file: None,
             webhook_url: None,
             webhook_hmac_secret_file: "/不存在".into(),
             ntfy_url: None,
@@ -499,6 +529,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(high_runs, 1);
+    }
+
+    #[tokio::test]
+    async fn opted_in_random_review_escalates_three_approvals() {
+        let state = fixture(["approve", "approve", "approve"]).await;
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('agent_random_high_cost_review_basis_points', '10000', ?)")
+            .bind(Utc::now()).execute(&state.database).await.unwrap();
+        evaluate(&state, &"c".repeat(64), "low").await.unwrap();
+        let high_runs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE tier = 'high'")
+                .fetch_one(&state.database)
+                .await
+                .unwrap();
+        assert_eq!(high_runs, 1);
+    }
+
+    #[test]
+    fn random_review_boundaries_are_deterministic() {
+        assert!(!random_high_cost_review_selected(&"a".repeat(64), 0));
+        assert!(random_high_cost_review_selected(&"a".repeat(64), 10_000));
+        assert_eq!(
+            random_high_cost_review_selected(&"a".repeat(64), 1234),
+            random_high_cost_review_selected(&"a".repeat(64), 1234)
+        );
     }
 
     #[tokio::test]

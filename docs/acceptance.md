@@ -20,7 +20,7 @@
 | P07 | 已验证 | AUR 消失、维护者/orphan/source 域名、官方晋升、依赖变化及 VCS 历史重写事件 | 无 |
 | P08 | 已验证 | 新批次失败不改变当前 Release；发布故障与回滚实际验证 | 无 |
 | A01 | 已验证 | 包装层扫描、Fetch 后 AuditBundle、三 Runner 调度 | 真实外部模型调用未验证 |
-| A02 | 已验证 | 3/2/≤1、单次重试和高成本批准规则自动测试 | 随机复查率保持默认 0%，尚无 UI 配置 |
+| A02 | 已验证 | 3/2/≤1、单次重试和高成本批准规则；默认 0 的摘要稳定随机复查可由 UI/环境配置 | 无 |
 | A03 | 部分验证 | Codex/Claude Code 固定 argv、凭据网关、Compose secret、预算；四 Runner 无付费 Doctor 已实现并做容器冒烟 | 缺真实 provider key 审计 E2E，发布前必须保留为未验证范围 |
 | A04 | 已验证 | 覆盖范围、选读文件和“不证明全部源码安全”写入报告 | 无 |
 | B01 | 已验证 | 非 privileged Builder 容器内真实 KVM Fetch→Build | 无 |
@@ -38,11 +38,11 @@
 | R03 | 已验证 | 签名 Release 保存 Audit、Agent、provenance、完整 Profile/Source/License/日志证据；ArchiveReceipt 绑定递归文件集合，rsync 快照恢复测试逐字节通过；控制面备份恢复测试通过 | 跨物理设备恢复仍应在实际部署后按手册演练 |
 | R04 | 已验证 | 服务端签名 Release 回滚和真实客户端 `pacman -U` 降级 | 自动客户端降级明确延期 |
 | U01 | 已验证 | 搜索、包、审计、构建、Worker、Profile、Release、归档、告警、设置页面；Job 可查看成功/失败有界日志，Release 可展开签名证据文档 | 不要求第一版实现复杂日志搜索 |
-| U02 | 部分验证 | 单管理员认证、一次性初始化、GPG/pacman 引导和稳定 URL | 内部 CA 证书导出/轮换仍主要依赖部署配置 |
+| U02 | 已验证 | 单管理员认证、一次性初始化、GPG/pacman 引导、稳定 URL；内部 CA 持久化、认证下载和有效期 Doctor；用户证书 Compose override | DNS、客户端导入和根 CA 轮换按设计由部署者人工执行 |
 | U03 | 已验证 | Worker/磁盘/时钟、Agent/Fetch Doctor、告警、Webhook/ntfy、备份与库存页面 | 外部 Webhook/ntfy 未使用真实服务冒烟 |
 | O01 | 已验证 | 包装 makepkg、repo-add、pacman、QEMU、OpenSSH、rsync、GnuPG、Caddy | 无 |
 | O02 | 已验证 | 全过程直接在 main 使用独立英文提交；Release 记录源码 commit；首个预发布版本使用本地 annotated tag 管理 | 仓库无 remote，未执行 push；正式 v0.1.0 尚未发布 |
 
 ## 第一版部署验收项
 
-B03/R03 的代码阻塞已经关闭。真实 provider key、跨物理设备恢复、内部 CA 生命周期、外部通知和热点 Profile 性能收益仍依赖用户部署环境，必须在首次部署时由 Doctor 与恢复手册验收；它们不应被误写成当前开发机已经验证，也不继续扩展为高可用或复杂观测系统。
+B03/R03/U02 的代码阻塞已经关闭。真实 provider key、跨物理设备恢复、DNS 与 CA 客户端分发、外部通知和热点 Profile 性能收益仍依赖用户部署环境，必须在首次部署时由 Doctor 与恢复手册验收；它们不应被误写成当前开发机已经验证，也不继续扩展为高可用或复杂观测系统。

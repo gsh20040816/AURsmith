@@ -22,6 +22,8 @@ use sqlx::{Row, SqlitePool};
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    fs,
+    process::Command,
     sync::Arc,
 };
 use tower_http::{
@@ -59,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/events", get(events))
         .route("/api/v1/client-bootstrap", get(client_bootstrap))
+        .route("/api/v1/client-ca.crt", get(client_ca_certificate))
         .route("/api/v1/doctor", get(doctor_status))
         .route("/api/v1/metrics", get(metrics_status))
         .route("/api/v1/alerts", get(list_alerts))
@@ -237,6 +240,7 @@ struct UpdateSettingsRequest {
     agent_daily_call_limit: i64,
     agent_monthly_call_limit: i64,
     agent_monthly_cost_limit_microusd: i64,
+    agent_random_high_cost_review_basis_points: i64,
 }
 
 async fn settings(
@@ -260,6 +264,12 @@ async fn settings(
         &state,
         "agent_monthly_cost_limit_microusd",
         state.config.agent_monthly_cost_limit_microusd,
+    )
+    .await?;
+    let random_review_basis_points = effective_i64_setting(
+        &state,
+        "agent_random_high_cost_review_basis_points",
+        state.config.agent_random_high_cost_review_basis_points,
     )
     .await?;
     let daily_used: i64 = sqlx::query_scalar(
@@ -288,6 +298,7 @@ async fn settings(
             "agent_daily_call_limit": daily_limit,
             "agent_monthly_call_limit": monthly_limit,
             "agent_monthly_cost_limit_microusd": cost_limit,
+            "agent_random_high_cost_review_basis_points": random_review_basis_points,
             "daily_used": daily_used,
             "monthly_used": monthly_used,
             "monthly_cost_microusd": monthly_cost
@@ -317,14 +328,19 @@ async fn update_settings(
             "agent_monthly_cost_limit_microusd",
             request.agent_monthly_cost_limit_microusd,
         ),
+        (
+            "agent_random_high_cost_review_basis_points",
+            request.agent_random_high_cost_review_basis_points,
+        ),
     ];
-    if values
+    if values[..3]
         .iter()
         .any(|(_, value)| !(0..=1_000_000_000).contains(value))
+        || !(0..=10_000).contains(&request.agent_random_high_cost_review_basis_points)
     {
         return Err(ApiError::bad_request(
             "INVALID_AGENT_BUDGET",
-            "Agent 调用与成本限制必须位于 0 到 1000000000",
+            "Agent 调用与成本限制必须位于 0 到 1000000000，随机复查基点必须位于 0 到 10000",
         ));
     }
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
@@ -341,7 +357,8 @@ async fn update_settings(
         json!({
             "daily": request.agent_daily_call_limit,
             "monthly": request.agent_monthly_call_limit,
-            "monthly_cost_microusd": request.agent_monthly_cost_limit_microusd
+            "monthly_cost_microusd": request.agent_monthly_cost_limit_microusd,
+            "random_high_cost_review_basis_points": request.agent_random_high_cost_review_basis_points
         }),
         &actor,
     )
@@ -387,22 +404,65 @@ async fn client_bootstrap(
     let base = state.config.repository_base_url.trim_end_matches('/');
     let repository_config =
         format!("[aursmith]\nSigLevel = Required DatabaseRequired\nServer = {base}/$arch");
+    let client_ca_available = state
+        .config
+        .client_ca_certificate_file
+        .as_deref()
+        .is_some_and(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_file()));
+    let mut warnings = vec![
+        "执行导入前必须人工核对页面显示的完整 GPG 指纹。",
+        "AURsmith 仓库必须放在官方仓库之后。",
+    ];
+    warnings.push(if state.config.client_ca_certificate_file.is_none() {
+        "控制面使用用户提供的证书；客户端应通过既有系统信任链验证。"
+    } else if client_ca_available {
+        "控制面使用内部 CA；请从当前认证页面下载根证书并通过其他可信通道核对。"
+    } else {
+        "内部 CA 根证书尚未生成；请等待 Web Caddy 启动后刷新。"
+    });
     Ok(Json(json!({
         "repository_config": repository_config,
         "gpg_fingerprint": fingerprint,
         "gpg_key_url": format!("{base}/x86_64/aursmith-repository-key.asc"),
+        "client_ca_url": client_ca_available.then_some("/api/v1/client-ca.crt"),
         "commands": [
             format!("curl --fail --output /tmp/aursmith-repository-key.asc '{base}/x86_64/aursmith-repository-key.asc'"),
             "sudo pacman-key --add /tmp/aursmith-repository-key.asc".to_owned(),
             format!("sudo pacman-key --lsign-key {fingerprint}"),
             "sudo pacman -Syu".to_owned(),
         ],
-        "warnings": [
-            "执行导入前必须人工核对页面显示的完整 GPG 指纹。",
-            "AURsmith 仓库必须放在官方仓库之后。",
-            "内部 CA 证书需由管理员通过首次设置页面导出并安装。",
-        ]
+        "warnings": warnings
     })))
+}
+
+async fn client_ca_certificate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let path = state
+        .config
+        .client_ca_certificate_file
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("EXTERNAL_CA_MODE", "当前使用用户提供的证书"))?;
+    let certificate = fs::read(path)
+        .map_err(|_| ApiError::conflict("CLIENT_CA_NOT_READY", "内部 CA 根证书尚未生成"))?;
+    if certificate.len() > 1024 * 1024 || !certificate.starts_with(b"-----BEGIN CERTIFICATE-----") {
+        return Err(ApiError::conflict(
+            "CLIENT_CA_INVALID",
+            "内部 CA 根证书格式无效",
+        ));
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-pem-file"),
+    );
+    response_headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"aursmith-root-ca.crt\""),
+    );
+    Ok((response_headers, certificate))
 }
 
 async fn doctor_status(
@@ -447,6 +507,7 @@ async fn doctor_status(
     .await
     .map_err(ApiError::internal)?;
     checks.push(json!({"id": "repository-gpg", "ok": fingerprint_ready == 1, "message": "仓库 GPG 指纹已由 Publisher 固定"}));
+    checks.push(client_ca_doctor_check(&state.config));
     let agent_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
@@ -504,6 +565,22 @@ async fn doctor_status(
     Ok(Json(
         json!({"ready": ready, "checked_at": Utc::now(), "checks": checks}),
     ))
+}
+
+fn client_ca_doctor_check(config: &Config) -> Value {
+    let Some(path) = config.client_ca_certificate_file.as_deref() else {
+        return json!({"id": "controller-tls", "ok": true, "message": "用户证书模式：由系统信任链和部署者负责轮换"});
+    };
+    let valid = fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && Command::new("/usr/bin/openssl")
+            .args(["x509", "-checkend", "2592000", "-noout", "-in", path])
+            .output()
+            .is_ok_and(|output| output.status.success());
+    json!({
+        "id": "controller-tls",
+        "ok": valid,
+        "message": if valid { "内部 CA 根证书存在且未来 30 天内不会过期" } else { "内部 CA 根证书缺失、格式无效或将在 30 天内过期" }
+    })
 }
 
 async fn agent_doctor_check(client: &reqwest::Client, id: &str, endpoint: &str) -> Value {
@@ -1414,6 +1491,10 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_router() -> Router {
+        test_router_with_client_ca(None).await
+    }
+
+    async fn test_router_with_client_ca(client_ca_certificate_file: Option<String>) -> Router {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         let config = Config {
             bind_address: "127.0.0.1:0".into(),
@@ -1430,9 +1511,11 @@ mod tests {
             agent_daily_call_limit: 300,
             agent_monthly_call_limit: 3000,
             agent_monthly_cost_limit_microusd: 5_000_000,
+            agent_random_high_cost_review_basis_points: 0,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            client_ca_certificate_file,
             webhook_url: None,
             webhook_hmac_secret_file: "/不存在".into(),
             ntfy_url: None,
@@ -1445,6 +1528,78 @@ mod tests {
             config,
             SigningKey::from_bytes(&[9_u8; 32]),
         ))
+    }
+
+    #[tokio::test]
+    async fn internal_ca_download_requires_an_administrator_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate_path = directory.path().join("root.crt");
+        let certificate = b"-----BEGIN CERTIFICATE-----\ntest-only\n-----END CERTIFICATE-----\n";
+        fs::write(&certificate_path, certificate).unwrap();
+        let app = test_router_with_client_ca(Some(certificate_path.display().to_string())).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/client-ca.crt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let setup = Request::builder()
+            .method("POST")
+            .uri("/api/v1/setup")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"token": "测试初始化令牌-至少二十个字符", "username": "admin", "password": "足够长的测试密码-123456"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(setup).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"username": "admin", "password": "足够长的测试密码-123456"}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/client-ca.crt")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/x-pem-file"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            certificate
+        );
     }
 
     #[tokio::test]
@@ -1504,7 +1659,8 @@ mod tests {
                 json!({
                     "agent_daily_call_limit": 12,
                     "agent_monthly_call_limit": 120,
-                    "agent_monthly_cost_limit_microusd": 3400
+                    "agent_monthly_cost_limit_microusd": 3400,
+                    "agent_random_high_cost_review_basis_points": 250
                 })
                 .to_string(),
             ))
@@ -1515,6 +1671,10 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["budget"]["agent_daily_call_limit"], 12);
+        assert_eq!(
+            body["budget"]["agent_random_high_cost_review_basis_points"],
+            250
+        );
         assert_eq!(body["agents"]["api_keys_exposed"], false);
 
         let profile = Request::builder()
