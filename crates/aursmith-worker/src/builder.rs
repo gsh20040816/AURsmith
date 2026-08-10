@@ -810,6 +810,7 @@ mod tests {
                     size: 1,
                 },
                 installed_packages: vec![],
+                repository_mirror: None,
                 created_at: Utc::now(),
             },
             root_image: root.join("root.qcow2"),
@@ -1076,6 +1077,7 @@ mod tests {
             kernel: entry("vmlinuz-linux", b"kernel"),
             initramfs: entry("initramfs-linux.img", b"initramfs"),
             installed_packages: vec!["base-devel=1".into()],
+            repository_mirror: Some("https://geo.mirror.pkgbuild.com".into()),
             created_at: Utc::now(),
         };
         spec.profile_sha256 = spec.content_sha256().unwrap();

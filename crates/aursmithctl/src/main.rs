@@ -351,6 +351,10 @@ fn export_profile(source: &Path, output: &Path, name: &str) -> anyhow::Result<()
         kernel: entries.remove(0),
         initramfs: entries.remove(0),
         installed_packages: packages,
+        repository_mirror: fs::read_to_string(source.join("repository-mirror"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
         created_at,
     };
     spec.profile_sha256 = spec.content_sha256()?;

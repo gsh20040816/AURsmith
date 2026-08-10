@@ -302,6 +302,23 @@ fn validate_spec(spec: &BuildProfileSpec) -> Result<(), ApiError> {
             "Profile 包清单必须包含 1 至 4096 项",
         ));
     }
+    if let Some(repository_mirror) = &spec.repository_mirror {
+        let mirror = url::Url::parse(repository_mirror).map_err(|_| {
+            ApiError::bad_request("INVALID_PROFILE_MIRROR", "Profile 镜像地址不是有效 URL")
+        })?;
+        if mirror.scheme() != "https"
+            || mirror.host_str().is_none()
+            || !mirror.username().is_empty()
+            || mirror.password().is_some()
+            || mirror.query().is_some()
+            || mirror.fragment().is_some()
+        {
+            return Err(ApiError::bad_request(
+                "INVALID_PROFILE_MIRROR",
+                "Profile 镜像地址必须是无凭据、查询参数和片段的 HTTPS Base URL",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -343,5 +360,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(second, "add");
+    }
+
+    #[test]
+    fn profile_mirror_requires_https_without_embedded_credentials() {
+        let entry = |path: &str| aursmith_protocol::ManifestEntry {
+            path: path.into(),
+            sha256: "a".repeat(64),
+            size: 1,
+        };
+        let mut spec = BuildProfileSpec {
+            profile_sha256: String::new(),
+            root_image: entry("root.qcow2"),
+            kernel: entry("vmlinuz-linux"),
+            initramfs: entry("initramfs-linux.img"),
+            installed_packages: vec!["base 3-3".into()],
+            repository_mirror: Some("http://mirror.example.org".into()),
+            created_at: Utc::now(),
+        };
+        assert!(validate_spec(&spec).is_err());
+        spec.repository_mirror = Some("https://mirror.example.org/archlinux".into());
+        assert!(validate_spec(&spec).is_ok());
     }
 }

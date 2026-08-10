@@ -119,18 +119,23 @@ pub struct BuildProfileSpec {
     pub kernel: ManifestEntry,
     pub initramfs: ManifestEntry,
     pub installed_packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_mirror: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 impl BuildProfileSpec {
     pub fn content_sha256(&self) -> Result<String, serde_json::Error> {
-        let content = serde_json::json!({
+        let mut content = serde_json::json!({
             "root_image": self.root_image,
             "kernel": self.kernel,
             "initramfs": self.initramfs,
             "installed_packages": self.installed_packages,
             "created_at": self.created_at,
         });
+        if let Some(repository_mirror) = &self.repository_mirror {
+            content["repository_mirror"] = serde_json::json!(repository_mirror);
+        }
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&content)?)))
     }
 }
@@ -333,5 +338,35 @@ mod tests {
         };
         assert!(!spec.is_expired_at(now));
         assert!(spec.is_expired_at(now + Duration::minutes(6)));
+    }
+
+    #[test]
+    fn profile_mirror_is_part_of_new_digest_without_breaking_legacy_payloads() {
+        let created_at = Utc::now();
+        let entry = |path: &str| ManifestEntry {
+            path: path.into(),
+            sha256: "a".repeat(64),
+            size: 1,
+        };
+        let mut profile = BuildProfileSpec {
+            profile_sha256: String::new(),
+            root_image: entry("root.qcow2"),
+            kernel: entry("vmlinuz-linux"),
+            initramfs: entry("initramfs-linux.img"),
+            installed_packages: vec!["base 3-3".into()],
+            repository_mirror: None,
+            created_at,
+        };
+        let legacy_digest = profile.content_sha256().unwrap();
+        profile.repository_mirror = Some("https://geo.mirror.pkgbuild.com".into());
+        assert_ne!(legacy_digest, profile.content_sha256().unwrap());
+        let mut value = serde_json::to_value(&profile).unwrap();
+        value.as_object_mut().unwrap().remove("repository_mirror");
+        assert_eq!(
+            serde_json::from_value::<BuildProfileSpec>(value)
+                .unwrap()
+                .repository_mirror,
+            None
+        );
     }
 }

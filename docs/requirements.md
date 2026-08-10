@@ -20,6 +20,7 @@
 | B02 | 限制 Fetch Guest 网络并彻底移除 Build Guest 网络 | 网络隔离测试 |
 | B03 | 记录输入、依赖、Profile、工具、日志和产物 | provenance 测试 |
 | B04 | 统计依赖使用情况并优化不可变 Guest Profile | 优化器测试 |
+| B05 | 允许为 Profile 构建和 Fetch Guest 的官方依赖下载配置 Arch HTTPS 镜像源；Build Guest 仍保持无网，并在 Profile 与 provenance 中固定实际镜像 | Profile 构建与协议测试 |
 | W01 | 通过 Docker Compose 部署所有 AURsmith 服务 | Compose 策略测试 |
 | W02 | Builder、Publisher 和 Archiver 可部署在不同主机 | 分布式冒烟测试 |
 | W03 | 使用固定 OpenSSH host key 和受限 rsync | 传输测试 |

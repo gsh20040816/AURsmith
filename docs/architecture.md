@@ -85,7 +85,7 @@ Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.P
 
 Builder Worker 的 Journal 保存完整签名 JobSpec。执行循环以条件更新认领 queued Attempt，重启后会继续处理尚未认领的任务；同一 generation 的重放仍由 Journal 幂等规则约束。任务分为 Fetch、Build 和 ProfileFixture 三种，协议字段带默认值仅用于同一 major 版本内读取早期 Build 任务。
 
-Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`、`initramfs-linux.img` 和 `profile-envelope.json`。Envelope 由 Controller Ed25519 密钥签署，内容摘要由三个文件的 Manifest、已安装包清单和创建时间确定，不采用无法实现的“包含自身摘要再求哈希”。Builder 在启动 VM 前验证签名、文件类型、大小和 SHA-256；Profile 的任何单字节变化都会拒绝任务。
+Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`、`initramfs-linux.img` 和 `profile-envelope.json`。Envelope 由 Controller Ed25519 密钥签署，内容摘要由三个文件的 Manifest、已安装包清单、创建时间和可选的官方仓库镜像确定，不采用无法实现的“包含自身摘要再求哈希”。旧 Profile 未声明镜像时仍按原摘要读取；新 Profile 一旦声明镜像，修改地址就必须产生新摘要。Builder 在启动 VM 前验证签名、文件类型、大小和 SHA-256；Profile 的任何单字节变化都会拒绝任务。
 
 每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出分别由两个 virtiofsd 进程提供，输入为只读，输出为独立可写目录；控制通道使用 virtio-serial。Build 与 ProfileFixture 明确传入 `-nic none`。Fetch 使用 QEMU user networking 的 `restrict=on`，并且只有一条指向固定 Publisher source proxy IP:端口的 `guestfwd`，Guest 不能任意访问局域网或互联网。
 
@@ -97,9 +97,9 @@ Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日�
 
 Guest Agent 作为 Profile 根文件系统的 PID 1 运行，从内核命令行读取 Controller 公钥并再次验证只读输入中的 JobSpec Envelope。Fetch 任务只给 `makepkg --verifysource` 注入固定代理，复制并摘要准备后的完整源码树；Build 任务没有网卡，也不注入代理，以普通 `builder` 用户运行 `makepkg --cleanbuild`。输入中的特殊文件和越界符号链接会被拒绝。Guest 生成结果并同步输出卷后强制关机；失败时只写结构化错误，不尝试降级为宿主构建。
 
-JobSpec 同时固定直接运行、构建和检查依赖及其来源。Fetch Guest 只对 `official` 依赖使用 pacman 下载，包文件进入 prepared source、完整 Source Manifest 和解析后的名称/版本/摘要清单；AUR 依赖不会伪装成官方依赖下载。Controller 使用 Fetch 实际结果替换预估的依赖快照摘要。按 DAG 构建时，Builder 从同批次已成功 Build Attempt 中重新验证并复制直接 AUR 依赖产物。Build Guest 以 PID 1 身份先用 pacman 离线安装两类依赖，再降权执行 makepkg；依赖缺失时确定性失败，绝不临时添加网卡。
+JobSpec 同时固定直接运行、构建和检查依赖及其来源。Fetch Guest 只对 `official` 依赖使用 pacman 下载，并使用不可变 Profile 内已授权的 Arch HTTPS 镜像；包文件进入 prepared source、完整 Source Manifest 和解析后的名称/版本/摘要清单。AUR 依赖不会伪装成官方依赖下载。Controller 使用 Fetch 实际结果替换预估的依赖快照摘要。按 DAG 构建时，Builder 从同批次已成功 Build Attempt 中重新验证并复制直接 AUR 依赖产物。Build Guest 以 PID 1 身份先用 pacman 离线安装两类依赖，再降权执行 makepkg；依赖缺失时确定性失败，绝不临时添加网卡。BuildResult 通过 Profile 摘要间接固定镜像配置，控制面可从对应 Profile 清单还原该事实。
 
-Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段安装完整且同步的 Arch 根文件系统、嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 virtiofs 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate。
+Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段使用部署者选择的 Arch HTTPS 镜像安装完整且同步的 Arch 根文件系统，把同一 mirrorlist 写入 Guest，嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 virtiofs 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate；candidate 明确记录镜像地址。
 
 Profile 页面接受 profile-builder 生成的 `profile-candidate.json`，通过认证 API 得到 Controller 签名 Envelope 并提供下载；大体积 qcow2、内核和 initramfs 不经过浏览器，仍由管理员复制到 Builder Profile 卷。Builder 心跳发现对应摘要目录后才有资格接收 fixture Job，fixture 成功前 UI 和 API 都拒绝激活。
 

@@ -75,14 +75,17 @@ Builder Stack 必须设置 `KVM_GID` 和 `AURSMITH_FETCH_PROXY`，后者填写�
 - `initramfs-linux.img`；
 - `profile-envelope.json`。
 
-`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。执行以下命令构建和导出 base candidate：
+`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。构建前可通过 `AURSMITH_ARCH_MIRROR` 选择 Arch 镜像，地址必须是无凭据、查询参数和片段的 HTTPS Base URL。该值同时用于构建 Profile 根文件系统，并写入 Guest 的 `/etc/pacman.d/mirrorlist`，因此 Fetch Guest 后续下载官方依赖时使用同一镜像；正式 Build Guest 仍然没有网卡。
+
+下面示例使用清华大学开源软件镜像站构建并导出 base candidate；未设置变量时使用 `https://geo.mirror.pkgbuild.com`：
 
 ```bash
-docker compose -f deploy/builder/compose.yaml --profile profile-build build profile-builder
+AURSMITH_ARCH_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/archlinux \
+  docker compose -f deploy/builder/compose.yaml --profile profile-build build profile-builder
 docker compose -f deploy/builder/compose.yaml --profile profile-build run --rm profile-builder --name base
 ```
 
-导出卷包含 `profile-candidate.json` 以及三个固定二进制文件。管理员可在 Web 的 Profile 页面选择该 JSON，也可以提交到 `POST /api/v1/profiles`；Controller 会忽略候选中自报的摘要、重新计算内容摘要并返回签名 Envelope。页面提供 `profile-envelope.json` 下载。Envelope 和三个文件必须放入 `/profiles/<profile_sha256>/`。Profile 未通过启动、无网和固定 fixture build 前，激活 API 会返回 `PROFILE_NOT_VERIFIED`；不能用人工改数据库绕过。
+导出卷包含 `profile-candidate.json` 以及三个固定二进制文件。候选清单中的 `repository_mirror` 属于 Profile 内容摘要和后续 provenance；修改镜像必须重新构建、授权和验证 Profile，不能只改 Guest 内的 mirrorlist。管理员可在 Web 的 Profile 页面选择该 JSON，也可以提交到 `POST /api/v1/profiles`；Controller 会忽略候选中自报的摘要、重新计算内容摘要并返回签名 Envelope。页面提供 `profile-envelope.json` 下载。Envelope 和三个文件必须放入 `/profiles/<profile_sha256>/`。Profile 未通过启动、无网和固定 fixture build 前，激活 API 会返回 `PROFILE_NOT_VERIFIED`；不能用人工改数据库绕过。
 
 已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`。实际生成的 base Profile 已冷启动到嵌入的 Guest Agent；在未提供 virtiofs 的负向测试中，Guest 在 0.8 秒左右明确报告输入挂载失败、执行 poweroff，QEMU 正常退出。这证明 direct-kernel、initramfs、根文件系统和 PID 1 链路可用，但不替代后续带输入的完整 fixture build 验收。
 

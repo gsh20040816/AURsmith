@@ -8,10 +8,18 @@ RUN cargo build --locked --release -p aursmith-guest-agent -p aursmithctl
 
 FROM archlinux:base@sha256:345a872f6c95e082d4b8c050af637eebb57402c6e2177b411c3acf7df84eb33b AS profile
 ARG AURSMITH_SOURCE_GIT_COMMIT
-RUN pacman -Syu --noconfirm --needed e2fsprogs qemu-img mkinitcpio \
+ARG AURSMITH_ARCH_MIRROR=https://geo.mirror.pkgbuild.com
+RUN case "${AURSMITH_ARCH_MIRROR}" in https://*) ;; *) echo 'AURSMITH_ARCH_MIRROR 必须是 HTTPS URL' >&2; exit 1 ;; esac \
+    && case "${AURSMITH_ARCH_MIRROR}" in *[[:space:]]*) echo 'AURSMITH_ARCH_MIRROR 不能包含空白' >&2; exit 1 ;; esac \
+    && case "${AURSMITH_ARCH_MIRROR}" in *'@'*|*'?'*|*'#'*) echo 'AURSMITH_ARCH_MIRROR 不能包含凭据、查询参数或片段' >&2; exit 1 ;; esac \
+    && repository_mirror="${AURSMITH_ARCH_MIRROR%/}" \
+    && printf 'Server = %s/$repo/os/$arch\n' "${repository_mirror}" > /etc/pacman.d/mirrorlist \
+    && pacman -Syu --noconfirm --needed e2fsprogs qemu-img mkinitcpio \
     && install -d /rootfs/var/lib/pacman /rootfs/etc /opt/aursmith-profile \
     && pacman -Sy --noconfirm --root /rootfs --dbpath /rootfs/var/lib/pacman \
       --cachedir /var/cache/pacman/pkg base linux base-devel devtools namcap \
+    && install -Dm644 /etc/pacman.d/mirrorlist /rootfs/etc/pacman.d/mirrorlist \
+    && printf '%s\n' "${repository_mirror}" > /opt/aursmith-profile/repository-mirror \
     && useradd --root /rootfs --uid 1000 --create-home --shell /bin/bash builder
 COPY deploy/common/mkinitcpio-aursmith.conf /rootfs/etc/mkinitcpio.conf
 COPY --from=rust-builder /src/target/release/aursmith-guest-agent /rootfs/usr/local/bin/aursmith-guest-agent

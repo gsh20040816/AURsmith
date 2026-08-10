@@ -157,3 +157,11 @@
 - Profile 页面新增 JSON 文件选择入口，浏览器解析 profile-builder 生成的 candidate 后调用现有授权 API；成功响应显示重新计算的 Profile 摘要并可下载 `profile-envelope.json`。
 - qcow2、内核和 initramfs 不上传 Controller，继续按摘要复制到 Builder 持久卷；这避免让控制面承担大文件传输，也保留 Builder 必须实际发现 Profile 后才能执行 fixture 的约束。
 - 前端类型检查、三个 Vitest 页面用例和生产构建通过。当前 UI 测试覆盖入口和文件控件；真实 candidate 的 API 签名与 fixture 状态机由 Controller 测试覆盖，尚未在浏览器自动化中选择本地文件。
+
+## 2026-08-10：构建镜像源配置
+
+- Profile 协议新增可选 `repository_mirror`；新值参与内容摘要，缺少该字段的旧 Profile 仍按旧摘要读取。Controller 拒绝非 HTTPS、内嵌凭据、查询参数或片段的镜像地址。
+- profile-builder 使用 `AURSMITH_ARCH_MIRROR` 同时配置自身 pacman 和 Guest mirrorlist，并把实际 Base URL 交给 candidate 导出。Compose 默认使用 `https://geo.mirror.pkgbuild.com`。
+- Rust 工作区 86 个测试、前端 3 个测试与生产构建、Compose 安全检查均通过；另用一次预期失败的 Docker 构建确认 `http://mirror.example.org` 在执行 pacman 前即被拒绝。随后实际设置 `AURSMITH_ARCH_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/archlinux` 构建当前源码的 Profile 镜像；pacman 从该镜像完成仓库同步和约 442 MiB 的包下载，profile-builder 成功生成 qcow2、内核与 initramfs，并导出包含 218 个已安装包的 candidate。
+- 导出的 `profile-candidate.json` 明确记录镜像地址，Profile 摘要为 `48c8ed63192a249bc69a12a6be6061a7cd662957e80a48b506705a653d5c79d3`；最终构建镜像内的 `repository-mirror` 也与 candidate 一致。本轮尚未把该 Profile 授权后启动 Fetch VM 下载一个真实官方依赖，因此 Guest 内 pacman 的运行时命中仍属于后续端到端验证范围。
+- 安全边界：该选项只影响 Profile 制作和 Fetch Guest 的官方依赖下载，Build Guest 仍固定 `-nic none`，不会因选择镜像而获得网络。
