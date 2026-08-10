@@ -1,8 +1,9 @@
 use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
-use aursmith_protocol::{JobKind, JobSpec, ResourceLimits, SignedEnvelope};
+use aursmith_protocol::{GuestResult, JobKind, JobSpec, ResourceLimits, SignedEnvelope};
 use chrono::{Duration, Utc};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::BTreeSet;
 use tokio::time::{MissedTickBehavior, interval};
@@ -242,7 +243,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.profile_sha256, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, jobs.kind, jobs.profile_sha256, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') ORDER BY jobs.updated_at LIMIT 1",
     )
     .fetch_optional(&state.database)
     .await
@@ -285,6 +286,23 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         );
         return Ok(());
     }
+    let guest_result = if status == "succeeded" {
+        let raw = reply.data["guest_result_json"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("Worker 成功结果缺少 GuestResult"))?;
+        let expected_sha256 = reply.data["result_sha256"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("Worker 成功结果缺少摘要"))?;
+        if hex::encode(Sha256::digest(raw.as_bytes())) != expected_sha256 {
+            return Err(ApiError::conflict(
+                "RESULT_DIGEST_MISMATCH",
+                "Worker 返回的 GuestResult 与 Journal 摘要不一致",
+            ));
+        }
+        Some(serde_json::from_str::<GuestResult>(raw).map_err(ApiError::internal)?)
+    } else {
+        None
+    };
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("UPDATE attempts SET status = ?, result_sha256 = ? WHERE id = ?")
         .bind(status)
@@ -312,6 +330,43 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
                     .bind(failure).bind(profile_sha).execute(&mut *transaction).await.map_err(ApiError::internal)?;
             }
         }
+    }
+    if row.get::<String, _>("kind") == "fetch" && status == "succeeded" {
+        let revision_id: Option<String> = row.get("revision_id");
+        let Some(revision_id) = revision_id else {
+            return Err(ApiError::internal("Fetch Job 缺少 revision_id"));
+        };
+        let Some(GuestResult::Fetch(fetch_result)) = guest_result else {
+            return Err(ApiError::conflict(
+                "RESULT_KIND_MISMATCH",
+                "Fetch Job 返回了其他类型的 GuestResult",
+            ));
+        };
+        let expected_revision: Option<String> = row.get("revision_sha256");
+        if fetch_result.job_id.to_string() != job_id
+            || fetch_result.attempt.attempt_id.to_string() != attempt_id
+            || expected_revision.as_deref() != Some(fetch_result.revision_sha256.as_str())
+        {
+            return Err(ApiError::conflict(
+                "RESULT_IDENTITY_MISMATCH",
+                "GuestResult 身份与 Controller 的 Job/Attempt/Revision 不一致",
+            ));
+        }
+        crate::packages::complete_fetch(&mut transaction, &revision_id, &fetch_result).await?;
+        if let Some(batch_id) = row.get::<Option<String>, _>("batch_id") {
+            let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE batch_id = ? AND kind = 'fetch' AND status != 'succeeded'")
+                .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
+            if unfinished == 0 {
+                sqlx::query("UPDATE release_batches SET state = 'awaiting_audit', updated_at = ? WHERE id = ?")
+                    .bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+            }
+        }
+    } else if row.get::<String, _>("kind") == "fetch"
+        && status == "failed"
+        && let Some(batch_id) = row.get::<Option<String>, _>("batch_id")
+    {
+        sqlx::query("UPDATE release_batches SET state = 'fetch_failed', failure_reason = ?, updated_at = ? WHERE id = ?")
+            .bind(failure).bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     }
     transaction.commit().await.map_err(ApiError::internal)?;
     Ok(())

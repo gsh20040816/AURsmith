@@ -421,39 +421,73 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
         }
     }
 
-    if !spec.inline_inputs.is_empty() {
-        let Some(builder) = &worker.builder else {
-            return WorkerResponse::error(
-                "INLINE_INPUT_UNSUPPORTED",
-                "只有 Builder 可以接收内联构建输入",
-            );
-        };
-        if let Err(error) = builder.materialize_inline_inputs(&spec) {
-            return WorkerResponse::error("INVALID_INLINE_INPUT", error.to_string());
-        }
-    }
-
+    let initial_status = if spec.inline_inputs.is_empty() {
+        "queued"
+    } else {
+        "preparing"
+    };
     let inserted = sqlx::query(
-        "INSERT INTO attempts(job_id, attempt_id, generation, envelope_sha256, status, received_at, spec_json) VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+        "INSERT INTO attempts(job_id, attempt_id, generation, envelope_sha256, status, received_at, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(spec.job_id.to_string())
     .bind(spec.attempt.attempt_id.to_string())
     .bind(i64::from(spec.attempt.generation))
     .bind(envelope_sha256)
+    .bind(initial_status)
     .bind(Utc::now())
     .bind(spec_json)
     .execute(&worker.database)
     .await;
     match inserted {
-        Ok(_) => WorkerResponse::ok(
-            "ACCEPTED",
-            serde_json::json!({
-                "job_id": spec.job_id,
-                "attempt_id": spec.attempt.attempt_id,
-                "generation": spec.attempt.generation,
-                "status": status_name(JobStatus::Queued),
-            }),
-        ),
+        Ok(_) => {
+            if !spec.inline_inputs.is_empty() {
+                let Some(builder) = &worker.builder else {
+                    let _ = sqlx::query("DELETE FROM attempts WHERE attempt_id = ?")
+                        .bind(spec.attempt.attempt_id.to_string())
+                        .execute(&worker.database)
+                        .await;
+                    return WorkerResponse::error(
+                        "INLINE_INPUT_UNSUPPORTED",
+                        "只有 Builder 可以接收内联构建输入",
+                    );
+                };
+                if let Err(error) = builder.materialize_inline_inputs(&spec) {
+                    let _ = sqlx::query("DELETE FROM attempts WHERE attempt_id = ?")
+                        .bind(spec.attempt.attempt_id.to_string())
+                        .execute(&worker.database)
+                        .await;
+                    return WorkerResponse::error("INVALID_INLINE_INPUT", error.to_string());
+                }
+                if let Err(error) = sqlx::query(
+                    "UPDATE attempts SET status = 'queued' WHERE attempt_id = ? AND status = 'preparing'",
+                )
+                .bind(spec.attempt.attempt_id.to_string())
+                .execute(&worker.database)
+                .await
+                {
+                    let _ = sqlx::query("DELETE FROM attempts WHERE attempt_id = ?")
+                        .bind(spec.attempt.attempt_id.to_string())
+                        .execute(&worker.database)
+                        .await;
+                    let _ = std::fs::remove_dir_all(
+                        builder
+                            .jobs_dir()
+                            .join("staging")
+                            .join(spec.attempt.attempt_id.to_string()),
+                    );
+                    return WorkerResponse::error("JOURNAL_ERROR", error.to_string());
+                }
+            }
+            WorkerResponse::ok(
+                "ACCEPTED",
+                serde_json::json!({
+                    "job_id": spec.job_id,
+                    "attempt_id": spec.attempt.attempt_id,
+                    "generation": spec.attempt.generation,
+                    "status": status_name(JobStatus::Queued),
+                }),
+            )
+        }
         Err(error) => {
             if let Some(builder) = &worker.builder {
                 let _ = std::fs::remove_dir_all(
@@ -476,18 +510,39 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
     .fetch_optional(&worker.database)
     .await;
     match row {
-        Ok(Some(row)) => WorkerResponse::ok(
-            "JOB_STATUS",
-            serde_json::json!({
-                "job_id": job_id,
-                "attempt_id": row.get::<String, _>("attempt_id"),
-                "generation": row.get::<i64, _>("generation"),
-                "status": row.get::<String, _>("status"),
-                "received_at": row.get::<String, _>("received_at"),
-                "result_sha256": row.get::<Option<String>, _>("result_sha256"),
-                "failure_code": row.get::<Option<String>, _>("failure_code"),
-            }),
-        ),
+        Ok(Some(row)) => {
+            let attempt_id = row.get::<String, _>("attempt_id");
+            let status = row.get::<String, _>("status");
+            let guest_result_json = if status == "succeeded" {
+                let Some(builder) = &worker.builder else {
+                    return WorkerResponse::error(
+                        "RESULT_UNAVAILABLE",
+                        "该 Worker 角色没有 Builder 结果目录",
+                    );
+                };
+                match builder.completed_result_json(&attempt_id) {
+                    Ok(result) => Some(result),
+                    Err(error) => {
+                        return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
+                    }
+                }
+            } else {
+                None
+            };
+            WorkerResponse::ok(
+                "JOB_STATUS",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "generation": row.get::<i64, _>("generation"),
+                    "status": status,
+                    "received_at": row.get::<String, _>("received_at"),
+                    "result_sha256": row.get::<Option<String>, _>("result_sha256"),
+                    "failure_code": row.get::<Option<String>, _>("failure_code"),
+                    "guest_result_json": guest_result_json,
+                }),
+            )
+        }
         Ok(None) => WorkerResponse::error("JOB_NOT_FOUND", "Worker Journal 中没有该任务"),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }

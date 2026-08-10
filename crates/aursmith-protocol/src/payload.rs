@@ -30,6 +30,32 @@ pub struct ManifestEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceManifestEntry {
+    pub path: String,
+    pub kind: SourceEntryKind,
+    pub sha256: Option<String>,
+    pub size: u64,
+    pub link_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSourceFile {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+    pub selection_reason: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineInput {
     pub entry: ManifestEntry,
     pub content_base64: String,
@@ -126,7 +152,8 @@ pub struct FetchResult {
     pub attempt: AttemptRef,
     pub revision_sha256: String,
     pub source_manifest_sha256: String,
-    pub sources: Vec<ManifestEntry>,
+    pub sources: Vec<SourceManifestEntry>,
+    pub audit_files: Vec<AuditSourceFile>,
     pub resolved_pkgver: Option<String>,
     pub dependency_snapshot_sha256: String,
     pub log_sha256: String,

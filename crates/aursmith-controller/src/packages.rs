@@ -402,7 +402,7 @@ async fn apply_snapshot(
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::internal)?;
-    create_audit_bundle(&mut transaction, &revision_id, snapshot).await?;
+    create_audit_pre_scan(&mut transaction, &revision_id, snapshot).await?;
 
     sqlx::query("DELETE FROM subscription_references WHERE owner_package_base = ?")
         .bind(&snapshot.package_base)
@@ -493,7 +493,7 @@ async fn apply_snapshot(
     } else {
         let batch_id = Uuid::new_v4().to_string();
         let build_order = batch_graph.topological_order();
-        let (batch_state, failure_reason) = match &build_order {
+        let (mut batch_state, failure_reason) = match &build_order {
             _ if batch_has_blocker => (
                 "blocked_deterministically",
                 Some("一个或多个 Revision 被确定性审计规则阻断".to_owned()),
@@ -503,7 +503,7 @@ async fn apply_snapshot(
                 "awaiting_provider_selection",
                 Some("一个或多个虚拟依赖存在多个 Provider 候选".to_owned()),
             ),
-            Ok(_) => ("awaiting_audit", None),
+            Ok(_) => ("awaiting_fetch", None),
         };
         sqlx::query(
             "INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -526,6 +526,13 @@ async fn apply_snapshot(
                     .execute(&mut *transaction).await.map_err(ApiError::internal)?;
             }
         }
+        if batch_state == "awaiting_fetch" {
+            if enqueue_fetch_jobs(&mut transaction, &batch_id).await? {
+                batch_state = "fetching";
+            } else {
+                batch_state = "awaiting_profile";
+            }
+        }
         (Some(batch_id), batch_state)
     };
     append_event_in_transaction(
@@ -545,6 +552,163 @@ async fn apply_snapshot(
         "batch_state": batch_state,
         "idempotent": idempotent_revision
     }))
+}
+
+async fn enqueue_fetch_jobs(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    batch_id: &str,
+) -> Result<bool, ApiError> {
+    let profile_sha256: Option<String> = sqlx::query_scalar(
+        "SELECT manifest_sha256 FROM build_profiles WHERE state = 'active' AND last_verified_at IS NOT NULL ORDER BY activated_at DESC LIMIT 1",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(profile_sha256) = profile_sha256 else {
+        sqlx::query("UPDATE release_batches SET state = 'awaiting_profile', failure_reason = '没有已验证且激活的 Build Profile', updated_at = ? WHERE id = ?")
+            .bind(Utc::now()).bind(batch_id).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+        return Ok(false);
+    };
+    let rows = sqlx::query(
+        "SELECT revisions.id, revisions.input_sha256, audit_pre_scans.payload_json FROM release_batch_revisions JOIN revisions ON revisions.id = release_batch_revisions.revision_id JOIN audit_pre_scans ON audit_pre_scans.revision_id = revisions.id WHERE release_batch_revisions.batch_id = ? AND audit_pre_scans.state = 'ready_for_fetch' AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = release_batch_revisions.batch_id AND jobs.revision_id = revisions.id AND jobs.kind = 'fetch') ORDER BY release_batch_revisions.build_order",
+    )
+    .bind(batch_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    for row in rows {
+        let revision_id: String = row.get("id");
+        let payload: Value =
+            serde_json::from_str(row.get("payload_json")).map_err(ApiError::internal)?;
+        let files: Vec<SnapshotFile> =
+            serde_json::from_value(payload["files"].clone()).map_err(ApiError::internal)?;
+        let inputs = files
+            .iter()
+            .map(|file| aursmith_protocol::ManifestEntry {
+                path: file.path.clone(),
+                sha256: file.sha256.clone(),
+                size: file.size,
+            })
+            .collect::<Vec<_>>();
+        let inline_inputs = files
+            .into_iter()
+            .map(|file| aursmith_protocol::InlineInput {
+                entry: aursmith_protocol::ManifestEntry {
+                    path: file.path,
+                    sha256: file.sha256,
+                    size: file.size,
+                },
+                content_base64: file.content_base64,
+            })
+            .collect::<Vec<_>>();
+        let dependencies = sqlx::query("SELECT dependency_name, dependency_kind, target_package_base, provider_state, candidates_json FROM revision_dependencies WHERE revision_id = ? ORDER BY dependency_name, dependency_kind")
+            .bind(&revision_id).fetch_all(&mut **transaction).await.map_err(ApiError::internal)?;
+        let dependency_document = dependencies.into_iter().map(|dependency| json!({
+            "name": dependency.get::<String,_>("dependency_name"),
+            "kind": dependency.get::<String,_>("dependency_kind"),
+            "target": dependency.get::<Option<String>,_>("target_package_base"),
+            "provider_state": dependency.get::<String,_>("provider_state"),
+            "candidates": serde_json::from_str::<Value>(dependency.get("candidates_json")).unwrap_or_else(|_| json!([]))
+        })).collect::<Vec<_>>();
+        let dependency_sha256 = hex::encode(Sha256::digest(
+            serde_json::to_vec(&dependency_document).map_err(ApiError::internal)?,
+        ));
+        let job_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, profile_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 50, ?, 'fetch', ?, ?, ?, ?, '[]', ?, ?, ?)")
+            .bind(job_id).bind(batch_id).bind(&revision_id).bind(row.get::<String,_>("input_sha256"))
+            .bind(&profile_sha256).bind(dependency_sha256)
+            .bind(serde_json::to_string(&inputs).map_err(ApiError::internal)?)
+            .bind(serde_json::to_string(&inline_inputs).map_err(ApiError::internal)?)
+            .bind(r#"{"cpu_count":1,"memory_mib":2048,"disk_mib":8192,"timeout_seconds":1800}"#)
+            .bind(now).bind(now).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+    }
+    sqlx::query("UPDATE release_batches SET state = 'fetching', failure_reason = NULL, updated_at = ? WHERE id = ?")
+        .bind(Utc::now()).bind(batch_id).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+    Ok(true)
+}
+
+pub(crate) async fn schedule_waiting_fetches(database: &SqlitePool) -> Result<(), ApiError> {
+    let batch_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM release_batches WHERE state IN ('awaiting_profile', 'awaiting_fetch') ORDER BY created_at",
+    )
+    .fetch_all(database)
+    .await
+    .map_err(ApiError::internal)?;
+    for batch_id in batch_ids {
+        let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+        enqueue_fetch_jobs(&mut transaction, &batch_id).await?;
+        transaction.commit().await.map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn complete_fetch(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    revision_id: &str,
+    result: &aursmith_protocol::FetchResult,
+) -> Result<(), ApiError> {
+    let row = sqlx::query("SELECT sha256, payload_json, deterministic_findings_json FROM audit_pre_scans WHERE revision_id = ? AND state = 'ready_for_fetch'")
+        .bind(revision_id).fetch_optional(&mut **transaction).await.map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::conflict("FETCH_ALREADY_CONSUMED", "Fetch 结果没有可消费的预扫描记录"))?;
+    let mut payload: Value =
+        serde_json::from_str(row.get("payload_json")).map_err(ApiError::internal)?;
+    payload["source_manifest"] =
+        serde_json::to_value(&result.sources).map_err(ApiError::internal)?;
+    payload["source_manifest_sha256"] = json!(result.source_manifest_sha256);
+    payload["resolved_pkgver"] = json!(result.resolved_pkgver);
+    payload["dependency_snapshot_sha256"] = json!(result.dependency_snapshot_sha256);
+    payload["selected_upstream_source_files"] =
+        serde_json::to_value(&result.audit_files).map_err(ApiError::internal)?;
+    let coverage = json!({
+        "aur_wrapper": {
+            "mode": "complete",
+            "files": payload["files"].as_array().map(|files| files.iter().filter_map(|file| file["path"].as_str()).collect::<Vec<_>>()).unwrap_or_default()
+        },
+        "upstream_source": {
+            "mode": "complete_manifest_risk_selected_content",
+            "manifest_sha256": result.source_manifest_sha256,
+            "manifest_entries": result.sources.len(),
+            "agent_read_files": result.audit_files.iter().map(|file| json!({"path": file.path, "reason": file.selection_reason})).collect::<Vec<_>>(),
+            "statement": "系统对 Fetch VM 输出执行完整确定性文件清单；Agent 完整读取 AUR 包装文件，并只读取列出的风险相关上游源码。此报告不证明全部上游源码安全。"
+        }
+    });
+    let findings: Value =
+        serde_json::from_str(row.get("deterministic_findings_json")).map_err(ApiError::internal)?;
+    let bundle_document = json!({
+        "policy_version": "v1",
+        "payload": payload,
+        "coverage": coverage,
+        "deterministic_findings": findings
+    });
+    let bundle_sha256 = hex::encode(Sha256::digest(
+        serde_json::to_vec(&bundle_document).map_err(ApiError::internal)?,
+    ));
+    sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', ?, ?, ?, 'agent_pending', ?)")
+        .bind(&bundle_sha256).bind(revision_id).bind(payload.to_string()).bind(coverage.to_string())
+        .bind(findings.to_string()).bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+    for slot in 1..=3 {
+        sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'low', ?, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
+            .bind(Uuid::new_v4().to_string()).bind(&bundle_sha256).bind(slot)
+            .execute(&mut **transaction).await.map_err(ApiError::internal)?;
+    }
+    sqlx::query(
+        "UPDATE audit_pre_scans SET state = 'consumed', consumed_at = ? WHERE revision_id = ?",
+    )
+    .bind(Utc::now())
+    .bind(revision_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    sqlx::query(
+        "UPDATE revisions SET state = 'audit_pending', source_manifest_sha256 = ? WHERE id = ?",
+    )
+    .bind(&result.source_manifest_sha256)
+    .bind(revision_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 pub async fn list_subscriptions(
@@ -1015,17 +1179,19 @@ async fn supersede_other_revisions(
     Ok(())
 }
 
-async fn create_audit_bundle(
+async fn create_audit_pre_scan(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     revision_id: &str,
     snapshot: &UpstreamSnapshot,
 ) -> Result<(), ApiError> {
-    let exists: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM audit_bundles WHERE revision_id = ?")
-            .bind(revision_id)
-            .fetch_one(&mut **transaction)
-            .await
-            .map_err(ApiError::internal)?;
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM audit_pre_scans WHERE revision_id = ?) + (SELECT COUNT(*) FROM audit_bundles WHERE revision_id = ?)",
+    )
+    .bind(revision_id)
+    .bind(revision_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
     if exists > 0 {
         return Ok(());
     }
@@ -1081,19 +1247,21 @@ async fn create_audit_bundle(
     let blocked = findings
         .iter()
         .any(|finding| finding.severity == FindingSeverity::Block);
-    let state = if blocked { "blocked" } else { "agent_pending" };
-    sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', ?, ?, ?, ?, ?)")
-        .bind(&bundle_sha256)
+    sqlx::query("INSERT INTO audit_pre_scans(revision_id, sha256, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind(revision_id)
+        .bind(&bundle_sha256)
         .bind(payload.to_string())
         .bind(coverage.to_string())
         .bind(json_string(&findings)?)
-        .bind(state)
+        .bind(if blocked { "blocked" } else { "ready_for_fetch" })
         .bind(Utc::now())
         .execute(&mut **transaction)
         .await
         .map_err(ApiError::internal)?;
     if blocked {
+        sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', ?, ?, ?, 'blocked', ?)")
+            .bind(&bundle_sha256).bind(revision_id).bind(payload.to_string()).bind(coverage.to_string())
+            .bind(json_string(&findings)?).bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE revisions SET state = 'audit_rejected' WHERE id = ?")
             .bind(revision_id)
             .execute(&mut **transaction)
@@ -1104,16 +1272,11 @@ async fn create_audit_bundle(
             .bind("一个或多个绝对阻断规则命中").bind(&bundle_sha256).bind(Utc::now())
             .execute(&mut **transaction).await.map_err(ApiError::internal)?;
     } else {
-        sqlx::query("UPDATE revisions SET state = 'audit_pending' WHERE id = ?")
+        sqlx::query("UPDATE revisions SET state = 'fetching' WHERE id = ?")
             .bind(revision_id)
             .execute(&mut **transaction)
             .await
             .map_err(ApiError::internal)?;
-        for slot in 1..=3 {
-            sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'low', ?, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
-                .bind(Uuid::new_v4().to_string()).bind(&bundle_sha256).bind(slot)
-                .execute(&mut **transaction).await.map_err(ApiError::internal)?;
-        }
     }
     Ok(())
 }
@@ -1193,7 +1356,7 @@ async fn upsert_implicit_node(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    create_audit_bundle(transaction, &revision_id, snapshot).await?;
+    create_audit_pre_scan(transaction, &revision_id, snapshot).await?;
     sqlx::query("DELETE FROM subscription_references WHERE owner_package_base = ?")
         .bind(&snapshot.package_base)
         .execute(&mut **transaction)
@@ -1590,6 +1753,58 @@ mod tests {
         .await
         .unwrap();
         assert!(states.contains(&"superseded".to_owned()));
-        assert!(states.contains(&"audit_pending".to_owned()));
+        assert!(states.contains(&"fetching".to_owned()));
+        let agent_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        let pre_scans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_pre_scans WHERE state = 'ready_for_fetch'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(agent_runs, 0, "Fetch 完成前不得启动 Agent 审计");
+        assert!(pre_scans >= 1);
+
+        let revision_id = second["revision_id"].as_str().unwrap();
+        let job_id = Uuid::new_v4();
+        let mut transaction = database.begin().await.unwrap();
+        complete_fetch(
+            &mut transaction,
+            revision_id,
+            &aursmith_protocol::FetchResult {
+                job_id,
+                attempt: aursmith_domain::AttemptRef {
+                    job_id,
+                    attempt_id: Uuid::new_v4(),
+                    generation: 0,
+                },
+                revision_sha256: "f".repeat(64),
+                source_manifest_sha256: "a".repeat(64),
+                sources: vec![aursmith_protocol::SourceManifestEntry {
+                    path: "prepared/PKGBUILD".into(),
+                    kind: aursmith_protocol::SourceEntryKind::File,
+                    sha256: Some("b".repeat(64)),
+                    size: 1,
+                    link_target: None,
+                }],
+                audit_files: vec![],
+                resolved_pkgver: None,
+                dependency_snapshot_sha256: "c".repeat(64),
+                log_sha256: "d".repeat(64),
+                finished_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        let pending_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs WHERE tier = 'low' AND status = 'pending'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(pending_runs, 3, "完整 Fetch 结果必须启动三个低成本 Agent");
     }
 }

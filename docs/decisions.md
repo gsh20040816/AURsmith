@@ -17,6 +17,7 @@
 - ADR-013：Agent 凭据网关替代通用正向代理。它为 low/high 层分别固定唯一 HTTPS upstream 和认证方式，剥离调用方认证头并注入 secret，不能由请求选择目标主机。Runner 网络为内部网络，只有网关具有 provider 外网。
 - ADR-014：KVM Profile 身份采用“文件 Manifest、已安装包清单和创建时间”的确定性内容摘要，Envelope 再对该声明签名。拒绝让 payload 包含自身哈希的循环定义。Fetch VM 只用 `restrict=on` 的单一 guestfwd 到固定 source proxy，Build VM 固定 `-nic none`。
 - ADR-015：Profile 使用一次性 Compose 构建镜像生成，不给常驻 Builder 增加 root 或联网能力。Guest Agent 固定为 PID 1 并再次验证 Controller JobSpec；任何 Guest 失败都关闭 VM，不回退到宿主 makepkg。
+- ADR-016：AUR 包装层扫描结果建模为 `AuditPreScan`，它不是 Agent 的最终审计输入。只有 Fetch VM 产生完整 Source Manifest、Builder 与 Controller 双重验证结果后，系统才创建内容寻址的 `AuditBundle` 和三路低成本 Agent 任务，避免把“尚未取得上游源码”误报成已完成审计。
 
 ## 已拒绝
 

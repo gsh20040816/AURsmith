@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use aursmith_protocol::{
-    ArtifactRecord, BuildResult, FetchResult, GuestResult, JobKind, JobSpec, ManifestEntry,
-    SignedEnvelope,
+    ArtifactRecord, AuditSourceFile, BuildResult, FetchResult, GuestResult, JobKind, JobSpec,
+    SignedEnvelope, SourceEntryKind, SourceManifestEntry,
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -94,12 +94,14 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     copy_tree(Path::new(BUILD), &prepared, false)?;
     let sources = manifest(&prepared, Path::new(OUTPUT))?;
     let source_manifest_sha256 = manifest_digest(&sources)?;
+    let audit_files = select_audit_files(&prepared, &sources)?;
     Ok(FetchResult {
         job_id: spec.job_id,
         attempt: spec.attempt.clone(),
         revision_sha256: spec.revision_sha256.clone(),
         source_manifest_sha256,
         sources,
+        audit_files,
         resolved_pkgver: None,
         dependency_snapshot_sha256: spec
             .dependency_snapshot_sha256
@@ -256,7 +258,7 @@ fn validate_relative_link(link: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn manifest(root: &Path, output_root: &Path) -> anyhow::Result<Vec<ManifestEntry>> {
+fn manifest(root: &Path, output_root: &Path) -> anyhow::Result<Vec<SourceManifestEntry>> {
     let mut files = Vec::new();
     collect_manifest(root, output_root, &mut files)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -266,30 +268,102 @@ fn manifest(root: &Path, output_root: &Path) -> anyhow::Result<Vec<ManifestEntry
 fn collect_manifest(
     root: &Path,
     output_root: &Path,
-    files: &mut Vec<ManifestEntry>,
+    files: &mut Vec<SourceManifestEntry>,
 ) -> anyhow::Result<()> {
     for item in fs::read_dir(root)? {
         let item = item?;
         let metadata = fs::symlink_metadata(item.path())?;
+        let path = item
+            .path()
+            .strip_prefix(output_root)?
+            .to_string_lossy()
+            .into_owned();
         if metadata.is_dir() {
+            files.push(SourceManifestEntry {
+                path,
+                kind: SourceEntryKind::Directory,
+                sha256: None,
+                size: 0,
+                link_target: None,
+            });
             collect_manifest(&item.path(), output_root, files)?;
         } else if metadata.is_file() {
-            let path = item.path();
-            files.push(ManifestEntry {
-                path: path
-                    .strip_prefix(output_root)?
-                    .to_string_lossy()
-                    .into_owned(),
-                sha256: file_digest(&path)?,
+            files.push(SourceManifestEntry {
+                path,
+                kind: SourceEntryKind::File,
+                sha256: Some(file_digest(&item.path())?),
                 size: metadata.len(),
+                link_target: None,
             });
+        } else if metadata.file_type().is_symlink() {
+            files.push(SourceManifestEntry {
+                path,
+                kind: SourceEntryKind::Symlink,
+                sha256: None,
+                size: 0,
+                link_target: Some(fs::read_link(item.path())?.to_string_lossy().into_owned()),
+            });
+        } else {
+            bail!("源码树包含设备文件或其他特殊文件");
         }
     }
     Ok(())
 }
 
-fn manifest_digest(entries: &[ManifestEntry]) -> anyhow::Result<String> {
+fn manifest_digest(entries: &[SourceManifestEntry]) -> anyhow::Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(entries)?)))
+}
+
+fn select_audit_files(
+    prepared: &Path,
+    entries: &[SourceManifestEntry],
+) -> anyhow::Result<Vec<AuditSourceFile>> {
+    const MAX_TOTAL: usize = 2 * 1024 * 1024;
+    const MAX_FILE: u64 = 256 * 1024;
+    let mut remaining = MAX_TOTAL;
+    let mut selected = Vec::new();
+    for entry in entries {
+        if entry.kind != SourceEntryKind::File || entry.size > MAX_FILE {
+            continue;
+        }
+        let lower = entry.path.to_ascii_lowercase();
+        let reason = if lower.ends_with("/pkgbuild") || lower == "prepared/pkgbuild" {
+            Some("AUR 构建入口")
+        } else if lower.ends_with(".sh")
+            || lower.ends_with("/makefile")
+            || lower.ends_with("/cmakelists.txt")
+            || lower.contains("install")
+            || lower.contains("systemd")
+            || lower.contains("service")
+            || lower.contains("hook")
+            || lower.contains("network")
+            || lower.contains("permission")
+            || lower.contains("persist")
+        {
+            Some("风险相关构建、安装、网络、权限或持久化文件")
+        } else {
+            None
+        };
+        let Some(reason) = reason else { continue };
+        let relative = Path::new(&entry.path).strip_prefix("prepared")?;
+        let path = prepared.join(relative);
+        let bytes = fs::read(&path)?;
+        if bytes.len() > remaining {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        remaining -= text.len();
+        selected.push(AuditSourceFile {
+            path: entry.path.clone(),
+            sha256: entry.sha256.clone().context("源码文件缺少摘要")?,
+            size: entry.size,
+            selection_reason: reason.to_owned(),
+            text,
+        });
+    }
+    Ok(selected)
 }
 
 fn collect_package_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -364,10 +438,12 @@ mod tests {
 
     #[test]
     fn manifest_digest_is_order_sensitive_after_canonical_sorting() {
-        let entries = vec![ManifestEntry {
+        let entries = vec![SourceManifestEntry {
             path: "prepared/PKGBUILD".into(),
-            sha256: "a".repeat(64),
+            kind: SourceEntryKind::File,
+            sha256: Some("a".repeat(64)),
             size: 1,
+            link_target: None,
         }];
         assert_eq!(manifest_digest(&entries).unwrap().len(), 64);
     }

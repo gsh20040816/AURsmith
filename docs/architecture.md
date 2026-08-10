@@ -53,7 +53,9 @@ Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机
 
 ## 审计流水线与 Agent 边界
 
-每个 Revision 首先形成包含全部 AUR Git 跟踪文件、相对差异、文件摘要、source 声明和覆盖说明的不可变 `AuditBundle`。确定性扫描会阻断路径逃逸、摘要不一致、私网 source URL 等确定性违规，并将动态下载、混淆、安装钩子、权限修改等不确定信号交给 Agent 判断。当前 Fetch VM 尚未补入完整上游源码前，覆盖说明必须明确写为“完整 AUR 包装层、上游仅清单”，不能将其描述成完整源码审计。
+每个 Revision 首先形成只包含 AUR Git 跟踪文件、文件摘要、source 声明和确定性发现的不可变 `AuditPreScan`。预扫描命中路径逃逸、摘要不一致、私网 source URL 等绝对阻断时直接停止；未阻断时只允许创建 Fetch Job，绝不提前创建 Agent 调用。
+
+Fetch VM 完成下载和校验后生成完整 Source Manifest，清单显式区分普通文件、目录和符号链接，并附带按固定规则选择的构建入口、脚本、安装、网络、权限和持久化相关文本。Builder 验证完整结果，Controller 再核对 Journal 中的结果摘要、Job、Attempt 和 Revision 身份，消费一次 `AuditPreScan`，形成内容寻址且不可再修改的最终 `AuditBundle`。此时才创建三个低成本 Agent 任务。覆盖说明必须明确列出完整清单和 Agent 实际读取的文件，并声明风险选读不能证明全部上游源码安全。
 
 三个低成本 Runner 各自独立读取同一 Bundle。三票通过时直接批准；恰好两票通过时只创建一次高成本任务；不超过一票通过时转入人工队列。Runner 超时、不可用、非零退出、非法 JSON 都按未通过处理，每个调用仅重试一次。高成本 Runner 只收到原始 Bundle 和低成本报告的规范化异议，不接收隐藏推理过程，并且只有明确 `approve` 才能批准。人工决定绑定 Revision、Bundle 摘要和策略版本。
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use aursmith_protocol::{
     BuildProfileSpec, GuestResult, JobKind, JobSpec, ManifestEntry, SignedEnvelope,
+    SourceEntryKind, SourceManifestEntry,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,19 @@ impl BuilderRuntime {
 
     pub fn jobs_dir(&self) -> &Path {
         &self.jobs_dir
+    }
+
+    pub fn completed_result_json(&self, attempt_id: &str) -> anyhow::Result<String> {
+        if uuid::Uuid::parse_str(attempt_id).is_err() {
+            bail!("INVALID_ATTEMPT_ID");
+        }
+        fs::read_to_string(
+            self.jobs_dir
+                .join("completed")
+                .join(attempt_id)
+                .join("output/build-result.json"),
+        )
+        .context("COMPLETED_RESULT_MISSING")
     }
 
     pub fn materialize_inline_inputs(&self, spec: &JobSpec) -> anyhow::Result<()> {
@@ -272,7 +286,7 @@ fn validate_guest_result(
     match result {
         GuestResult::Fetch(value) => {
             validate_result_identity(value.job_id, &value.attempt, &value.revision_sha256, spec)?;
-            validate_output_entries(output, &value.sources)
+            validate_source_entries(output, &value.sources)
         }
         GuestResult::Build(value) | GuestResult::ProfileFixture(value) => {
             validate_result_identity(value.job_id, &value.attempt, &value.revision_sha256, spec)?;
@@ -288,6 +302,39 @@ fn validate_guest_result(
             validate_output_entries(output, &entries)
         }
     }
+}
+
+fn validate_source_entries(output: &Path, entries: &[SourceManifestEntry]) -> anyhow::Result<()> {
+    for entry in entries {
+        aursmith_protocol::validate_relative_path(&entry.path)?;
+        let path = output.join(&entry.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("GUEST_SOURCE_MISSING:{}", entry.path))?;
+        let valid = match entry.kind {
+            SourceEntryKind::File => {
+                metadata.file_type().is_file()
+                    && metadata.len() == entry.size
+                    && entry.sha256.as_deref() == Some(digest_file(&path)?.as_str())
+                    && entry.link_target.is_none()
+            }
+            SourceEntryKind::Directory => {
+                metadata.file_type().is_dir()
+                    && entry.size == 0
+                    && entry.sha256.is_none()
+                    && entry.link_target.is_none()
+            }
+            SourceEntryKind::Symlink => {
+                metadata.file_type().is_symlink()
+                    && entry.size == 0
+                    && entry.sha256.is_none()
+                    && entry.link_target.as_deref() == fs::read_link(&path)?.to_str()
+            }
+        };
+        if !valid {
+            bail!("GUEST_SOURCE_MISMATCH:{}", entry.path);
+        }
+    }
+    Ok(())
 }
 
 fn validate_result_identity(
