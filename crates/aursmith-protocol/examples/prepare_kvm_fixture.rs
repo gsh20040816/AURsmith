@@ -1,6 +1,9 @@
 use anyhow::{Context, bail};
 use aursmith_domain::{AttemptRef, WorkerRole};
-use aursmith_protocol::{BuildProfileSpec, JobKind, JobSpec, ResourceLimits, SignedEnvelope};
+use aursmith_protocol::{
+    BuildProfileSpec, DependencyInput, DependencySource, JobKind, JobSpec, ResourceLimits,
+    SignedEnvelope,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
@@ -19,15 +22,18 @@ fn main() -> anyhow::Result<()> {
     let arguments = env::args().collect::<Vec<_>>();
     if !(arguments.len() == 3 || arguments.len() == 4) {
         bail!(
-            "用法：prepare_kvm_fixture <Profile 导出目录> <临时运行目录> [profile_fixture|fetch]"
+            "用法：prepare_kvm_fixture <Profile 导出目录> <临时运行目录> [profile_fixture|fetch|fetch_dependency]"
         );
     }
     let fixture_kind = arguments
         .get(3)
         .map(String::as_str)
         .unwrap_or("profile_fixture");
-    if !matches!(fixture_kind, "profile_fixture" | "fetch") {
-        bail!("fixture 类型只能是 profile_fixture 或 fetch");
+    if !matches!(
+        fixture_kind,
+        "profile_fixture" | "fetch" | "fetch_dependency"
+    ) {
+        bail!("fixture 类型只能是 profile_fixture、fetch 或 fetch_dependency");
     }
     let source = Path::new(&arguments[1]);
     let runtime = Path::new(&arguments[2]);
@@ -56,7 +62,12 @@ fn main() -> anyhow::Result<()> {
     let job_id = Uuid::new_v4();
     let attempt_id = Uuid::new_v4();
     let now = Utc::now();
-    let package_build = b"pkgname=aursmith-fetch-fixture\npkgver=1\npkgrel=1\narch=('any')\nsource=()\nsha256sums=()\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-fetch-fixture/os-release\"; }\n";
+    let fetch_job = matches!(fixture_kind, "fetch" | "fetch_dependency");
+    let package_build = if fixture_kind == "fetch_dependency" {
+        b"pkgname=aursmith-fetch-fixture\npkgver=1\npkgrel=1\narch=('any')\nmakedepends=('tree')\nsource=()\nsha256sums=()\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-fetch-fixture/os-release\"; }\n".as_slice()
+    } else {
+        b"pkgname=aursmith-fetch-fixture\npkgver=1\npkgrel=1\narch=('any')\nsource=()\nsha256sums=()\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-fetch-fixture/os-release\"; }\n".as_slice()
+    };
     let package_entry = aursmith_protocol::ManifestEntry {
         path: "PKGBUILD".into(),
         sha256: hex::encode(Sha256::digest(package_build)),
@@ -70,7 +81,7 @@ fn main() -> anyhow::Result<()> {
             generation: 0,
         },
         required_role: WorkerRole::Builder,
-        kind: if fixture_kind == "fetch" {
+        kind: if fetch_job {
             JobKind::Fetch
         } else {
             JobKind::ProfileFixture
@@ -83,13 +94,21 @@ fn main() -> anyhow::Result<()> {
         published_pkgrel: None,
         source_attempt_id: None,
         dependency_attempt_ids: vec![],
-        dependencies: vec![],
-        inputs: if fixture_kind == "fetch" {
+        dependencies: if fixture_kind == "fetch_dependency" {
+            vec![DependencyInput {
+                name: "tree".into(),
+                kind: "makedepends".into(),
+                source: DependencySource::Official,
+            }]
+        } else {
+            vec![]
+        },
+        inputs: if fetch_job {
             vec![package_entry.clone()]
         } else {
             vec![]
         },
-        inline_inputs: if fixture_kind == "fetch" {
+        inline_inputs: if fetch_job {
             vec![aursmith_protocol::InlineInput {
                 entry: package_entry,
                 content_base64: STANDARD.encode(package_build),
@@ -97,7 +116,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             vec![]
         },
-        expected_outputs: if fixture_kind == "fetch" {
+        expected_outputs: if fetch_job {
             vec![]
         } else {
             vec!["aursmith-profile-fixture".into()]

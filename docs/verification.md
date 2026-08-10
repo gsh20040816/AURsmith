@@ -8,7 +8,7 @@
 - 宿主能力：`/dev/kvm` 可用，QEMU、qemu-img 和 `/usr/lib/virtiofsd` 均由宿主提供。
 - Profile：通过非 privileged、断网导出容器重建 Arch rootfs、Linux 内核、initramfs 和最新版 Guest Agent。
 - 授权：`prepare_kvm_fixture` 使用正式 Ed25519/CBOR Envelope 实现和固定测试密钥，在临时目录生成 Profile 与 ProfileFixture JobSpec；没有使用生产密钥。
-- 执行：真实 Worker daemon 创建 qcow2 overlay、两个 virtiofs 通道和无网卡 KVM VM；Guest 再次验证 Controller 签名，以普通 `builder` 用户执行 `makepkg`。
+- 执行：真实 Worker daemon 创建 qcow2 overlay、两个只限 Attempt 目录的 virtio-9p 通道和无网卡 KVM VM；Guest 再次验证 Controller 签名，以普通 `builder` 用户执行 `makepkg`。
 - 结果：Job `33246641-748c-42d7-ad33-017a3223d307` 成功，Attempt `e238c934-c38b-4799-9579-5f418f3cff6e` 返回 `profile_fixture`；生成 `aursmith-profile-fixture-1-1-any.pkg.tar.zst`，大小 1255 字节，SHA-256 为 `a09eedb98a2fdb0630730a23afc5d57c3b8ce45636f359be3436d43714aaa2e7`；provenance 明确记录 `network=none`。
 - 实际发现并修复：QEMU memfd/NUMA 后端缺少匹配的 `-m`；最小 Arch rootfs 的 os-release 位于 `/usr/lib/os-release`；失败 VM 日志此前会随 runtime 清理而丢失。
 - 未覆盖：这次只验证 ProfileFixture，不代表 Fetch 代理、真实 AUR source、批次内 AUR 依赖、Publisher、Signer 或 Archiver 已完成端到端验证。
@@ -20,7 +20,7 @@
 - 输入：测试 PKGBUILD 不含外部 source 和依赖；它通过签名 JobSpec 的内联输入进入 Worker，不从宿主共享可写目录注入。
 - Fetch：Job `42a6f6c4-2b19-44b3-9a32-e2c86c9b8d0d`、Attempt `59d2c20c-f0a0-4b80-a43b-b1d44ecba210` 在受限联网 KVM 中成功；Source Manifest 摘要为 `22f6a17734aea5df41ef3498c2bdf79fd5cb4d13e858b3c65cc5d428d0be957a`，并完整记录 PKGBUILD、src 目录和 Agent 风险选读文本。
 - Build：新的 Job `74881cb7-c2be-49e4-96e7-f6a7b4b0f07c` 只引用上述 Fetch Attempt 和摘要；Worker 从 completed 目录重新验证并创建新 overlay。Build VM 使用 `network=none`，成功生成 `aursmith-fetch-fixture-1-1-any.pkg.tar.zst`，解析到包名、版本 `1-1`、架构 `any`，SHA-256 为 `744859e3eceb7675962040dc91150b1cef219936e1ad4a11bec5d630119ee24b`。
-- 边界：fixture 没有实际下载官方依赖，因此验证了依赖为空时的快照与离线安装路径，但未验证 pacman 经 source proxy 下载真实官方包的网络行为。
+- 边界：该早期 fixture 没有实际下载官方依赖，只验证了依赖为空时的快照与离线安装路径；后续“Fetch KVM 真实官方依赖下载”已补齐 pacman 经 source proxy 的真实网络与验签行为。
 - 清理：Worker 和临时监听器已停止；本次 Profile 与 runtime 目录移动到回收站后再确认无 QEMU/virtiofsd 残留。
 
 ## 2026-08-10：离线 Signer
@@ -260,7 +260,7 @@
 - 单元测试覆盖 Agent 健康响应探测和 source proxy URL 拒绝规则。实际以只读、`cap_drop: ALL`、`no-new-privileges` 的 Squid 容器运行扩展后的 `scripts/smoke-upstream.sh`，AUR 与 source proxy 两项均通过；测试容器由 trap 删除，临时镜像标签移除。
 - 实际构建 Agent Runner 镜像，并以只读、零 capability 容器分别启动 Codex 与 Claude Code adapter；两者 `/healthz` 均返回 200，且模拟凭据网关 TCP 可达。第一次用 `nc` 模拟网关没有得到 JSON，脚本又缺少最终失败判定，因此不计为通过；改用明确 HTTP 监听和失败关闭后分别复验成功。排查期间一个前台测试容器未随非 TTY 中断退出，随后按精确 ID 删除；测试镜像及独占层也已删除，可由 Dockerfile 重建。
 - 最终执行 `bash scripts/test-all.sh`：全仓库 104 个 Rust 测试、前端类型检查、7 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。此前直接运行 `docker compose config` 未提供 Stack 强制要求的 Controller 公钥和传输映射，因此在变量插值阶段按设计拒绝；该次不计为配置验证，最终结论采用统一脚本注入测试值后的通过结果。
-- 边界：Doctor 证明配置、CLI、内部凭据网关、AUR 和 source proxy 路径可用，不证明 provider API key 有效，也不产生任何审计结论。真实 provider 审计和 Fetch VM 内下载仍保留为部署验收的未验证范围。
+- 边界：Doctor 证明配置、CLI、内部凭据网关、AUR 和 source proxy 路径可用，不证明 provider API key 有效，也不产生任何审计结论。真实 provider 审计仍保留为部署验收项；Fetch VM 内官方依赖下载已由后续独立 KVM 验收补齐。
 
 ## 2026-08-10：有界 Job 日志与证据详情
 
@@ -283,3 +283,12 @@
 - 使用上游 1.8 镜像的固定 digest 构建 AURsmith 派生镜像，强制 UID/GID 65532、只读根文件系统、`cap_drop: ALL`、`no-new-privileges` 和独立缓存卷；命名卷首次挂载后实际确认该用户可写缓存。
 - Caddy 配置验证通过。在临时 Docker 网络中经正式 `/arch-cache/core/os/x86_64/core.db` 路由连续请求两次，pacoloco `/metrics` 实际返回 requests 2、miss 1、hit 1。
 - Publisher Worker 只允许无凭据、无参数的内部 HTTP `/metrics` URL，解析并聚合请求、命中、未命中、错误、缓存字节和包数量；单元测试覆盖多 repo 聚合和外部 HTTPS/内嵌凭据拒绝。Controller 指标从活动 Publisher 的签名状态快照读取该全局统计。
+
+## 2026-08-11：Fetch KVM 真实官方依赖下载
+
+- 使用 `AURSMITH_ARCH_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/archlinux` 从头生成不可变 Profile。构建补齐根文件系统 `pacman.conf`、Arch Linux keyring，以及 initramfs 中的 `9pnet_virtio` 和 `virtio_net`；导出的镜像选择和文件摘要继续进入签名 Profile 声明。
+- Builder 在只读根文件系统、`cap_drop: ALL`、`no-new-privileges` 且只挂载 `/dev/kvm` 的容器内启动 Fetch VM。QEMU user network 保持 `restrict=on`，唯一 guestfwd 指向 Attempt 独占的 Builder 回环中继，中继再连接无特权 Squid source proxy；Build VM 的 `-nic none` 逻辑没有改变。
+- 测试 Revision 的 `makedepends=('tree')`。Fetch Guest 实际下载并通过 Arch keyring 验签 `tree-2.3.2-1-x86_64.pkg.tar.zst`，最终 Job `e4d002d5-85bb-4d76-87a1-adcd4f82a03f` 成功；FetchResult 记录 `tree 2.3.2-1`、44562 字节、SHA-256 `8a6230468cc31a2c984a41c092035dd16bf97e737ec3241490724a5419903739`，下载阶段为 901 毫秒，包及分离签名均进入 Source Manifest。
+- 排查中先后真实暴露并修复了旧 Profile 缺少 9p 网络模块、`pacman.conf`、virtio 网卡驱动和初始化 keyring的问题。最后一个失败来自误把 pacman 的非 Query 选项用于 `-Qp`；正式实现改为用固定 argv 的 bsdtar 从已验签包读取 `.PKGINFO`，并排除 `.sig` 文件。只有上述最终成功 Attempt 计入 B02/B05 验收。
+- 最终执行 `bash scripts/test-all.sh`：全仓库 110 个 Rust 测试、前端 TypeScript 检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
+- 边界：该 fixture 没有额外 AUR source URL，因此本条严格证明的是同一个 Fetch KVM 内的受限网络、官方包下载、签名校验和溯源记录；AUR source 的实际 HTTPS 路径由同一代理机制和既有 Publisher Doctor覆盖，但不把二者合并声称为任意上游源码均已安全审计。

@@ -21,6 +21,9 @@ RUN case "${AURSMITH_ARCH_MIRROR}" in https://*) ;; *) echo 'AURSMITH_ARCH_MIRRO
     && install -Dm644 /etc/pacman.d/mirrorlist /rootfs/etc/pacman.d/mirrorlist \
     && printf '%s\n' "${repository_mirror}" > /opt/aursmith-profile/repository-mirror \
     && useradd --root /rootfs --uid 1000 --create-home --shell /bin/bash builder
+RUN install -Dm644 /etc/pacman.conf /rootfs/etc/pacman.conf
+RUN pacman-key --gpgdir /rootfs/etc/pacman.d/gnupg --init \
+    && pacman-key --gpgdir /rootfs/etc/pacman.d/gnupg --populate archlinux
 COPY deploy/common/mkinitcpio-aursmith.conf /rootfs/etc/mkinitcpio.conf
 COPY --from=rust-builder /src/target/release/aursmith-guest-agent /rootfs/usr/local/bin/aursmith-guest-agent
 RUN chmod 0755 /rootfs/usr/local/bin/aursmith-guest-agent \

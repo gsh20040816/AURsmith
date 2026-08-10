@@ -64,6 +64,9 @@ fn run() -> anyhow::Result<()> {
     if spec.is_expired_at(Utc::now()) {
         bail!("Guest JobSpec 已过期");
     }
+    if spec.kind == JobKind::Fetch {
+        configure_fetch_network()?;
+    }
     reset_build_directory()?;
     copy_tree(Path::new(INPUT), Path::new(BUILD), true)?;
     if spec.kind == JobKind::ProfileFixture {
@@ -92,6 +95,26 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn configure_fetch_network() -> anyhow::Result<()> {
+    let interface = fs::read_dir("/sys/class/net")?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|name| name != "lo")
+        .context("Fetch VM 未发现网络接口")?;
+    run_checked("/usr/bin/ip", &["link", "set", &interface, "up"], None)?;
+    run_checked(
+        "/usr/bin/ip",
+        &["address", "add", "10.0.2.15/24", "dev", &interface],
+        None,
+    )?;
+    run_checked(
+        "/usr/bin/ip",
+        &["route", "add", "default", "via", "10.0.2.2"],
+        None,
+    )?;
+    Ok(())
+}
+
 fn install_offline_dependencies(build: &Path) -> anyhow::Result<()> {
     let mut packages = Vec::new();
     for directory in [
@@ -107,7 +130,7 @@ fn install_offline_dependencies(build: &Path) -> anyhow::Result<()> {
                 && path
                     .file_name()
                     .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.contains(".pkg.tar."))
+                    .is_some_and(is_package_archive_name)
             {
                 packages.push(path);
             }
@@ -268,27 +291,27 @@ fn download_official_dependencies(
             || !path
                 .file_name()
                 .and_then(|value| value.to_str())
-                .is_some_and(|name| name.contains(".pkg.tar."))
+                .is_some_and(is_package_archive_name)
         {
             continue;
         }
         let metadata = fs::metadata(&path)?;
-        let output = Command::new("/usr/bin/pacman")
-            .args(["-Qp", "--print-format", "%n\t%v"])
+        let output = Command::new("/usr/bin/bsdtar")
+            .args(["-xOf"])
             .arg(&path)
+            .arg(".PKGINFO")
             .stdin(Stdio::null())
+            .env_clear()
+            .env("PATH", "/usr/bin")
             .output()?;
         if !output.status.success() {
             bail!("无法读取官方依赖包元数据");
         }
-        let metadata_line = String::from_utf8(output.stdout)?;
-        let (name, version) = metadata_line
-            .trim()
-            .split_once('\t')
-            .context("官方依赖包元数据格式无效")?;
+        let pkginfo = String::from_utf8(output.stdout)?;
+        let (name, version) = parse_pkginfo_identity(&pkginfo)?;
         resolved.push(ResolvedDependency {
-            name: name.to_owned(),
-            version: version.to_owned(),
+            name,
+            version,
             source: DependencySource::Official,
             package: ManifestEntry {
                 path: path
@@ -302,6 +325,33 @@ fn download_official_dependencies(
     }
     resolved.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(resolved)
+}
+
+fn is_package_archive_name(name: &str) -> bool {
+    name.contains(".pkg.tar.") && !name.ends_with(".sig")
+}
+
+fn parse_pkginfo_identity(pkginfo: &str) -> anyhow::Result<(String, String)> {
+    fn values<'a>(pkginfo: &'a str, key: &str) -> BTreeSet<&'a str> {
+        pkginfo
+            .lines()
+            .filter_map(|line| {
+                let (field, value) = line.split_once('=')?;
+                (field.trim() == key)
+                    .then(|| value.trim())
+                    .filter(|value| !value.is_empty())
+            })
+            .collect()
+    }
+    let names = values(pkginfo, "pkgname");
+    let versions = values(pkginfo, "pkgver");
+    if names.len() != 1 || versions.len() != 1 {
+        bail!("官方依赖包 .PKGINFO 缺少唯一 pkgname/pkgver");
+    }
+    Ok((
+        names.into_iter().next().unwrap().to_owned(),
+        versions.into_iter().next().unwrap().to_owned(),
+    ))
 }
 
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
@@ -635,7 +685,7 @@ fn collect_package_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             && path
                 .file_name()
                 .and_then(|value| value.to_str())
-                .is_some_and(|name| name.contains(".pkg.tar."))
+                .is_some_and(is_package_archive_name)
         {
             packages.push(path);
         }
@@ -721,6 +771,21 @@ mod tests {
             link_target: None,
         }];
         assert_eq!(manifest_digest(&entries).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn package_identity_comes_from_unique_pkginfo_fields() {
+        let pkginfo = "pkgname = tree\npkgbase = tree\npkgver = 2.3.2-1\n";
+        assert_eq!(
+            parse_pkginfo_identity(pkginfo).unwrap(),
+            ("tree".into(), "2.3.2-1".into())
+        );
+        assert!(parse_pkginfo_identity("pkgname = tree\n").is_err());
+        assert!(parse_pkginfo_identity("pkgname = one\npkgname = two\npkgver = 1\n").is_err());
+        assert!(is_package_archive_name("tree-2.3.2-1-x86_64.pkg.tar.zst"));
+        assert!(!is_package_archive_name(
+            "tree-2.3.2-1-x86_64.pkg.tar.zst.sig"
+        ));
     }
 
     #[test]

@@ -13,7 +13,12 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
-use tokio::{process::Command, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    process::Command,
+    task::JoinHandle,
+    time::timeout,
+};
 
 #[derive(Clone)]
 pub struct BuilderRuntime {
@@ -442,7 +447,17 @@ async fn execute_attempt(
         output_directory: work.join("output"),
         control_socket: work.join("control.sock"),
     };
-    let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.fetch_proxy)?;
+    let fetch_relay = match (spec.kind, runtime.fetch_proxy) {
+        (JobKind::Fetch, Some(target)) => Some(FetchRelay::start(target).await?),
+        (JobKind::Fetch, None) => bail!("Fetch VM 必须配置唯一源码代理"),
+        _ => None,
+    };
+    let plan = QemuPlan::for_job(
+        &profile,
+        &spec,
+        paths,
+        fetch_relay.as_ref().map(FetchRelay::address),
+    )?;
     let qemu = Command::new(plan.executable)
         .args(&plan.arguments)
         .stdin(std::process::Stdio::null())
@@ -475,6 +490,10 @@ async fn execute_attempt(
         bail!("VM_FAILED:{diagnostic}")
     }
     let result_path = work.join("output/build-result.json");
+    if !result_path.is_file() && work.join("output/guest-error.json").is_file() {
+        let code = classify_guest_failure(&spec, &work.join("output"));
+        bail!("{code}")
+    }
     let result = fs::read(&result_path).context("GUEST_RESULT_MISSING")?;
     let guest_result: GuestResult =
         serde_json::from_slice(&result).context("GUEST_RESULT_INVALID")?;
@@ -491,6 +510,44 @@ async fn execute_attempt(
     fs::create_dir_all(runtime.jobs_dir.join("completed"))?;
     fs::rename(&work, &completed)?;
     Ok(digest)
+}
+
+struct FetchRelay {
+    address: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl FetchRelay {
+    async fn start(target: SocketAddr) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("FETCH_RELAY_BIND_FAILED")?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut guest, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let Ok(mut proxy) = TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut guest, &mut proxy).await;
+                });
+            }
+        });
+        Ok(Self { address, task })
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for FetchRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 async fn create_build_evidence_archives(
@@ -848,7 +905,7 @@ impl QemuPlan {
         profile: &VerifiedProfile,
         spec: &JobSpec,
         paths: VmPaths,
-        fetch_proxy: Option<SocketAddr>,
+        fetch_relay: Option<SocketAddr>,
     ) -> anyhow::Result<Self> {
         if spec.required_role != aursmith_domain::WorkerRole::Builder {
             bail!("QEMU 计划只能用于 Builder Job");
@@ -856,8 +913,8 @@ impl QemuPlan {
         if spec.limits.cpu_count == 0 || spec.limits.memory_mib < 512 {
             bail!("VM 至少需要 1 个 CPU 和 512 MiB 内存");
         }
-        if spec.kind == JobKind::Fetch && fetch_proxy.is_none() {
-            bail!("Fetch VM 必须配置唯一源码代理");
+        if spec.kind == JobKind::Fetch && fetch_relay.is_none() {
+            bail!("Fetch VM 必须配置本地源码代理中继");
         }
         let memory = spec.limits.memory_mib.to_string();
         let mut arguments: Vec<OsString> = [
@@ -929,11 +986,11 @@ impl QemuPlan {
         ]);
         match spec.kind {
             JobKind::Fetch => {
-                let proxy = fetch_proxy.expect("前置校验保证存在 Fetch proxy");
+                let relay = fetch_relay.expect("前置校验保证存在 Fetch proxy 中继");
                 arguments.extend([
                     "-nic".into(),
                     format!(
-                        "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:{proxy}"
+                        "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:{relay}"
                     )
                     .into(),
                 ]);
@@ -1091,7 +1148,7 @@ mod tests {
     #[test]
     fn fetch_vm_can_only_reach_the_fixed_proxy_forward() {
         let root = Path::new("/jobs/attempt");
-        let proxy: SocketAddr = "192.0.2.10:8080".parse().unwrap();
+        let proxy: SocketAddr = "127.0.0.1:3129".parse().unwrap();
         let plan = QemuPlan::for_job(
             &profile(root),
             &job(JobKind::Fetch),
@@ -1104,7 +1161,8 @@ mod tests {
             .iter()
             .map(|value| value.to_string_lossy())
             .collect();
-        assert!(args.iter().any(|value| value.as_ref() == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:192.0.2.10:8080"));
+        assert!(args.iter().any(|value| value.as_ref()
+            == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:127.0.0.1:3129"));
         assert!(!args.windows(2).any(|pair| pair == ["-nic", "none"]));
     }
 
