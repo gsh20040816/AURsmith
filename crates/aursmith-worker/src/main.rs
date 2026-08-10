@@ -2608,6 +2608,86 @@ mod transfer_tests {
         assert!(verify_manifest_directory(root.path(), &[entry]).is_err());
     }
 
+    #[tokio::test]
+    async fn archive_receipt_binds_nested_release_evidence_and_restores_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let imported = root.path().join("imported");
+        std::fs::create_dir_all(imported.join("evidence/attempt")).unwrap();
+        std::fs::write(imported.join("release-manifest.json"), b"manifest").unwrap();
+        std::fs::write(
+            imported.join("evidence/attempt/source.tar.zst"),
+            b"complete source bytes",
+        )
+        .unwrap();
+        let files = directory_manifest(&imported).unwrap();
+        let database_path = root.path().join("worker.db");
+        let database = connect(&format!("sqlite://{}", database_path.display()))
+            .await
+            .unwrap();
+        let worker_id: String =
+            sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        let release_id = uuid::Uuid::new_v4();
+        let capability = TransferCapability {
+            id: uuid::Uuid::new_v4(),
+            source_worker: uuid::Uuid::new_v4(),
+            destination_worker: uuid::Uuid::parse_str(&worker_id).unwrap(),
+            attempt: None,
+            release_id: Some(release_id),
+            backup_id: None,
+            writer_epoch: 1,
+            files,
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+        };
+        let archive_dir = root.path().join("archive");
+        let worker = Worker {
+            name: "archive-test".into(),
+            role: WorkerRole::Archiver,
+            database,
+            trusted_controller_key: vec![0; 32],
+            aur: aur::AurClient::new("https://aur.archlinux.org/").unwrap(),
+            source_proxy_url: None,
+            builder: None,
+            transfer_endpoints: BTreeMap::new(),
+            transfer_ssh_identity_file: None,
+            transfer_ssh_known_hosts_file: None,
+            landing_dir: root.path().join("landing"),
+            writer_epoch: 0,
+            signer_inbox: root.path().join("signer-inbox"),
+            signer_output: root.path().join("signer-output"),
+            repository_dir: root.path().join("repository"),
+            repository_arch: "x86_64".into(),
+            publisher_gpg_home: root.path().join("gpg"),
+            jobs_dir: root.path().join("jobs"),
+            archive_dir: archive_dir.clone(),
+            identity_signing_key: SigningKey::from_bytes(&[31; 32]),
+            repository_gpg_fingerprint: None,
+        };
+        let envelope = archive_release(&worker, &capability, &imported)
+            .await
+            .unwrap();
+        let receipt: ArchiveReceipt = envelope.verify("aursmith.archive_receipt").unwrap();
+        assert_eq!(receipt.release_id, release_id);
+        assert!(
+            receipt
+                .files
+                .iter()
+                .any(|entry| entry.path == "evidence/attempt/source.tar.zst")
+        );
+        assert_eq!(
+            std::fs::read(
+                archive_dir
+                    .join("releases")
+                    .join(release_id.to_string())
+                    .join("evidence/attempt/source.tar.zst")
+            )
+            .unwrap(),
+            b"complete source bytes"
+        );
+    }
+
     #[test]
     fn control_plane_backup_requires_controller_signature_and_bound_database() {
         let root = tempfile::tempdir().unwrap();
