@@ -416,9 +416,13 @@ async fn check_official_dependency_updates(state: &AppState) -> Result<(), ApiEr
     let due: Vec<String> = sqlx::query_scalar("SELECT package_base FROM rebuild_recommendations WHERE state = 'suggested' AND detected_at <= ? ORDER BY package_base")
         .bind(Utc::now() - Duration::days(7)).fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let due_set = due.into_iter().collect::<BTreeSet<_>>();
-    if let Some(batch_id) =
-        crate::packages::schedule_rebuild_batch(&state.database, due_set.clone(), "scheduler")
-            .await?
+    if let Some(batch_id) = crate::packages::schedule_rebuild_batch(
+        &state.database,
+        due_set.clone(),
+        "scheduler",
+        "official_dependency_changed",
+    )
+    .await?
     {
         for package_base in due_set {
             sqlx::query("UPDATE rebuild_recommendations SET state = 'scheduled', updated_at = ? WHERE package_base = ? AND state = 'suggested'")

@@ -134,6 +134,10 @@ pub fn router(state: AppState) -> Router {
             post(crate::packages::refresh_package),
         )
         .route(
+            "/api/v1/packages/{package_base}/rebuild",
+            post(manual_rebuild_package),
+        )
+        .route(
             "/api/v1/packages/{package_base}/build-policy",
             post(crate::packages::set_build_policy),
         )
@@ -814,6 +818,7 @@ async fn schedule_rebuild_recommendation(
         &state.database,
         BTreeSet::from([package_base.clone()]),
         &actor,
+        "official_dependency_changed",
     )
     .await?
     .ok_or_else(|| ApiError::internal("重建批次未创建"))?;
@@ -822,6 +827,27 @@ async fn schedule_rebuild_recommendation(
     Ok(Json(
         json!({"package_base": package_base, "state": "scheduled", "batch_id": batch_id}),
     ))
+}
+
+async fn manual_rebuild_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(package_base): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let batch_id = crate::packages::schedule_rebuild_batch(
+        &state.database,
+        BTreeSet::from([package_base.clone()]),
+        &actor,
+        "manual_rebuild",
+    )
+    .await?
+    .ok_or_else(|| ApiError::internal("手工重建批次未创建"))?;
+    Ok(Json(json!({
+        "package_base": package_base,
+        "state": "scheduled",
+        "batch_id": batch_id,
+    })))
 }
 
 async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

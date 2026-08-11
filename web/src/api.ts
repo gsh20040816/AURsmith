@@ -379,6 +379,11 @@ export const api = {
       `/api/v1/packages/${encodeURIComponent(packageBase)}/refresh`,
       { method: "POST" }
     ),
+  rebuildPackage: (packageBase: string) =>
+    request<{ package_base: string; state: string; batch_id: string }>(
+      `/api/v1/packages/${encodeURIComponent(packageBase)}/rebuild`,
+      { method: "POST" }
+    ),
   probeWorker: (id: string) =>
     request<{ id: string; state: string }>(`/api/v1/workers/${id}/probe`, {
       method: "POST"

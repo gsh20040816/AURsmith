@@ -985,6 +985,7 @@ pub(crate) async fn schedule_rebuild_batch(
     database: &SqlitePool,
     changed: BTreeSet<String>,
     actor: &str,
+    reason: &str,
 ) -> Result<Option<String>, ApiError> {
     if changed.is_empty() {
         return Ok(None);
@@ -1018,7 +1019,7 @@ pub(crate) async fn schedule_rebuild_batch(
             serde_json::to_vec(&json!({
                 "upstream_input_sha256": previous.get::<String,_>("input_sha256"),
                 "rebuild_batch_id": batch_id,
-                "reason": "official_dependency_changed"
+                "reason": reason
             }))
             .map_err(ApiError::internal)?,
         ));
@@ -1048,8 +1049,8 @@ pub(crate) async fn schedule_rebuild_batch(
         &mut transaction,
         "release_batch",
         &batch_id,
-        "official_dependency_rebuild_batch_created",
-        json!({"changed_packages": changed}),
+        "rebuild_batch_created",
+        json!({"changed_packages": changed, "reason": reason}),
         actor,
     )
     .await?;
@@ -2435,11 +2436,15 @@ mod tests {
         .await
         .unwrap();
         let first_revision = first["revision_id"].as_str().unwrap().to_owned();
-        let batch_id =
-            schedule_rebuild_batch(&database, BTreeSet::from(["demo".into()]), "scheduler")
-                .await
-                .unwrap()
-                .unwrap();
+        let batch_id = schedule_rebuild_batch(
+            &database,
+            BTreeSet::from(["demo".into()]),
+            "scheduler",
+            "official_dependency_changed",
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let batches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_batches")
             .fetch_one(&database)
             .await
