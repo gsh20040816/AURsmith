@@ -310,10 +310,37 @@ async fn run_codex(
     )
     .await?;
     ensure_success(&output)?;
-    let raw: Value = serde_json::from_slice(&fs::read(result_path).await?)
-        .context("Codex 最终输出不是约定的 JSON")?;
+    let result = fs::read(result_path).await?;
+    let raw = parse_codex_output(&result)?;
     let parsed = serde_json::from_value(raw.clone()).context("Codex 审计输出字段无效")?;
     Ok((parsed, raw, adapter_version("/usr/local/bin/codex").await))
+}
+
+fn parse_codex_output(output: &[u8]) -> anyhow::Result<Value> {
+    if let Ok(value) = serde_json::from_slice(output) {
+        return Ok(value);
+    }
+    let text = std::str::from_utf8(output).context("Codex 最终输出不是 UTF-8")?;
+    let trimmed = text.trim();
+    if let Some(fenced) = trimmed
+        .strip_prefix("```json")
+        .and_then(|value| value.strip_suffix("```"))
+    {
+        if let Ok(value) = serde_json::from_str(fenced.trim()) {
+            return Ok(value);
+        }
+    }
+    let start = trimmed.find('{');
+    let end = trimmed.rfind('}');
+    if let (Some(start), Some(end)) = (start, end) {
+        if start <= end {
+            if let Ok(value) = serde_json::from_str(&trimmed[start..=end]) {
+                return Ok(value);
+            }
+        }
+    }
+    let diagnostic = trimmed.chars().take(512).collect::<String>();
+    bail!("Codex 最终输出不是约定的 JSON：{diagnostic}")
 }
 
 async fn run_claude_code(
@@ -577,5 +604,23 @@ mod tests {
         let error = ensure_success(&output).unwrap_err().to_string();
         assert!(error.contains("provider rejected [redacted]"));
         assert!(!error.contains("credential-is-in-gateway"));
+    }
+
+    #[test]
+    fn codex_output_accepts_json_inside_markdown_fence_or_short_preamble() {
+        let expected = serde_json::json!({"verdict": "approve"});
+        assert_eq!(
+            parse_codex_output(
+                br#"```json
+{"verdict":"approve"}
+```"#
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_codex_output(b"result follows: {\"verdict\":\"approve\"}").unwrap(),
+            expected
+        );
     }
 }
