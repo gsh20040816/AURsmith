@@ -20,6 +20,7 @@ pub struct BuilderRuntime {
     profiles_dir: PathBuf,
     jobs_dir: PathBuf,
     fetch_proxy: Option<SocketAddr>,
+    build_network: bool,
 }
 
 impl BuilderRuntime {
@@ -28,7 +29,13 @@ impl BuilderRuntime {
             profiles_dir,
             jobs_dir,
             fetch_proxy,
+            build_network: false,
         }
+    }
+
+    pub fn with_build_network(mut self, enabled: bool) -> Self {
+        self.build_network = enabled;
+        self
     }
 
     pub fn available_profiles(&self) -> Vec<String> {
@@ -445,7 +452,13 @@ async fn execute_attempt(
     if spec.kind == JobKind::Fetch && runtime.fetch_proxy.is_none() {
         bail!("Fetch VM 必须配置唯一源码代理");
     }
-    let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.fetch_proxy)?;
+    let plan = QemuPlan::for_job(
+        &profile,
+        &spec,
+        paths,
+        runtime.fetch_proxy,
+        runtime.build_network,
+    )?;
     let qemu = Command::new(plan.executable)
         .args(&plan.arguments)
         .stdin(std::process::Stdio::null())
@@ -760,6 +773,8 @@ fn network_failure_in_log(bytes: &[u8]) -> bool {
         "network is unreachable",
         "failed to connect",
         "connection timed out",
+        "error nu1301",
+        "unable to load the service index for source",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -856,6 +871,7 @@ impl QemuPlan {
         spec: &JobSpec,
         paths: VmPaths,
         fetch_relay: Option<SocketAddr>,
+        build_network: bool,
     ) -> anyhow::Result<Self> {
         if spec.required_role != aursmith_domain::WorkerRole::Builder {
             bail!("QEMU 计划只能用于 Builder Job");
@@ -897,8 +913,9 @@ impl QemuPlan {
             profile.initramfs.as_os_str().into(),
             "-append".into(),
             format!(
-                "root=/dev/vda rw console=ttyS0 panic=1 init=/usr/local/bin/aursmith-guest-agent aursmith.controller_key={}",
-                profile.controller_key_hex
+                "root=/dev/vda rw console=ttyS0 panic=1 init=/usr/local/bin/aursmith-guest-agent aursmith.controller_key={} aursmith.build_network={}",
+                profile.controller_key_hex,
+                u8::from(spec.kind == JobKind::Build && build_network),
             )
             .into(),
             "-drive".into(),
@@ -941,6 +958,9 @@ impl QemuPlan {
                     "-nic".into(),
                     "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-cmd:/usr/local/bin/aursmithctl tcp-relay".into(),
                 ]);
+            }
+            JobKind::Build if build_network => {
+                arguments.extend(["-nic".into(), "user,model=virtio-net-pci".into()]);
             }
             JobKind::Build | JobKind::ProfileFixture => {
                 arguments.extend(["-nic".into(), "none".into()]);
@@ -1068,8 +1088,14 @@ mod tests {
     #[test]
     fn build_vm_has_no_network_device() {
         let root = Path::new("/jobs/attempt");
-        let plan =
-            QemuPlan::for_job(&profile(root), &job(JobKind::Build), paths(root), None).unwrap();
+        let plan = QemuPlan::for_job(
+            &profile(root),
+            &job(JobKind::Build),
+            paths(root),
+            None,
+            false,
+        )
+        .unwrap();
         let args: Vec<_> = plan
             .arguments
             .iter()
@@ -1093,6 +1119,32 @@ mod tests {
     }
 
     #[test]
+    fn build_vm_can_use_direct_network_when_enabled() {
+        let root = Path::new("/jobs/attempt");
+        let plan = QemuPlan::for_job(
+            &profile(root),
+            &job(JobKind::Build),
+            paths(root),
+            None,
+            true,
+        )
+        .unwrap();
+        let args: Vec<_> = plan
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-nic", "user,model=virtio-net-pci"])
+        );
+        assert!(
+            args.iter()
+                .any(|value| value.contains("aursmith.build_network=1"))
+        );
+    }
+
+    #[test]
     fn fetch_vm_can_only_reach_the_fixed_proxy_forward() {
         let root = Path::new("/jobs/attempt");
         let proxy: SocketAddr = "127.0.0.1:3129".parse().unwrap();
@@ -1101,6 +1153,7 @@ mod tests {
             &job(JobKind::Fetch),
             paths(root),
             Some(proxy),
+            false,
         )
         .unwrap();
         let args: Vec<_> = plan

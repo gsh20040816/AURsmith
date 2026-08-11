@@ -68,6 +68,8 @@ struct Cli {
     jobs_dir: String,
     #[arg(long, env = "AURSMITH_FETCH_PROXY")]
     fetch_proxy: Option<SocketAddr>,
+    #[arg(long, env = "AURSMITH_BUILD_NETWORK", default_value_t = false)]
+    build_network: bool,
     #[arg(long, env = "AURSMITH_TRANSFER_ENDPOINTS_JSON", default_value = "{}")]
     transfer_endpoints_json: String,
     #[arg(long, env = "AURSMITH_TRANSFER_SSH_IDENTITY_FILE")]
@@ -266,11 +268,14 @@ async fn main() -> anyhow::Result<()> {
         source_proxy_url: cli.source_proxy_url,
         pacoloco_metrics_url: cli.pacoloco_metrics_url,
         builder: if matches!(cli.role, RoleArg::Builder) {
-            Some(builder::BuilderRuntime::new(
-                cli.profiles_dir.into(),
-                jobs_dir.clone(),
-                cli.fetch_proxy,
-            ))
+            Some(
+                builder::BuilderRuntime::new(
+                    cli.profiles_dir.into(),
+                    jobs_dir.clone(),
+                    cli.fetch_proxy,
+                )
+                .with_build_network(cli.build_network),
+            )
         } else {
             None
         },

@@ -357,6 +357,7 @@ fn parse_pkginfo_identity(pkginfo: &str) -> anyhow::Result<(String, String)> {
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     let log = Path::new(OUTPUT).join("build.log");
     let makepkg_arguments = makepkg_arguments(spec.allow_check);
+    let network = build_network_enabled()?;
     run_as_builder(&makepkg_arguments, Some(&log), false)?;
     let packages = collect_package_files(Path::new(BUILD))?;
     if packages.is_empty() {
@@ -409,7 +410,10 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         artifacts,
         provenance: [
             ("guest_agent".into(), env!("CARGO_PKG_VERSION").into()),
-            ("network".into(), "none".into()),
+            (
+                "network".into(),
+                if network { "direct" } else { "none" }.into(),
+            ),
             (
                 "check".into(),
                 if spec.allow_check {
@@ -507,6 +511,12 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyh
         bail!("Guest 命令失败，状态 {status}");
     }
     Ok(())
+}
+
+fn build_network_enabled() -> anyhow::Result<bool> {
+    Ok(fs::read_to_string("/proc/cmdline")?
+        .split_whitespace()
+        .any(|part| part == "aursmith.build_network=1"))
 }
 
 fn controller_key() -> anyhow::Result<Vec<u8>> {

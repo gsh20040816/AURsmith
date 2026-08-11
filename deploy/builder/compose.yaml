@@ -23,6 +23,7 @@ services:
       AURSMITH_PROFILES_DIR: /profiles
       AURSMITH_JOBS_DIR: /jobs
       AURSMITH_FETCH_PROXY: ${AURSMITH_FETCH_PROXY:?必须设置 Publisher source proxy 的固定 IP:端口}
+      AURSMITH_BUILD_NETWORK: ${AURSMITH_BUILD_NETWORK:-false}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
       - worker-run:/run/aursmith
