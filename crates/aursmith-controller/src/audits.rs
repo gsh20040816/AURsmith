@@ -139,7 +139,7 @@ async fn budget_available(state: &AppState) -> Result<bool, ApiError> {
 async fn invoke_runner(endpoint: &str, request: &Value) -> Result<RunnerResponse, String> {
     let url = format!("{}/v1/audit", endpoint.trim_end_matches('/'));
     let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(190))
+        .timeout(std::time::Duration::from_secs(620))
         .build()
         .map_err(|error| error.to_string())?
         .post(url)
