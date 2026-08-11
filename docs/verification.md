@@ -310,3 +310,11 @@
 - Publisher hot set 实际包含并可通过 HTTP 200 下载 `jackett-0.24.2307-1-x86_64.pkg.tar.zst`（4,328,821 字节）及 `aursmith.db`。Controller 公网入口继续使用 `desktop.shgao.top` 的 Let's Encrypt 证书，签发者为 YE1，有效期至 2026-11-09。
 - 排查还发现已取消 Job 所属的旧 ReleaseBatch 会被后续状态推进再次唤醒。控制面现会在创建同包新重建批次时原子标记所有未完成旧批次为 `superseded`，取消其活跃 Job/Attempt，并记录事件。部署结束后 Controller、Builder、Publisher 和 Archiver 均健康，没有运行中、已派发或 uncertain Job，也没有残留 QEMU 进程。
 - 本轮实际执行 Guest 10 项、Worker 29 项和 Controller 47 项测试，均通过；最后的旧批次 supersede 改动另执行对应定向回归测试并通过。Compose 安全检查与 `git diff --check` 通过。没有把未运行的全仓库统一脚本描述为已验证。
+
+## 2026-08-12：仓库 Keyring 软件包与真实客户端安装
+
+- Signer 现在从当前仓库 GPG 私钥导出公钥，生成标准 `aursmith-keyring` 软件包，并把 `aursmith.gpg`、`aursmith-trusted`、`aursmith-revoked` 和调用 `pacman-key --populate aursmith` 的安装脚本一并封装。Publisher 在公开前独立核对包元数据、签名、内嵌指纹、信任级别和安装脚本；普通 AUR 包不能占用该保留包名。
+- 首次真实发布暴露出 Signer 容器的 `makepkg` 默认执行 debug 包处理，但镜像没有 `debugedit`。Keyring 只含数据文件，不需要 strip/debug，因此生成的 PKGBUILD 明确设置 `options=('!strip' '!debug')`；没有用安装额外工具掩盖这一不必要步骤。修复后 Signer 定向测试 3 项全部通过，其中真实生成并解析了 pacman 软件包。
+- Jackett 同版本重建的 Build Job `2682e517-68bb-43ad-8673-928cfd40a153` 成功，发布版本递增为 `0.24.2307-1.1`。Release `0deee4fc-9c52-4f36-a788-90733407b236` 已提交，Manifest SHA-256 为 `b545f6001b65323b024ffd1ae5a864907f4022cf50bda5990ce9b1dee03fe33b`；ArchiveCopy `d7a3acdd-d010-4ee9-93e5-63ffa3187f42` 已验证，Receipt SHA-256 为 `9fc98125b4cff8050d9ea3d9c8c407565669196a63d73ec09a70ed2e305b2bb2`。
+- 公开仓库数据库经 `bsdtar` 实际读取，包含 `jackett-0.24.2307-1.1` 和 `aursmith-keyring-20260811.155833.ded1c44f.0deee4fc-1`。在全新的 `archlinux:base` 容器中完成 `pacman-key --init`、导入并本地签署人工核对过的指纹、`pacman -Sy` 和 `pacman -S aursmith-keyring`；安装脚本实际输出“Appending keys from aursmith.gpg”，随后三个 keyring 文件存在，trusted 文件精确包含 `BE59BEA40D9F50E7DA64BCBAFE313D9CC82D812D:4:`，pacman 信任库可读取同一指纹，`pacman -Q` 返回已安装版本。
+- 信任边界不变：首次接入仍必须通过独立渠道人工核对指纹并导入公钥，因为尚未建立信任根时，签名仓库不能靠仓库内的 Keyring 软件包自证可信。首次安装后，后续密钥发布和轮换可由标准软件包升级与 `pacman-key --populate aursmith` 完成。
