@@ -389,11 +389,26 @@ fn output_schema() -> Value {
         "properties": {
             "verdict": {"type": "string", "enum": ["approve", "reject"]},
             "summary": {"type": "string"},
-            "findings": {"type": "array", "items": {"type": "object"}},
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "severity": {"type": "string", "enum": ["info", "warning", "high", "critical"]},
+                        "category": {"type": "string"},
+                        "message": {"type": "string"},
+                        "file": {"type": ["string", "null"]},
+                        "line": {"type": ["integer", "null"]},
+                        "evidence": {"type": "string"}
+                    },
+                    "required": ["severity", "category", "message", "file", "line", "evidence"]
+                }
+            },
             "files_read": {"type": "array", "items": {"type": "string"}},
             "cost_microusd": {"type": ["integer", "null"]}
         },
-        "required": ["verdict", "summary", "findings", "files_read"]
+        "required": ["verdict", "summary", "findings", "files_read", "cost_microusd"]
     })
 }
 
@@ -499,6 +514,13 @@ mod tests {
         assert_eq!(
             output_schema()["properties"]["verdict"]["enum"],
             serde_json::json!(["approve", "reject"])
+        );
+        assert!(output_schema()["properties"]["findings"]["items"]["properties"].is_object());
+        assert!(
+            output_schema()["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("cost_microusd"))
         );
     }
 
