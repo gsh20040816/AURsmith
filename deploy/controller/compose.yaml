@@ -84,7 +84,7 @@ services:
       - /run/private:uid=0,gid=0,mode=0755,size=2m
     ports:
       - ${AURSMITH_BACKUP_SSH_BIND:-127.0.0.1:2221}:2222
-    networks: [control]
+    networks: [control, edge]
     depends_on:
       controller:
         condition: service_healthy
@@ -108,7 +108,7 @@ services:
       - /tmp:size=16m,mode=1777
     ports:
       - ${AURSMITH_WEB_BIND:-0.0.0.0:8443}:8443
-    networks: [control]
+    networks: [control, edge]
     depends_on:
       controller:
         condition: service_healthy
@@ -206,3 +206,4 @@ networks:
   agent:
     internal: true
   egress:
+  edge:

@@ -406,6 +406,10 @@ fn run_sshd(
     private_directory: &Path,
     config: &Path,
 ) -> anyhow::Result<()> {
+    let sshd = [Path::new("/usr/bin/sshd"), Path::new("/usr/sbin/sshd")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .context("无法在受支持的固定路径找到 sshd")?;
     let host_key = private_directory.join("ssh_host_ed25519_key");
     let authorized_keys = private_directory.join("authorized_keys");
     materialize_private_file(host_key_source, &host_key, 64 * 1024)?;
@@ -431,11 +435,9 @@ fn run_sshd(
             "--inh-caps=-all",
             "--ambient-caps=-all",
             "--no-new-privs",
-            "/usr/bin/sshd",
-            "-D",
-            "-e",
-            "-f",
         ])
+        .arg(sshd)
+        .args(["-D", "-e", "-f"])
         .arg(config)
         .exec();
     Err(error).context("无法启动 sshd")

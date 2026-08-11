@@ -97,6 +97,11 @@ if [[ "$(jq '[.services.web.volumes[]? | select(.target == "/data" and .type == 
   echo "内部 CA 数据必须由 Caddy 持久写入，并只读共享给 Controller" >&2
   exit 1
 fi
+if [[ "$(jq '(.services.web.networks | has("edge")) and (.services["backup-ssh"].networks | has("edge"))' <<<"${controller_json}")" != "true" ]] \
+  || [[ "$(jq -r '.networks.edge.internal // false' <<<"${controller_json}")" != "false" ]]; then
+  echo "Web 和 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2
+  exit 1
+fi
 
 archiver_json="$(docker compose -f deploy/archiver/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_pull_key" or .source == "publisher_known_hosts")] | length' <<<"${archiver_json}")" != "2" ]]; then
