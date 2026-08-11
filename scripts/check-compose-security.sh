@@ -97,6 +97,14 @@ if [[ "$(jq '[.services.web.volumes[]? | select(.target == "/data" and .type == 
   echo "内部 CA 数据必须由 Caddy 持久写入，并只读共享给 Controller" >&2
   exit 1
 fi
+if [[ "$(jq '[.services["agent-low-1"].environment.AURSMITH_AGENT_BASE_URL, .services["agent-low-2"].environment.AURSMITH_AGENT_BASE_URL, .services["agent-low-3"].environment.AURSMITH_AGENT_BASE_URL] | unique | length' <<<"${controller_json}")" != "3" ]]; then
+  echo "三个低成本 Agent 必须使用不同的凭据网关路由" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services["agent-credential-gateway"].secrets[]? | select(.source | test("^low_agent_[123]_api_key$"))] | length' <<<"${controller_json}")" != "3" ]]; then
+  echo "三个低成本 Agent 必须各自使用独立 API key secret" >&2
+  exit 1
+fi
 if [[ "$(jq '(.services.web.networks | has("edge")) and (.services["backup-ssh"].networks | has("edge"))' <<<"${controller_json}")" != "true" ]] \
   || [[ "$(jq -r '.networks.edge.internal // false' <<<"${controller_json}")" != "false" ]]; then
   echo "Web 和 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2

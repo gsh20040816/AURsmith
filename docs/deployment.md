@@ -34,20 +34,20 @@ Compose file-backed secret 以 UID/GID `10001`、模式 `0400` 挂载。部署�
 
 Controller Stack 内固定运行三个低成本 Runner、一个高成本 Runner和一个凭据网关。Runner 镜像固定包含 Codex CLI `0.147.0` 与 Claude Code `2.1.226`；升级 CLI 必须修改镜像构建参数、重新构建并运行适配器回归测试，不能在运行中自动更新。
 
-低成本与高成本层分别配置以下变量：
+三个低成本 Runner 必须分别配置，变量前缀依次为 `AURSMITH_LOW_AGENT_1_*`、`AURSMITH_LOW_AGENT_2_*`、`AURSMITH_LOW_AGENT_3_*`；高成本 Runner 使用 `AURSMITH_HIGH_AGENT_*`。每套配置包括：
 
-- `AURSMITH_LOW_AGENT_ADAPTER`、`AURSMITH_HIGH_AGENT_ADAPTER`：只能是 `codex` 或 `claude_code`；
-- `AURSMITH_*_AGENT_PROVIDER`：写入报告的 provider 标识，只允许字母、数字、连字符和下划线；
-- `AURSMITH_*_AGENT_MODEL`：传给对应 CLI 的模型 ID；
-- `AURSMITH_*_AGENT_BASE_URL`：凭据网关访问的上游 HTTPS Base URL；
-- `AURSMITH_*_AGENT_AUTH_STYLE`：`bearer` 或 `x-api-key`；Codex 兼容 provider 通常使用 `bearer`，Claude 原生 API 使用 `x-api-key`；
-- `AURSMITH_*_AGENT_API_KEY_FILE`：宿主机上的 Docker secret 文件路径。
+- `PROVIDER`：写入报告的 provider 标识，只允许字母、数字、连字符和下划线；
+- `MODEL`：传给对应 CLI 的模型 ID；
+- `REASONING_EFFORT`：Codex 思考强度，可为空或使用 `minimal/low/medium/high/xhigh`；
+- `BASE_URL`：凭据网关访问的上游 HTTPS Base URL；
+- `AUTH_STYLE`：`bearer` 或 `x-api-key`；Codex 兼容 provider 通常使用 `bearer`；
+- `API_KEY_FILE`：宿主机上的独立 Docker secret 文件路径。
 
-默认低成本层使用 Codex 和 `https://api.openai.com/v1/`，高成本层使用 Claude Code 和 `https://api.anthropic.com/`。自建兼容网关也必须使用 HTTPS；第一版不允许明文 HTTP upstream。自定义 Base URL 只配置在凭据网关，Runner 实际看到的是 `http://agent-credential-gateway:8091/low/` 或 `/high/`，且只处于 Compose 内部网络。
+第一版的三个低成本 Runner 固定使用 Codex 适配器，但 model、provider、Base URL、API key 和思考强度彼此独立，避免把三票退化成同一配置的重复调用。自建兼容网关必须使用 HTTPS；第一版不允许明文 HTTP upstream。Runner 实际只看到凭据网关的 `/low-1/`、`/low-2/`、`/low-3/` 或 `/high/` 内部路径。
 
 Web 设置页可以修改每日调用数、每月调用数和每月成本上限；这三项立即作用于后续调度并写入事件日志。设置页只显示 provider 配置来源和 Runner 状态。修改适配器、provider、模型或 Base URL 后需要重新创建 Agent Stack；更新 API key 时只替换对应 secret 并重启凭据网关，不能把 key 粘贴到 Web 表单。
 
-将低成本 key 写入 `deploy/controller/secrets/low_agent_api_key`，高成本 key 写入 `deploy/controller/secrets/high_agent_api_key`，权限设为仅部署账户可读。不要把 key 写进 `.env`、Compose environment、Controller 设置、Agent prompt 或日志。凭据网关读取 secret 后删除 Runner 发送的 `Authorization`、`x-api-key`、Host 和 hop-by-hop 头，再按配置注入真实凭据；Runner 子进程中只有无权限占位令牌。
+将三个低成本 key 分别写入 `deploy/controller/secrets/low_agent_1_api_key`、`low_agent_2_api_key`、`low_agent_3_api_key`，高成本 key 写入 `high_agent_api_key`，权限设为仅部署账户可读。不要把 key 写进 `.env`、Compose environment、Controller 设置、Agent prompt 或日志。凭据网关读取 secret 后删除 Runner 发送的认证头，再按各自路由注入对应凭据；Runner 子进程中只有无权限占位令牌。
 
 Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自定义 Base URL 需要提供 Anthropic Messages API 兼容接口。provider 名称只是可追踪标签，不会自动转换 API 协议。部署 Doctor 后续阶段会对两层分别执行不含软件包内容的结构化输出探测。
 

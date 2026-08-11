@@ -123,12 +123,12 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    environment: &low-agent-environment
-      AURSMITH_AGENT_ADAPTER: ${AURSMITH_LOW_AGENT_ADAPTER:-codex}
-      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_PROVIDER:-openai}
-      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_MODEL-gpt-5.6-terra}
-      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_REASONING_EFFORT-}
-      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low/
+    environment:
+      AURSMITH_AGENT_ADAPTER: codex
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_1_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_1_MODEL-}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_1_REASONING_EFFORT-}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low-1/
     tmpfs:
       - /tmp:uid=10002,gid=10002,mode=0700,size=32m
     networks: [agent]
@@ -136,11 +136,21 @@ services:
 
   agent-low-2:
     <<: *agent-runner
-    environment: *low-agent-environment
+    environment:
+      AURSMITH_AGENT_ADAPTER: codex
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_2_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_2_MODEL-}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_2_REASONING_EFFORT-}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low-2/
 
   agent-low-3:
     <<: *agent-runner
-    environment: *low-agent-environment
+    environment:
+      AURSMITH_AGENT_ADAPTER: codex
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_3_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_3_MODEL-}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_3_REASONING_EFFORT-}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low-3/
 
   agent-high:
     <<: *agent-runner
@@ -161,14 +171,22 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     environment:
-      AURSMITH_LOW_AGENT_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_BASE_URL-https://api.openai.com/v1/}
-      AURSMITH_LOW_AGENT_AUTH_STYLE: ${AURSMITH_LOW_AGENT_AUTH_STYLE:-bearer}
-      AURSMITH_LOW_AGENT_API_KEY_FILE: /run/secrets/low_agent_api_key
+      AURSMITH_LOW_AGENT_1_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_1_BASE_URL-}
+      AURSMITH_LOW_AGENT_1_AUTH_STYLE: ${AURSMITH_LOW_AGENT_1_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_1_API_KEY_FILE: /run/secrets/low_agent_1_api_key
+      AURSMITH_LOW_AGENT_2_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_2_BASE_URL-}
+      AURSMITH_LOW_AGENT_2_AUTH_STYLE: ${AURSMITH_LOW_AGENT_2_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_2_API_KEY_FILE: /run/secrets/low_agent_2_api_key
+      AURSMITH_LOW_AGENT_3_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_3_BASE_URL-}
+      AURSMITH_LOW_AGENT_3_AUTH_STYLE: ${AURSMITH_LOW_AGENT_3_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_3_API_KEY_FILE: /run/secrets/low_agent_3_api_key
       AURSMITH_HIGH_AGENT_PROVIDER_BASE_URL: ${AURSMITH_HIGH_AGENT_BASE_URL-https://api.openai.com/v1/}
       AURSMITH_HIGH_AGENT_AUTH_STYLE: ${AURSMITH_HIGH_AGENT_AUTH_STYLE:-bearer}
       AURSMITH_HIGH_AGENT_API_KEY_FILE: /run/secrets/high_agent_api_key
     secrets:
-      - low_agent_api_key
+      - low_agent_1_api_key
+      - low_agent_2_api_key
+      - low_agent_3_api_key
       - high_agent_api_key
     tmpfs:
       - /tmp:uid=10003,gid=10003,mode=0700,size=8m
@@ -190,8 +208,12 @@ secrets:
     file: ${AURSMITH_BACKUP_SSH_HOST_KEY_FILE:-./secrets/backup_ssh_host_ed25519_key}
   source_authorized_keys:
     file: ${AURSMITH_BACKUP_AUTHORIZED_KEYS_FILE:-./secrets/backup_authorized_keys}
-  low_agent_api_key:
-    file: ${AURSMITH_LOW_AGENT_API_KEY_FILE:-./secrets/low_agent_api_key}
+  low_agent_1_api_key:
+    file: ${AURSMITH_LOW_AGENT_1_API_KEY_FILE:-./secrets/low_agent_1_api_key}
+  low_agent_2_api_key:
+    file: ${AURSMITH_LOW_AGENT_2_API_KEY_FILE:-./secrets/low_agent_2_api_key}
+  low_agent_3_api_key:
+    file: ${AURSMITH_LOW_AGENT_3_API_KEY_FILE:-./secrets/low_agent_3_api_key}
   high_agent_api_key:
     file: ${AURSMITH_HIGH_AGENT_API_KEY_FILE:-./secrets/high_agent_api_key}
 

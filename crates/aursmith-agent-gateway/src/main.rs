@@ -9,7 +9,7 @@ use axum::{
 };
 use clap::Parser;
 use reqwest::Client;
-use std::{fs, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use url::Url;
 
@@ -41,8 +41,7 @@ enum AuthStyle {
 #[derive(Clone)]
 struct AppState {
     client: Client,
-    low: RouteConfig,
-    high: RouteConfig,
+    routes: Arc<BTreeMap<String, RouteConfig>>,
 }
 
 #[tokio::main]
@@ -52,14 +51,22 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
     let cli = Cli::parse();
+    let routes = [
+        ("low-1", load_route("LOW_AGENT_1")?),
+        ("low-2", load_route("LOW_AGENT_2")?),
+        ("low-3", load_route("LOW_AGENT_3")?),
+        ("high", load_route("HIGH_AGENT")?),
+    ]
+    .into_iter()
+    .map(|(name, route)| (name.to_owned(), route))
+    .collect();
     let state = AppState {
         client: Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(240))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
-        low: load_route("LOW")?,
-        high: load_route("HIGH")?,
+        routes: Arc::new(routes),
     };
     let app = Router::new()
         .route("/{tier}/{*path}", any(proxy))
@@ -70,8 +77,8 @@ async fn main() -> anyhow::Result<()> {
         .context("Agent 凭据网关异常退出")
 }
 
-fn load_route(tier: &str) -> anyhow::Result<RouteConfig> {
-    let base_name = format!("AURSMITH_{tier}_AGENT_PROVIDER_BASE_URL");
+fn load_route(route: &str) -> anyhow::Result<RouteConfig> {
+    let base_name = format!("AURSMITH_{route}_PROVIDER_BASE_URL");
     let base = std::env::var(&base_name).with_context(|| format!("缺少 {base_name}"))?;
     let mut base_url = Url::parse(&base).with_context(|| format!("{base_name} 不是有效 URL"))?;
     if base_url.scheme() != "https" {
@@ -84,7 +91,7 @@ fn load_route(tier: &str) -> anyhow::Result<RouteConfig> {
     if !base_url.path().ends_with('/') {
         base_url.set_path(&format!("{}/", base_url.path()));
     }
-    let key_file_name = format!("AURSMITH_{tier}_AGENT_API_KEY_FILE");
+    let key_file_name = format!("AURSMITH_{route}_API_KEY_FILE");
     let key_file =
         std::env::var(&key_file_name).with_context(|| format!("缺少 {key_file_name}"))?;
     let metadata = fs::symlink_metadata(&key_file)
@@ -99,7 +106,7 @@ fn load_route(tier: &str) -> anyhow::Result<RouteConfig> {
     if api_key.is_empty() || api_key.contains(['\r', '\n']) {
         bail!("Agent API key secret 内容无效");
     }
-    let style_name = format!("AURSMITH_{tier}_AGENT_AUTH_STYLE");
+    let style_name = format!("AURSMITH_{route}_AUTH_STYLE");
     let auth_style = match std::env::var(&style_name)
         .unwrap_or_else(|_| "bearer".into())
         .as_str()
@@ -120,11 +127,10 @@ async fn proxy(
     Path((tier, path)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response, (StatusCode, String)> {
-    let route = match tier.as_str() {
-        "low" => &state.low,
-        "high" => &state.high,
-        _ => return Err((StatusCode::NOT_FOUND, "未知 Agent 层级".into())),
-    };
+    let route = state
+        .routes
+        .get(&tier)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "未知 Agent 路由".into()))?;
     let query = request
         .uri()
         .query()
@@ -233,12 +239,11 @@ mod tests {
             .route("/{tier}/{*path}", any(proxy))
             .with_state(AppState {
                 client: Client::new(),
-                low: route.clone(),
-                high: route,
+                routes: Arc::new(BTreeMap::from([("low-1".into(), route)])),
             });
         let response = app
             .oneshot(
-                Request::post("/low/messages")
+                Request::post("/low-1/messages")
                     .header("x-api-key", "caller-secret")
                     .body(Body::empty())
                     .unwrap(),
