@@ -10,6 +10,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    net::SocketAddr,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
@@ -19,7 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
+    net::{TcpStream, UnixStream},
 };
 use uuid::Uuid;
 
@@ -79,6 +80,9 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
     },
+    /// 供 QEMU guestfwd 按连接启动，只转发到 Builder 已验证的唯一 Source Proxy。
+    #[command(hide = true)]
+    TcpRelay,
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,7 +240,28 @@ async fn main() -> anyhow::Result<()> {
             name,
         } => export_profile(&source, &output, &name)?,
         Command::RsyncSsh { arguments } => rsync_ssh(arguments)?,
+        Command::TcpRelay => tcp_relay().await?,
     }
+    Ok(())
+}
+
+async fn tcp_relay() -> anyhow::Result<()> {
+    let target: SocketAddr = env::var("AURSMITH_FETCH_PROXY")
+        .context("缺少 AURSMITH_FETCH_PROXY")?
+        .parse()
+        .context("AURSMITH_FETCH_PROXY 必须是固定 IP:端口")?;
+    let stream = TcpStream::connect(target)
+        .await
+        .context("无法连接 Source Proxy")?;
+    let (mut remote_read, mut remote_write) = stream.into_split();
+    let mut input = tokio::io::stdin();
+    let mut output = tokio::io::stdout();
+    let upload = async {
+        tokio::io::copy(&mut input, &mut remote_write).await?;
+        remote_write.shutdown().await
+    };
+    let download = tokio::io::copy(&mut remote_read, &mut output);
+    tokio::try_join!(upload, download)?;
     Ok(())
 }
 

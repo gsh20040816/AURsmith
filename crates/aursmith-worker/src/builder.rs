@@ -13,12 +13,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    process::Command,
-    task::JoinHandle,
-    time::timeout,
-};
+use tokio::{process::Command, time::timeout};
 
 #[derive(Clone)]
 pub struct BuilderRuntime {
@@ -447,17 +442,10 @@ async fn execute_attempt(
         output_directory: work.join("output"),
         control_socket: work.join("control.sock"),
     };
-    let fetch_relay = match (spec.kind, runtime.fetch_proxy) {
-        (JobKind::Fetch, Some(target)) => Some(FetchRelay::start(target).await?),
-        (JobKind::Fetch, None) => bail!("Fetch VM 必须配置唯一源码代理"),
-        _ => None,
-    };
-    let plan = QemuPlan::for_job(
-        &profile,
-        &spec,
-        paths,
-        fetch_relay.as_ref().map(FetchRelay::address),
-    )?;
+    if spec.kind == JobKind::Fetch && runtime.fetch_proxy.is_none() {
+        bail!("Fetch VM 必须配置唯一源码代理");
+    }
+    let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.fetch_proxy)?;
     let qemu = Command::new(plan.executable)
         .args(&plan.arguments)
         .stdin(std::process::Stdio::null())
@@ -510,44 +498,6 @@ async fn execute_attempt(
     fs::create_dir_all(runtime.jobs_dir.join("completed"))?;
     fs::rename(&work, &completed)?;
     Ok(digest)
-}
-
-struct FetchRelay {
-    address: SocketAddr,
-    task: JoinHandle<()>,
-}
-
-impl FetchRelay {
-    async fn start(target: SocketAddr) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .context("FETCH_RELAY_BIND_FAILED")?;
-        let address = listener.local_addr()?;
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut guest, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let Ok(mut proxy) = TcpStream::connect(target).await else {
-                        return;
-                    };
-                    let _ = tokio::io::copy_bidirectional(&mut guest, &mut proxy).await;
-                });
-            }
-        });
-        Ok(Self { address, task })
-    }
-
-    fn address(&self) -> SocketAddr {
-        self.address
-    }
-}
-
-impl Drop for FetchRelay {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 async fn create_build_evidence_archives(
@@ -986,13 +936,10 @@ impl QemuPlan {
         ]);
         match spec.kind {
             JobKind::Fetch => {
-                let relay = fetch_relay.expect("前置校验保证存在 Fetch proxy 中继");
+                fetch_relay.expect("前置校验保证存在 Fetch proxy");
                 arguments.extend([
                     "-nic".into(),
-                    format!(
-                        "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:{relay}"
-                    )
-                    .into(),
+                    "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-cmd:/usr/local/bin/aursmithctl tcp-relay".into(),
                 ]);
             }
             JobKind::Build | JobKind::ProfileFixture => {
@@ -1162,7 +1109,8 @@ mod tests {
             .map(|value| value.to_string_lossy())
             .collect();
         assert!(args.iter().any(|value| value.as_ref()
-            == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-tcp:127.0.0.1:3129"));
+            == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-cmd:/usr/local/bin/aursmithctl tcp-relay"));
+        assert!(!args.iter().any(|value| value.contains("127.0.0.1:3129")));
         assert!(!args.windows(2).any(|pair| pair == ["-nic", "none"]));
     }
 
