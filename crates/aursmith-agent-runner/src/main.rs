@@ -433,10 +433,26 @@ async fn run_codex(
     )
     .await?;
     ensure_success(&output)?;
-    let result = fs::read(&result_path)
-        .await
-        .with_context(|| format!("Codex 没有写入审计结果文件 {}", result_path.display()))?;
-    let raw = parse_codex_output(&result)?;
+    let (result, output_source) = match fs::read(&result_path).await {
+        Ok(result) => (result, "agent_verified_file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            fs::read(&last_message_path).await.with_context(|| {
+                format!(
+                    "Codex 既没有写入 {}，也没有生成最终消息",
+                    result_path.display()
+                )
+            })?,
+            "cli_last_message_fallback",
+        ),
+        Err(error) => return Err(error).context("无法读取 Codex 审计结果文件"),
+    };
+    let mut raw = parse_codex_output(&result)?;
+    if let Some(object) = raw.as_object_mut() {
+        object.insert(
+            "_aursmith_output_source".into(),
+            Value::String(output_source.into()),
+        );
+    }
     let parsed = serde_json::from_value(raw.clone()).context("Codex 审计输出字段无效")?;
     Ok((parsed, raw, adapter_version("/usr/local/bin/codex").await))
 }
@@ -750,6 +766,21 @@ mod tests {
             parse_codex_output(b"result follows: {\"verdict\":\"approve\"}").unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn runner_output_source_metadata_does_not_change_agent_fields() {
+        let output: AgentOutput = serde_json::from_value(serde_json::json!({
+            "verdict": "approve",
+            "summary": "ok",
+            "findings": [],
+            "files_read": ["PKGBUILD"],
+            "cost_microusd": null,
+            "_aursmith_output_source": "cli_last_message_fallback"
+        }))
+        .unwrap();
+        assert_eq!(output.verdict, "approve");
+        assert_eq!(output.files_read, ["PKGBUILD"]);
     }
 
     #[test]
