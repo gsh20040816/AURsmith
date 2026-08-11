@@ -100,6 +100,26 @@ pub async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+pub async fn recover_interrupted(state: &AppState) -> Result<(), ApiError> {
+    let rows = sqlx::query("SELECT id, audit_bundle_sha256, tier, slot, attempt FROM agent_runs WHERE status = 'running' ORDER BY started_at")
+        .fetch_all(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    for row in rows {
+        record_failure(
+            state,
+            row.get("id"),
+            row.get("audit_bundle_sha256"),
+            row.get("tier"),
+            row.get("slot"),
+            row.get("attempt"),
+            "CONTROLLER_RESTARTED_DURING_AGENT_RUN",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn budget_available(state: &AppState) -> Result<bool, ApiError> {
     let daily: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_runs WHERE started_at >= datetime('now', 'start of day')",

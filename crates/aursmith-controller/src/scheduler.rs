@@ -41,6 +41,9 @@ pub fn spawn(state: AppState) {
     });
     let audit_state = state.clone();
     tokio::spawn(async move {
+        if let Err(error) = crate::audits::recover_interrupted(&audit_state).await {
+            tracing::warn!(%error, "中断的 Agent 审计恢复失败");
+        }
         let mut timer = interval(std::time::Duration::from_secs(3));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
