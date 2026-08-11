@@ -940,6 +940,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         artifacts,
         evidence_files,
         removed_package_names: removed_package_names.into_iter().collect(),
+        include_repository_keyring: true,
         evidence,
         issued_at: now,
         expires_at: now + Duration::hours(1),

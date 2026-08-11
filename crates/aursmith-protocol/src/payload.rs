@@ -232,6 +232,8 @@ pub struct ReleaseAuthorization {
     #[serde(default)]
     pub removed_package_names: Vec<String>,
     #[serde(default)]
+    pub include_repository_keyring: bool,
+    #[serde(default)]
     pub evidence: ReleaseEvidence,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -249,6 +251,8 @@ pub struct ReleaseManifest {
     pub evidence_files: Vec<ManifestEntry>,
     #[serde(default)]
     pub removed_package_names: Vec<String>,
+    #[serde(default)]
+    pub repository_keyring: Option<ArtifactRecord>,
     pub repository_database: ManifestEntry,
     pub repository_files: ManifestEntry,
     #[serde(default)]

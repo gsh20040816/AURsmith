@@ -62,6 +62,7 @@ fn main() -> anyhow::Result<()> {
             size: evidence_bytes.len() as u64,
         }],
         removed_package_names: vec![],
+        include_repository_keyring: true,
         evidence: Default::default(),
         issued_at: Utc::now(),
         expires_at: Utc::now() + Duration::minutes(10),

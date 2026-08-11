@@ -109,6 +109,15 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         gpg_sign(cli, &destination)?;
         package_paths.push(destination);
     }
+    let repository_keyring = if authorization.include_repository_keyring {
+        let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
+        let path = staging.join(&artifact.path);
+        gpg_sign(cli, &path)?;
+        package_paths.push(path);
+        Some(artifact)
+    } else {
+        None
+    };
     let mut evidence_files = Vec::new();
     for evidence in &authorization.evidence_files {
         let source = entry.path().join(&evidence.path);
@@ -153,6 +162,7 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
         artifacts: authorization.artifacts,
         evidence_files,
         removed_package_names: authorization.removed_package_names,
+        repository_keyring,
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
         artifact_inspections: Some(file_entry(&inspection_destination)?),
@@ -166,6 +176,138 @@ fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
     gpg_sign(cli, &staging.join("release-manifest.json"))?;
     fs::rename(staging, committed)?;
     Ok(())
+}
+
+fn create_repository_keyring_package(
+    cli: &Cli,
+    authorization: &ReleaseAuthorization,
+    staging: &Path,
+) -> anyhow::Result<ArtifactRecord> {
+    let fingerprint = repository_fingerprint(cli)?;
+    let source_commit = authorization
+        .source_git_commit
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let source_commit = if source_commit.is_empty() {
+        "unknown".to_owned()
+    } else {
+        source_commit
+    };
+    let package_version = format!(
+        "{}.{}.{}-1",
+        authorization.issued_at.format("%Y%m%d.%H%M%S"),
+        source_commit,
+        authorization
+            .release_id
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>()
+    );
+    let pkgver = package_version
+        .strip_suffix("-1")
+        .context("keyring package version 无效")?;
+    let directory = tempfile::Builder::new()
+        .prefix("aursmith-keyring-")
+        .tempdir_in("/tmp")?;
+    let root = directory.path();
+    let public_key = root.join("aursmith.gpg");
+    run_checked(
+        "/usr/bin/gpg",
+        &[
+            "--homedir".into(),
+            cli.gpg_home.as_os_str().into(),
+            "--batch".into(),
+            "--yes".into(),
+            "--output".into(),
+            public_key.as_os_str().into(),
+            "--export".into(),
+            fingerprint.clone().into(),
+        ],
+    )?;
+    if fs::metadata(&public_key)?.len() == 0 {
+        bail!("仓库 GPG 公钥导出为空");
+    }
+    fs::write(root.join("aursmith-trusted"), format!("{fingerprint}:4:\n"))?;
+    fs::write(root.join("aursmith-revoked"), b"")?;
+    fs::write(
+        root.join("aursmith-keyring.install"),
+        b"#!/bin/sh\n\npopulate_aursmith() {\n\tif usr/bin/pacman-key -l >/dev/null 2>&1; then\n\t\tusr/bin/pacman-key --populate aursmith\n\tfi\n}\n\npost_upgrade() {\n\tpopulate_aursmith\n}\n\npost_install() {\n\tif [ -x usr/bin/pacman-key ]; then\n\t\tpopulate_aursmith\n\tfi\n}\n",
+    )?;
+    let checksums = [
+        digest_file(&public_key)?,
+        digest_file(&root.join("aursmith-trusted"))?,
+        digest_file(&root.join("aursmith-revoked"))?,
+    ];
+    fs::write(
+        root.join("PKGBUILD"),
+        format!(
+            "pkgname=aursmith-keyring\npkgver={pkgver}\npkgrel=1\npkgdesc='AURsmith repository signing keys'\narch=('any')\nurl='https://desktop.shgao.top:8443'\nlicense=('Apache-2.0')\ndepends=('pacman')\ninstall=aursmith-keyring.install\nsource=('aursmith.gpg' 'aursmith-trusted' 'aursmith-revoked')\nsha256sums=('{}' '{}' '{}')\n\npackage() {{\n  install -Dm644 aursmith.gpg \"$pkgdir/usr/share/pacman/keyrings/aursmith.gpg\"\n  install -Dm644 aursmith-trusted \"$pkgdir/usr/share/pacman/keyrings/aursmith-trusted\"\n  install -Dm644 aursmith-revoked \"$pkgdir/usr/share/pacman/keyrings/aursmith-revoked\"\n}}\n",
+            checksums[0], checksums[1], checksums[2]
+        ),
+    )?;
+    let package_output = root.join("packages");
+    fs::create_dir_all(&package_output)?;
+    let status = Command::new("/usr/bin/makepkg")
+        .args(["--noconfirm", "--force", "--nodeps", "--cleanbuild"])
+        .current_dir(root)
+        .env("SOURCE_DATE_EPOCH", "946684800")
+        .env("PKGDEST", &package_output)
+        .env("SRCDEST", root)
+        .env("BUILDDIR", root.join("build"))
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        bail!("aursmith-keyring makepkg 失败，状态 {status}");
+    }
+    let packages = fs::read_dir(&package_output)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.file_name().to_string_lossy().contains(".pkg.tar.")
+        })
+        .collect::<Vec<_>>();
+    if packages.len() != 1 {
+        bail!("aursmith-keyring 产物数量不是 1");
+    }
+    let source = packages[0].path();
+    let file_name = packages[0].file_name().to_string_lossy().into_owned();
+    let destination = staging.join(&file_name);
+    fs::copy(&source, &destination)?;
+    let artifact = ArtifactRecord {
+        path: file_name,
+        sha256: digest_file(&destination)?,
+        size: fs::metadata(&destination)?.len(),
+        package_name: Some("aursmith-keyring".into()),
+        package_version: Some(package_version),
+        architecture: Some("any".into()),
+    };
+    validate_package_metadata(&destination, &artifact)?;
+    Ok(artifact)
+}
+
+fn repository_fingerprint(cli: &Cli) -> anyhow::Result<String> {
+    let output = Command::new("/usr/bin/gpg")
+        .args(["--homedir"])
+        .arg(&cli.gpg_home)
+        .args(["--batch", "--with-colons", "--fingerprint"])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("无法读取仓库 GPG 指纹");
+    }
+    String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| line.split(':').nth(9))
+        .find(|value| {
+            value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .map(str::to_owned)
+        .context("仓库私钥没有有效主指纹")
 }
 
 fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> anyhow::Result<()> {
@@ -207,6 +349,9 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
         }
         validate_package_metadata(&path, artifact)?;
         package_names.insert(artifact.package_name.clone().unwrap_or_default());
+    }
+    if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
+        bail!("aursmith-keyring 是 Signer 生成的保留包名");
     }
     if (!authorization.artifacts.is_empty() && authorization.evidence_files.is_empty())
         || authorization.evidence_files.len() > 4096
@@ -369,6 +514,7 @@ mod tests {
             }],
             evidence_files: vec![],
             removed_package_names: vec![],
+            include_repository_keyring: true,
             evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
@@ -388,5 +534,72 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert!(fs::metadata(database).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn repository_keyring_is_a_real_arch_package() {
+        let root = tempfile::tempdir().unwrap();
+        let gpg_home = root.path().join("gnupg");
+        let staging = root.path().join("staging");
+        fs::create_dir_all(&gpg_home).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        let status = Command::new("/usr/bin/gpg")
+            .args([
+                "--homedir",
+                gpg_home.to_str().unwrap(),
+                "--batch",
+                "--passphrase",
+                "",
+                "--quick-gen-key",
+                "AURsmith Keyring Test <test@aursmith.invalid>",
+                "ed25519",
+                "sign",
+                "0",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let cli = Cli {
+            inbox: root.path().join("inbox"),
+            output: root.path().join("output"),
+            controller_key_hex: "00".repeat(32),
+            gpg_private_key: root.path().join("unused"),
+            gpg_home,
+        };
+        let authorization = ReleaseAuthorization {
+            release_id: Uuid::new_v4(),
+            batch_id: Uuid::new_v4(),
+            writer_epoch: 1,
+            repository_name: "aursmith".into(),
+            source_git_commit: "abcdef1234567890".into(),
+            revision_sha256s: vec![],
+            audit_report_sha256s: vec![],
+            artifacts: vec![],
+            evidence_files: vec![],
+            removed_package_names: vec!["old-package".into()],
+            include_repository_keyring: true,
+            evidence: Default::default(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::minutes(5),
+        };
+        let artifact = create_repository_keyring_package(&cli, &authorization, &staging).unwrap();
+        assert_eq!(artifact.package_name.as_deref(), Some("aursmith-keyring"));
+        assert_eq!(artifact.architecture.as_deref(), Some("any"));
+        let package = staging.join(&artifact.path);
+        validate_package_metadata(&package, &artifact).unwrap();
+        let entries = Command::new("/usr/bin/bsdtar")
+            .args(["-tf"])
+            .arg(package)
+            .output()
+            .unwrap();
+        assert!(entries.status.success());
+        let entries = String::from_utf8(entries.stdout).unwrap();
+        for expected in [
+            "usr/share/pacman/keyrings/aursmith.gpg",
+            "usr/share/pacman/keyrings/aursmith-trusted",
+            "usr/share/pacman/keyrings/aursmith-revoked",
+        ] {
+            assert!(entries.lines().any(|entry| entry == expected));
+        }
     }
 }

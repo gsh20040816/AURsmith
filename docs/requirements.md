@@ -31,6 +31,7 @@
 | R02 | 原子发布完整、不可变的 pacman Release | 崩溃测试 |
 | R03 | 归档 Release、审计证据、provenance 和 Controller 备份 | 恢复测试 |
 | R04 | 恢复服务端 Release 并生成显式客户端降级命令 | 回滚测试 |
+| R05 | 每个 Release 包含由隔离 Signer 生成的 `aursmith-keyring`，安装后自动执行 `pacman-key --populate aursmith` | Signer、Publisher 与真实 pacman 测试 |
 | U01 | 提供完整 Web UI | 浏览器验收测试 |
 | U02 | 提供单用户局域网认证和客户端接入引导 | 认证与接入测试 |
 | U03 | 提供告警、存储、Worker、Doctor 和恢复状态 | 运维测试 |

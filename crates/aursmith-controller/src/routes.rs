@@ -439,7 +439,7 @@ async fn client_bootstrap(
             format!("curl --fail --output /tmp/aursmith-repository-key.asc '{base}/x86_64/aursmith-repository-key.asc'"),
             "sudo pacman-key --add /tmp/aursmith-repository-key.asc".to_owned(),
             format!("sudo pacman-key --lsign-key {fingerprint}"),
-            "sudo pacman -Syu".to_owned(),
+            "sudo pacman -Syu aursmith-keyring".to_owned(),
         ],
         "warnings": warnings
     })))

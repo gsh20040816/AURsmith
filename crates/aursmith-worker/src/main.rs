@@ -5,8 +5,8 @@ mod package_inspection;
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
-    ArchiveInventory, ArchiveReceipt, BackupArchiveReceipt, ControlPlaneBackup, JobSpec,
-    PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, ReleaseRollbackAuthorization,
+    ArchiveInventory, ArchiveReceipt, ArtifactRecord, BackupArchiveReceipt, ControlPlaneBackup,
+    JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, ReleaseRollbackAuthorization,
     SignedEnvelope, TransferCapability,
 };
 use chrono::Utc;
@@ -1345,6 +1345,9 @@ fn validate_release_authorization_for_publisher(
         }
         package_names.insert(artifact.package_name.clone().unwrap_or_default());
     }
+    if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
+        bail!("aursmith-keyring 是 Signer 生成的保留包名");
+    }
     if (!authorization.artifacts.is_empty() && authorization.evidence_files.is_empty())
         || authorization.evidence_files.len() > 4096
     {
@@ -1693,6 +1696,7 @@ fn verify_and_publish_release(
         || manifest.repository_name != authorization.repository_name
         || manifest.source_git_commit != authorization.source_git_commit
         || manifest.artifacts != authorization.artifacts
+        || manifest.repository_keyring.is_some() != authorization.include_repository_keyring
         || manifest.evidence_files != authorization.evidence_files
         || manifest.removed_package_names != authorization.removed_package_names
     {
@@ -1756,6 +1760,21 @@ fn verify_and_publish_release(
                 size: artifact.size,
             },
         )?;
+    }
+    if let Some(keyring) = &manifest.repository_keyring {
+        if !package_names.insert(keyring.path.clone()) {
+            bail!("Release keyring 与普通 Artifact 路径冲突");
+        }
+        verify_signed_entry(
+            worker,
+            signed,
+            &aursmith_protocol::ManifestEntry {
+                path: keyring.path.clone(),
+                sha256: keyring.sha256.clone(),
+                size: keyring.size,
+            },
+        )?;
+        validate_repository_keyring_package(worker, &signed.join(&keyring.path), keyring)?;
     }
 
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
@@ -1836,9 +1855,16 @@ fn activate_committed_release(
     for evidence in &manifest.evidence_files {
         verify_manifest_entry(committed, evidence)?;
     }
+    if let Some(keyring) = &manifest.repository_keyring {
+        validate_repository_keyring_package(worker, &committed.join(&keyring.path), keyring)?;
+    }
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
-    for artifact in &manifest.artifacts {
+    for artifact in manifest
+        .artifacts
+        .iter()
+        .chain(manifest.repository_keyring.iter())
+    {
         let entry = aursmith_protocol::ManifestEntry {
             path: artifact.path.clone(),
             sha256: artifact.sha256.clone(),
@@ -1910,6 +1936,94 @@ fn verify_signed_entry(
         &path,
         &root.join(format!("{}.sig", entry.path)),
     )
+}
+
+fn validate_repository_keyring_package(
+    worker: &Worker,
+    package: &Path,
+    artifact: &ArtifactRecord,
+) -> anyhow::Result<()> {
+    let fingerprint = worker
+        .repository_gpg_fingerprint
+        .as_deref()
+        .context("Publisher 缺少仓库 GPG 指纹")?;
+    let file_name = package
+        .file_name()
+        .context("keyring package 缺少文件名")?
+        .to_string_lossy();
+    if artifact.package_name.as_deref() != Some("aursmith-keyring")
+        || artifact.architecture.as_deref() != Some("any")
+        || artifact.package_version.is_none()
+        || artifact.path != file_name
+        || !artifact.path.starts_with("aursmith-keyring-")
+        || !artifact.path.contains("-any.pkg.tar.")
+    {
+        bail!("Release keyring Artifact 元数据无效");
+    }
+    let pkginfo = String::from_utf8(package_archive_entry(package, ".PKGINFO")?)?;
+    for (field, expected) in [
+        ("pkgname", artifact.package_name.as_deref()),
+        ("pkgver", artifact.package_version.as_deref()),
+        ("arch", artifact.architecture.as_deref()),
+    ] {
+        let actual = pkginfo
+            .lines()
+            .filter_map(|line| line.split_once(" = "))
+            .find_map(|(name, value)| (name == field).then_some(value));
+        if actual != expected {
+            bail!("Release keyring .PKGINFO 不匹配：{field}");
+        }
+    }
+    let key_bytes = package_archive_entry(package, "usr/share/pacman/keyrings/aursmith.gpg")?;
+    if key_bytes.is_empty() || key_bytes.len() > 1024 * 1024 {
+        bail!("Release keyring 公钥大小无效");
+    }
+    let key_file = tempfile::NamedTempFile::new()?;
+    std::fs::write(key_file.path(), key_bytes)?;
+    let output = std::process::Command::new("/usr/bin/gpg")
+        .args(["--batch", "--with-colons", "--show-keys", "--fingerprint"])
+        .arg(key_file.path())
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("Release keyring 公钥无法解析");
+    }
+    let key_listing = String::from_utf8(output.stdout)?;
+    let package_fingerprint = key_listing
+        .lines()
+        .filter_map(|line| line.split(':').nth(9))
+        .find(|value| {
+            value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .context("Release keyring 公钥没有主指纹")?;
+    if package_fingerprint != fingerprint {
+        bail!("Release keyring 公钥与 Publisher 固定指纹不一致");
+    }
+    let trusted = package_archive_entry(package, "usr/share/pacman/keyrings/aursmith-trusted")?;
+    if trusted != format!("{fingerprint}:4:\n").as_bytes() {
+        bail!("Release keyring ownertrust 内容无效");
+    }
+    if !package_archive_entry(package, "usr/share/pacman/keyrings/aursmith-revoked")?.is_empty() {
+        bail!("Release keyring 初始 revoked 清单必须为空");
+    }
+    let install = String::from_utf8(package_archive_entry(package, ".INSTALL")?)?;
+    if !install.contains("pacman-key --populate aursmith") {
+        bail!("Release keyring 缺少 pacman-key populate 安装动作");
+    }
+    Ok(())
+}
+
+fn package_archive_entry(package: &Path, entry: &str) -> anyhow::Result<Vec<u8>> {
+    let output = std::process::Command::new("/usr/bin/bsdtar")
+        .args(["-xOf"])
+        .arg(package)
+        .arg(entry)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() || output.stdout.len() > 1024 * 1024 {
+        bail!("Release keyring 缺少或包含过大的归档项：{entry}");
+    }
+    Ok(output.stdout)
 }
 
 fn verify_manifest_entry(
@@ -2671,6 +2785,7 @@ mod transfer_tests {
                 size: 1,
             }],
             removed_package_names: vec![],
+            include_repository_keyring: true,
             evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
