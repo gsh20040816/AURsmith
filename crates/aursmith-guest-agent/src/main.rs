@@ -36,8 +36,8 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    mount("proc", "/proc", "proc", &[])?;
-    mount("sysfs", "/sys", "sysfs", &[])?;
+    ensure_mount("proc", "/proc", "proc", &[])?;
+    ensure_mount("sysfs", "/sys", "sysfs", &[])?;
     fs::create_dir_all(INPUT)?;
     fs::create_dir_all(OUTPUT)?;
     mount(
@@ -802,6 +802,18 @@ fn mount(source: &str, target: &str, kind: &str, extra: &[&str]) -> anyhow::Resu
     run_checked("/usr/bin/mount", &arguments, None)
 }
 
+fn ensure_mount(source: &str, target: &str, kind: &str, extra: &[&str]) -> anyhow::Result<()> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if mountinfo.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mounted_at| mounted_at == target)
+    }) {
+        return Ok(());
+    }
+    mount(source, target, kind, extra)
+}
+
 fn run_checked(executable: &str, arguments: &[&str], cwd: Option<&Path>) -> anyhow::Result<()> {
     let mut command = Command::new(executable);
     command.args(arguments).stdin(Stdio::null());
@@ -839,6 +851,12 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn system_mounts_are_detected_without_remounting() {
+        ensure_mount("proc", "/proc", "proc", &[]).unwrap();
+        ensure_mount("sysfs", "/sys", "sysfs", &[]).unwrap();
     }
 
     #[test]

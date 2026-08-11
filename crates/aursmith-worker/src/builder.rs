@@ -913,7 +913,7 @@ impl QemuPlan {
             profile.initramfs.as_os_str().into(),
             "-append".into(),
             format!(
-                "root=/dev/vda rw console=ttyS0 panic=1 init=/usr/local/bin/aursmith-guest-agent aursmith.controller_key={} aursmith.build_network={}",
+                "root=/dev/vda rw console=ttyS0 panic=1 systemd.unit=aursmith-guest-agent.service aursmith.controller_key={} aursmith.build_network={}",
                 profile.controller_key_hex,
                 u8::from(spec.kind == JobKind::Build && build_network),
             )
@@ -1142,6 +1142,10 @@ mod tests {
             args.iter()
                 .any(|value| value.contains("aursmith.build_network=1"))
         );
+        assert!(args.iter().any(|value| {
+            value.contains("systemd.unit=aursmith-guest-agent.service")
+                && !value.contains("init=/usr/local/bin/aursmith-guest-agent")
+        }));
     }
 
     #[test]

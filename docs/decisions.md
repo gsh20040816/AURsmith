@@ -57,6 +57,7 @@
 - ADR-053：替换 ADR-014、ADR-018、ADR-034 和 ADR-035 中“Build VM 固定无网”的部分。第一版以实用构建成功率为优先，Builder 通过 `AURSMITH_BUILD_NETWORK` 选择 Build VM 使用 `-nic none` 或 QEMU user networking 直接访问公网；默认关闭，部署者可显式开启。Fetch VM 的代理路径、KVM 边界、只读输入、Attempt 独立输出、非 root makepkg、密钥不进入 Guest 和产物复验保持不变。BuildResult 的 provenance 必须记录 `network=none/direct`。原因是 NuGet 等生态会在正常构建命令内解析依赖，强制离线需要为每个生态重复实现预取器，不符合第一版实用优先的范围。
 - ADR-054（已撤回）：曾考虑对所有 makepkg 子进程设置 .NET 专用的 build server 环境变量，但这无法证明 Jackett 挂起的通用根因，且会让平台行为依赖特定生态的碰运气配置，因此在进入正式 Profile 前撤回。
 - ADR-055：Guest 对有日志的长任务执行通用无侵入诊断。日志连续 120 秒不增长时，将 `/proc` 中进程的名称、状态、PID/PPID、线程数、命令行和内核等待点追加到任务日志；不终止任务、不改变环境。该证据用于区分构建脚本、子进程回收、文件系统和 Guest PID 1 问题，确认根因后再实施修复。
+- ADR-056：Guest 恢复标准 Arch Linux 启动模型。真实 Jackett 诊断显示 Guest Agent 被错误地指定为 PID 1，却未回收孤儿进程，多个 GPG 和 .NET 进程成为 `PPid=1` 的 zombie；`dotnet build-server shutdown` 因等待已退出但未回收的 server PID 而阻塞 makepkg。本机 init 会正常回收，故同一 PKGBUILD 本机构建无此问题。修复方式是由 Profile 已安装的 systemd 作为 PID 1，并把 Guest Agent 注册成一次性 service；不自行实现 init，也不注入生态专用变量。这对所有会派生后台进程的构建工具生效。
 
 ## 已拒绝
 

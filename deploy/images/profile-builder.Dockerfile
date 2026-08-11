@@ -24,8 +24,10 @@ RUN install -Dm644 /etc/pacman.conf /rootfs/etc/pacman.conf
 RUN pacman-key --gpgdir /rootfs/etc/pacman.d/gnupg --init \
     && pacman-key --gpgdir /rootfs/etc/pacman.d/gnupg --populate archlinux
 COPY deploy/common/mkinitcpio-aursmith.conf /rootfs/etc/mkinitcpio.conf
+COPY deploy/common/aursmith-guest-agent.service /rootfs/usr/lib/systemd/system/aursmith-guest-agent.service
 COPY --from=rust-builder /src/target/release/aursmith-guest-agent /rootfs/usr/local/bin/aursmith-guest-agent
 RUN chmod 0755 /rootfs/usr/local/bin/aursmith-guest-agent \
+    && systemctl --root=/rootfs enable aursmith-guest-agent.service \
     && chown -R 1000:1000 /rootfs/home/builder \
     && kernel_version="$(basename "$(find /rootfs/usr/lib/modules -mindepth 1 -maxdepth 1 -type d -print -quit)")" \
     && test -n "${kernel_version}" \
