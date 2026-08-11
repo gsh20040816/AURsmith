@@ -64,8 +64,8 @@ fn run() -> anyhow::Result<()> {
     if spec.is_expired_at(Utc::now()) {
         bail!("Guest JobSpec 已过期");
     }
-    if spec.kind == JobKind::Fetch {
-        configure_fetch_network()?;
+    if spec.kind == JobKind::Fetch || (spec.kind == JobKind::Build && build_network_enabled()?) {
+        configure_network()?;
     }
     reset_build_directory()?;
     copy_tree(Path::new(INPUT), Path::new(BUILD), true)?;
@@ -95,12 +95,12 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn configure_fetch_network() -> anyhow::Result<()> {
+fn configure_network() -> anyhow::Result<()> {
     let interface = fs::read_dir("/sys/class/net")?
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .find(|name| name != "lo")
-        .context("Fetch VM 未发现网络接口")?;
+        .context("联网 VM 未发现网络接口")?;
     run_checked("/usr/bin/ip", &["link", "set", &interface, "up"], None)?;
     run_checked(
         "/usr/bin/ip",
@@ -112,6 +112,7 @@ fn configure_fetch_network() -> anyhow::Result<()> {
         &["route", "add", "default", "via", "10.0.2.2"],
         None,
     )?;
+    fs::write("/etc/resolv.conf", b"nameserver 10.0.2.3\n")?;
     Ok(())
 }
 
@@ -514,9 +515,15 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyh
 }
 
 fn build_network_enabled() -> anyhow::Result<bool> {
-    Ok(fs::read_to_string("/proc/cmdline")?
+    Ok(command_line_enables_build_network(&fs::read_to_string(
+        "/proc/cmdline",
+    )?))
+}
+
+fn command_line_enables_build_network(command_line: &str) -> bool {
+    command_line
         .split_whitespace()
-        .any(|part| part == "aursmith.build_network=1"))
+        .any(|part| part == "aursmith.build_network=1")
 }
 
 fn controller_key() -> anyhow::Result<Vec<u8>> {
@@ -795,6 +802,16 @@ mod tests {
         assert!(is_package_archive_name("tree-2.3.2-1-x86_64.pkg.tar.zst"));
         assert!(!is_package_archive_name(
             "tree-2.3.2-1-x86_64.pkg.tar.zst.sig"
+        ));
+    }
+
+    #[test]
+    fn build_network_requires_the_explicit_kernel_flag() {
+        assert!(command_line_enables_build_network(
+            "root=/dev/vda aursmith.build_network=1"
+        ));
+        assert!(!command_line_enables_build_network(
+            "root=/dev/vda aursmith.build_network=0"
         ));
     }
 
