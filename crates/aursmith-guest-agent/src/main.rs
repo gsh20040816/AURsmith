@@ -9,10 +9,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 const INPUT: &str = "/mnt/aursmith-input";
@@ -494,9 +495,7 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyh
         .env_clear()
         .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
         .env("HOME", "/home/builder")
-        .env("LANG", "C.UTF-8")
-        .env("DOTNET_CLI_USE_MSBUILD_SERVER", "0")
-        .env("MSBUILDUSESERVER", "0");
+        .env("LANG", "C.UTF-8");
     if network {
         command
             .env("http_proxy", "http://10.0.2.100:8080")
@@ -509,11 +508,80 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyh
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
     }
-    let status = command.status()?;
+    let mut child = command.spawn()?;
+    let mut last_size = log.and_then(|path| fs::metadata(path).ok().map(|value| value.len()));
+    let mut last_progress = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let Some(path) = log else {
+            continue;
+        };
+        let current_size = fs::metadata(path).ok().map(|value| value.len());
+        if current_size != last_size {
+            last_size = current_size;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= Duration::from_secs(120) {
+            let mut diagnostics = fs::OpenOptions::new().append(true).open(path)?;
+            diagnostics
+                .write_all("\n==> AURsmith: 120 秒无日志进展，记录 Guest 进程快照\n".as_bytes())?;
+            diagnostics.write_all(process_snapshot().as_bytes())?;
+            diagnostics.flush()?;
+            last_size = fs::metadata(path).ok().map(|value| value.len());
+            last_progress = Instant::now();
+        }
+    };
     if !status.success() {
         bail!("Guest 命令失败，状态 {status}");
     }
     Ok(())
+}
+
+fn process_snapshot() -> String {
+    let mut processes = fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().into_string().ok()?;
+            pid.chars()
+                .all(|value| value.is_ascii_digit())
+                .then_some(pid)
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by_key(|pid| pid.parse::<u32>().unwrap_or(u32::MAX));
+    let mut snapshot = String::new();
+    for pid in processes {
+        let root = Path::new("/proc").join(&pid);
+        let status = fs::read_to_string(root.join("status")).unwrap_or_default();
+        let selected = status
+            .lines()
+            .filter(|line| {
+                ["Name:", "State:", "Pid:", "PPid:", "Threads:"]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = fs::read(root.join("cmdline"))
+            .ok()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let wait = fs::read_to_string(root.join("wchan"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        snapshot.push_str(&format!("{selected} wchan:{wait} cmd:{command}\n"));
+    }
+    snapshot
 }
 
 fn build_network_enabled() -> anyhow::Result<bool> {
@@ -815,6 +883,14 @@ mod tests {
         assert!(!command_line_enables_build_network(
             "root=/dev/vda aursmith.build_network=0"
         ));
+    }
+
+    #[test]
+    fn process_snapshot_contains_the_current_test_process() {
+        let snapshot = process_snapshot();
+        assert!(snapshot.contains(&format!("Pid:\t{} ", std::process::id())));
+        assert!(snapshot.contains("PPid:"));
+        assert!(snapshot.contains("wchan:"));
     }
 
     #[test]
