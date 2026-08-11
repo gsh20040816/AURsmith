@@ -231,13 +231,22 @@ async fn invoke(
         .await
         .map_err(|_| ApiError::internal("Worker SSH 调用超时"))?
         .map_err(ApiError::internal)?;
+    let reply = serde_json::from_slice::<WorkerReply>(&output.stdout);
     if !output.status.success() {
+        if let Ok(reply) = &reply
+            && !reply.ok
+        {
+            return Err(ApiError::conflict(
+                "WORKER_REJECTED",
+                format!("{}: {}", reply.code, reply.message),
+            ));
+        }
         return Err(ApiError::internal(format!(
             "Worker SSH 失败: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let reply: WorkerReply = serde_json::from_slice(&output.stdout).map_err(ApiError::internal)?;
+    let reply = reply.map_err(ApiError::internal)?;
     if !reply.ok {
         return Err(ApiError::conflict(
             "WORKER_REJECTED",

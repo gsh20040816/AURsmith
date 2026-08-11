@@ -230,6 +230,14 @@ async fn collect_dependency_snapshots(
         if names.is_empty() {
             continue;
         }
+        let official_names = collect_official_dependency_names(state, endpoint, &names).await?;
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|name| !official_names.contains(name))
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
         let reply = transport::aur_info(&state.config, endpoint, &names).await?;
         let found: Vec<UpstreamPackage> =
             serde_json::from_value(reply.data.get("items").cloned().unwrap_or(Value::Null))
@@ -334,6 +342,38 @@ async fn collect_dependency_snapshots(
         resolutions,
         provider_candidates,
     })
+}
+
+async fn collect_official_dependency_names(
+    state: &AppState,
+    endpoint: &str,
+    names: &[String],
+) -> Result<BTreeSet<String>, ApiError> {
+    let mut official_names = BTreeSet::new();
+    for chunk in names.chunks(50) {
+        let reply = transport::official_info(&state.config, endpoint, chunk).await?;
+        official_names.extend(official_dependency_names_from_data(chunk, &reply.data)?);
+    }
+    Ok(official_names)
+}
+
+fn official_dependency_names_from_data(
+    names: &[String],
+    data: &Value,
+) -> Result<BTreeSet<String>, ApiError> {
+    let packages = data
+        .as_object()
+        .ok_or_else(|| ApiError::internal("官方仓库响应不是对象"))?;
+    Ok(names
+        .iter()
+        .filter(|name| {
+            packages
+                .get(name.as_str())
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        })
+        .cloned()
+        .collect())
 }
 
 async fn apply_snapshot(
@@ -2286,6 +2326,19 @@ mod tests {
                 "local.patch".into(),
             ]),
             BTreeSet::from(["downloads.example.org".into(), "git.example.org".into(),])
+        );
+    }
+
+    #[test]
+    fn official_dependencies_are_excluded_before_aur_provider_resolution() {
+        let names = vec!["glibc".into(), "aur-library".into()];
+        let data = json!({
+            "glibc": [{"repo": "core", "pkgname": "glibc"}],
+            "aur-library": []
+        });
+        assert_eq!(
+            official_dependency_names_from_data(&names, &data).unwrap(),
+            BTreeSet::from(["glibc".into()])
         );
     }
 
