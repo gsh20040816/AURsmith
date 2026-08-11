@@ -133,7 +133,7 @@ Fetch VM 完成下载和校验后生成完整 Source Manifest，清单显式区�
 
 三个低成本 Runner 各自独立读取同一 Bundle。三票通过时直接批准；恰好两票通过时只创建一次高成本任务；不超过一票通过时转入人工队列。Runner 超时、不可用、非零退出、非法 JSON 都按未通过处理，每个调用仅重试一次。高成本 Runner 只收到原始 Bundle 和低成本报告的规范化异议，不接收隐藏推理过程，并且只有明确 `approve` 才能批准。人工决定绑定 Revision、Bundle 摘要和策略版本。
 
-Runner 只支持 `codex` 与 `claude_code` 两种适配器，不接受用户提供任意可执行文件或 Shell 命令。两种 CLI 都从固定绝对路径和结构化 argv 启动，并使用 JSON Schema 约束最终输出。Codex 使用临时 `CODEX_HOME`、忽略用户配置与规则、只读 sandbox 和非交互审批；可选思考强度只接受 `minimal/low/medium/high/xhigh` 白名单并作为独立 `model_reasoning_effort` 配置参数传入。Claude Code 使用 bare/safe 配置、禁用全部工具、MCP、slash command、会话持久化和非必要遥测。一次性目录中只有输出 Schema，不挂载 Controller 数据库、仓库、Worker、SSH/GPG 密钥或 Docker Socket。
+Runner 只支持 `codex` 与 `claude_code` 两种适配器，不接受用户提供任意可执行文件或 Shell 命令。两种 CLI 都从固定绝对路径和结构化 argv 启动，并使用 JSON Schema 约束最终输出。Codex 使用临时 `CODEX_HOME`、忽略用户配置与规则、只读 sandbox 和非交互审批；可选思考强度只接受 `minimal/low/medium/high/xhigh/max` 白名单并作为独立 `model_reasoning_effort` 配置参数传入。Claude Code 使用 bare/safe 配置、禁用全部工具、MCP、slash command、会话持久化和非必要遥测。一次性目录中只有输出 Schema，不挂载 Controller 数据库、仓库、Worker、SSH/GPG 密钥或 Docker Socket。
 
 真实 provider API key 不进入 Runner 容器。独立 `agent-credential-gateway` 挂载 low-1、low-2、low-3 和 high 四份 Docker secret；三个低成本路由各自固定 provider Base URL、认证方式和密钥。Runner 只连接内部 Agent 网络中的专属网关路径并使用无权限占位令牌。网关删除调用方认证头后重新注入对应凭据，且不接受请求指定目标主机。这样既确保三路审计配置彼此独立，也避免模型通过工具或环境读取真实密钥。网关是唯一拥有 Agent 外网的容器。
 

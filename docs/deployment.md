@@ -38,7 +38,7 @@ Controller Stack 内固定运行三个低成本 Runner、一个高成本 Runner�
 
 - `PROVIDER`：写入报告的 provider 标识，只允许字母、数字、连字符和下划线；
 - `MODEL`：传给对应 CLI 的模型 ID；
-- `REASONING_EFFORT`：Codex 思考强度，可为空或使用 `minimal/low/medium/high/xhigh`；
+- `REASONING_EFFORT`：Codex 思考强度，可为空或使用 `minimal/low/medium/high/xhigh/max`；
 - `BASE_URL`：凭据网关访问的上游 HTTPS Base URL；
 - `AUTH_STYLE`：`bearer` 或 `x-api-key`；Codex 兼容 provider 通常使用 `bearer`；
 - `API_KEY_FILE`：宿主机上的独立 Docker secret 文件路径。

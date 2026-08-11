@@ -186,7 +186,9 @@ impl AdapterConfig {
             .as_deref()
             .is_some_and(|value| !reasoning_effort_is_valid(value))
         {
-            bail!("AURSMITH_AGENT_REASONING_EFFORT 只能是 minimal、low、medium、high 或 xhigh");
+            bail!(
+                "AURSMITH_AGENT_REASONING_EFFORT 只能是 minimal、low、medium、high、xhigh 或 max"
+            );
         }
         Ok(Self {
             kind,
@@ -199,7 +201,10 @@ impl AdapterConfig {
 }
 
 fn reasoning_effort_is_valid(value: &str) -> bool {
-    matches!(value, "minimal" | "low" | "medium" | "high" | "xhigh")
+    matches!(
+        value,
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {
@@ -492,7 +497,7 @@ mod tests {
 
     #[test]
     fn codex_reasoning_effort_uses_a_fixed_allowlist() {
-        for effort in ["minimal", "low", "medium", "high", "xhigh"] {
+        for effort in ["minimal", "low", "medium", "high", "xhigh", "max"] {
             assert!(reasoning_effort_is_valid(effort));
         }
         assert!(!reasoning_effort_is_valid("ultra"));
