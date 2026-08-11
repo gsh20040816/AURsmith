@@ -120,6 +120,21 @@ pub async fn recover_interrupted(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+pub async fn reconcile_completed(state: &AppState) -> Result<(), ApiError> {
+    let row = sqlx::query("SELECT audit_bundles.sha256, (SELECT tier FROM agent_runs WHERE audit_bundle_sha256 = audit_bundles.sha256 AND status IN ('succeeded', 'failed') ORDER BY finished_at DESC LIMIT 1) AS latest_tier FROM audit_bundles WHERE audit_bundles.state IN ('agent_pending', 'agent_running') AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE audit_bundle_sha256 = audit_bundles.sha256 AND status IN ('pending', 'running')) ORDER BY audit_bundles.created_at LIMIT 1")
+        .fetch_optional(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Some(row) = row {
+        let bundle: String = row.get("sha256");
+        let tier = row
+            .get::<Option<String>, _>("latest_tier")
+            .unwrap_or_else(|| "low".into());
+        evaluate(state, &bundle, &tier).await?;
+    }
+    Ok(())
+}
+
 async fn budget_available(state: &AppState) -> Result<bool, ApiError> {
     let daily: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_runs WHERE started_at >= datetime('now', 'start of day')",

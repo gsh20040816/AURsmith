@@ -48,6 +48,9 @@ pub fn spawn(state: AppState) {
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
+            if let Err(error) = crate::audits::reconcile_completed(&audit_state).await {
+                tracing::warn!(%error, "已完成 Agent 审计对账失败");
+            }
             let dispatch_state = audit_state.clone();
             tokio::spawn(async move {
                 if let Err(error) = crate::audits::dispatch_one(&dispatch_state).await {
