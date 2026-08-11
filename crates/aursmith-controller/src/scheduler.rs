@@ -2,7 +2,8 @@ use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
 use aursmith_protocol::{
     ArtifactRecord, DependencyInput, DependencySource, GuestResult, JobKind, JobSpec,
-    ReleaseAuthorization, ReleaseEvidence, ReleaseEvidenceRecord, ResourceLimits, SignedEnvelope,
+    ManifestEntry, ReleaseAuthorization, ReleaseEvidence, ReleaseEvidenceRecord, ResourceLimits,
+    SignedEnvelope,
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
@@ -133,6 +134,23 @@ pub fn spawn(state: AppState) {
     });
 }
 
+fn manifest_entries_match(left: &[ManifestEntry], right: &[ManifestEntry]) -> bool {
+    fn index(entries: &[ManifestEntry]) -> Option<BTreeMap<String, (String, u64)>> {
+        let mut indexed = BTreeMap::new();
+        for entry in entries {
+            if indexed
+                .insert(entry.path.clone(), (entry.sha256.clone(), entry.size))
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(indexed)
+    }
+
+    left.len() == right.len() && index(left).is_some_and(|left| Some(left) == index(right))
+}
+
 async fn dispatch_backup_archive_one(state: &AppState) -> Result<(), ApiError> {
     let pending = sqlx::query("SELECT control_plane_backup_archives.id, control_plane_backup_archives.backup_id, control_plane_backup_archives.envelope_json, control_plane_backup_archives.export_directory, control_plane_backup_archives.attempt_count, control_plane_backup_archives.expires_at, workers.endpoint, workers.identity_signing_key_hex FROM control_plane_backup_archives JOIN workers ON workers.id = control_plane_backup_archives.archiver_worker_id WHERE control_plane_backup_archives.state = 'issued' ORDER BY control_plane_backup_archives.updated_at LIMIT 1")
         .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
@@ -174,7 +192,7 @@ async fn dispatch_backup_archive_one(state: &AppState) -> Result<(), ApiError> {
                     .map_err(ApiError::internal)?;
                 if receipt.backup_id.to_string() != backup_id
                     || receipt.archive_worker != capability.destination_worker
-                    || receipt.files != capability.files
+                    || !manifest_entries_match(&receipt.files, &capability.files)
                 {
                     return Err(ApiError::conflict(
                         "BACKUP_RECEIPT_MISMATCH",
@@ -558,7 +576,7 @@ async fn dispatch_archive_one(state: &AppState) -> Result<(), ApiError> {
                     if receipt.release_id != release_id
                         || receipt.archive_worker != capability.destination_worker
                         || receipt.release_manifest_sha256 != expected_manifest
-                        || receipt.files != capability.files
+                        || !manifest_entries_match(&receipt.files, &capability.files)
                         || receipt.state != aursmith_domain::ArchiveState::Verified
                     {
                         return Err(ApiError::conflict(
@@ -2245,6 +2263,27 @@ async fn load_batch_dependency_attempts(
 #[cfg(test)]
 mod release_tests {
     use super::*;
+
+    #[test]
+    fn receipt_manifest_comparison_ignores_order_but_rejects_duplicate_paths() {
+        let entry = |path: &str, digest: &str| ManifestEntry {
+            path: path.into(),
+            sha256: digest.into(),
+            size: 1,
+        };
+        let capability = vec![
+            entry("controller.db", "a"),
+            entry("backup-envelope.json", "b"),
+        ];
+        let receipt = vec![
+            entry("backup-envelope.json", "b"),
+            entry("controller.db", "a"),
+        ];
+        assert!(manifest_entries_match(&capability, &receipt));
+
+        let duplicates = vec![entry("controller.db", "a"), entry("controller.db", "a")];
+        assert!(!manifest_entries_match(&duplicates, &duplicates));
+    }
 
     fn state(database: sqlx::SqlitePool) -> AppState {
         AppState::new(
