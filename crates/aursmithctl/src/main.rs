@@ -58,8 +58,13 @@ enum Command {
         #[arg(long, default_value = "/etc/ssh/sshd_config")]
         config: PathBuf,
     },
-    /// 生成 Controller Ed25519 密钥；私钥只输出一次，必须写入 secret。
-    GenerateControllerKey,
+    /// 生成 Controller Ed25519 密钥；生产部署应直接写入私有文件，避免私钥经过终端。
+    GenerateControllerKey {
+        #[arg(long, requires = "public_key_file")]
+        private_key_file: Option<PathBuf>,
+        #[arg(long, requires = "private_key_file")]
+        public_key_file: Option<PathBuf>,
+    },
     /// 从固定 Profile 构建产物导出待 Controller 授权的候选清单。
     ExportProfile {
         #[arg(long, default_value = "/opt/aursmith-profile")]
@@ -221,7 +226,10 @@ async fn main() -> anyhow::Result<()> {
             &private_directory,
             &config,
         )?,
-        Command::GenerateControllerKey => generate_controller_key()?,
+        Command::GenerateControllerKey {
+            private_key_file,
+            public_key_file,
+        } => generate_controller_key(private_key_file.as_deref(), public_key_file.as_deref())?,
         Command::ExportProfile {
             source,
             output,
@@ -454,20 +462,75 @@ fn materialize_private_file(source: &Path, target: &Path, maximum_size: u64) -> 
     Ok(())
 }
 
-fn generate_controller_key() -> anyhow::Result<()> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_key_can_be_written_without_printing_the_private_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let private = directory.path().join("controller.key");
+        let public = directory.path().join("controller.pub");
+        generate_controller_key(Some(&private), Some(&public)).unwrap();
+        let private_value = fs::read_to_string(&private).unwrap();
+        let public_value = fs::read_to_string(&public).unwrap();
+        assert_eq!(private_value.trim().len(), 64);
+        assert_eq!(public_value.trim().len(), 64);
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(generate_controller_key(Some(&private), Some(&public)).is_err());
+    }
+}
+
+fn generate_controller_key(
+    private_key_file: Option<&Path>,
+    public_key_file: Option<&Path>,
+) -> anyhow::Result<()> {
     let mut secret = [0_u8; 32];
     std::fs::File::open("/dev/urandom")
         .context("无法打开系统随机源")?
         .read_exact(&mut secret)
         .context("无法从系统随机源读取密钥")?;
     let signing_key = SigningKey::from_bytes(&secret);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "private_key_hex": hex::encode(secret),
-            "public_key_hex": hex::encode(signing_key.verifying_key().to_bytes()),
-        }))?
-    );
+    let private_key_hex = hex::encode(secret);
+    let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    match (private_key_file, public_key_file) {
+        (Some(private_path), Some(public_path)) => {
+            write_new_file(private_path, private_key_hex.as_bytes(), 0o600)?;
+            write_new_file(public_path, public_key_hex.as_bytes(), 0o644)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "private_key_file": private_path,
+                    "public_key_file": public_path,
+                    "public_key_hex": public_key_hex,
+                }))?
+            );
+        }
+        (None, None) => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "private_key_hex": private_key_hex,
+                "public_key_hex": public_key_hex,
+            }))?
+        ),
+        _ => bail!("必须同时提供私钥与公钥输出文件"),
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("无法创建 {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
     Ok(())
 }
 

@@ -53,6 +53,7 @@
 - ADR-049：pacoloco 作为 Publisher Stack 的独立无特权缓存服务，固定上游镜像版本和镜像 digest。Caddy 只在 `/arch-cache/` 暴露它，默认仓库读取不依赖缓存健康状态。Publisher Worker 只读取无凭据的内部 `/metrics`，把全局累计命中率写入 Worker 心跳；Profile 优化不把全局计数错误分摊给单个依赖。
 - ADR-050：随机高成本复查保持默认 0%，不得改变用户指定的三票通过规则。用户显式启用后，以 AuditBundle 摘要映射到 0～9999 的稳定桶并按基点抽样，避免重启导致同一输入反复改变决定；命中项作为额外门禁，仍要求高成本 Agent 明确通过。
 - ADR-051：Controller Web 默认使用 Caddy 内部 CA，并把 Caddy `/data` 放在独立持久卷；Controller 只读共享根证书以提供认证下载和 Doctor，不共享 CA 私钥。用户证书通过 Compose override 和 Docker secret 只进入 Caddy。根 CA 轮换保持人工维护，避免单用户第一版引入自研 PKI。
+- ADR-052：Codex 思考强度不接受任意 CLI 片段，只允许固定枚举并通过结构化 `--config model_reasoning_effort=...` 传入。空值表示使用 provider/model 默认值；部署模板可保留为空，不能把未填写值伪装成已配置。
 
 ## 已拒绝
 

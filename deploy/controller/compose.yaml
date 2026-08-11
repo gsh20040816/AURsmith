@@ -126,7 +126,8 @@ services:
     environment: &low-agent-environment
       AURSMITH_AGENT_ADAPTER: ${AURSMITH_LOW_AGENT_ADAPTER:-codex}
       AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_PROVIDER:-openai}
-      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_MODEL:-gpt-5.6-terra}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_MODEL-gpt-5.6-terra}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_REASONING_EFFORT-}
       AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low/
     tmpfs:
       - /tmp:uid=10002,gid=10002,mode=0700,size=32m
@@ -144,9 +145,10 @@ services:
   agent-high:
     <<: *agent-runner
     environment:
-      AURSMITH_AGENT_ADAPTER: ${AURSMITH_HIGH_AGENT_ADAPTER:-claude_code}
-      AURSMITH_AGENT_PROVIDER: ${AURSMITH_HIGH_AGENT_PROVIDER:-anthropic}
-      AURSMITH_AGENT_MODEL: ${AURSMITH_HIGH_AGENT_MODEL:-claude-sonnet-4-6}
+      AURSMITH_AGENT_ADAPTER: ${AURSMITH_HIGH_AGENT_ADAPTER:-codex}
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_HIGH_AGENT_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_HIGH_AGENT_MODEL-gpt-5.6-terra}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_HIGH_AGENT_REASONING_EFFORT-}
       AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/high/
 
   agent-credential-gateway:
@@ -159,11 +161,11 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     environment:
-      AURSMITH_LOW_AGENT_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_BASE_URL:-https://api.openai.com/v1/}
+      AURSMITH_LOW_AGENT_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_BASE_URL-https://api.openai.com/v1/}
       AURSMITH_LOW_AGENT_AUTH_STYLE: ${AURSMITH_LOW_AGENT_AUTH_STYLE:-bearer}
       AURSMITH_LOW_AGENT_API_KEY_FILE: /run/secrets/low_agent_api_key
-      AURSMITH_HIGH_AGENT_PROVIDER_BASE_URL: ${AURSMITH_HIGH_AGENT_BASE_URL:-https://api.anthropic.com/}
-      AURSMITH_HIGH_AGENT_AUTH_STYLE: ${AURSMITH_HIGH_AGENT_AUTH_STYLE:-x-api-key}
+      AURSMITH_HIGH_AGENT_PROVIDER_BASE_URL: ${AURSMITH_HIGH_AGENT_BASE_URL-https://api.openai.com/v1/}
+      AURSMITH_HIGH_AGENT_AUTH_STYLE: ${AURSMITH_HIGH_AGENT_AUTH_STYLE:-bearer}
       AURSMITH_HIGH_AGENT_API_KEY_FILE: /run/secrets/high_agent_api_key
     secrets:
       - low_agent_api_key

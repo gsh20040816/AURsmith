@@ -21,7 +21,7 @@
 | P08 | 已验证 | 新批次失败不改变当前 Release；发布故障与回滚实际验证 | 无 |
 | A01 | 已验证 | 包装层扫描、Fetch 后 AuditBundle、三 Runner 调度 | 真实外部模型调用未验证 |
 | A02 | 已验证 | 3/2/≤1、单次重试和高成本批准规则；默认 0 的摘要稳定随机复查可由 UI/环境配置 | 无 |
-| A03 | 已验证 | Codex/Claude Code 固定 argv、自定义 provider/Base URL、凭据网关 Docker secret、预算；四 Runner 无付费 Doctor 和容器冒烟 | 真实 provider key 审计属于首次部署验收，当前开发机没有可用凭据，未伪造外部调用 |
+| A03 | 已验证 | Codex/Claude Code 固定 argv、自定义 provider/Base URL/思考强度、凭据网关 Docker secret、预算；四 Runner 无付费 Doctor 和容器冒烟 | 真实 provider key 审计属于首次部署验收，当前开发机没有可用凭据，未伪造外部调用 |
 | A04 | 已验证 | 覆盖范围、选读文件和“不证明全部源码安全”写入报告 | 无 |
 | B01 | 已验证 | 非 privileged Builder 容器内真实 KVM Fetch→Build | 无 |
 | B02 | 已验证 | Build VM `-nic none`；Fetch VM 在 `restrict=on` 下经 Attempt 本地中继和 source proxy 真实下载、验签 `tree` 官方包 | source 域名的逐 Revision 动态白名单属于后续收紧项 |

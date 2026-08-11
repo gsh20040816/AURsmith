@@ -67,6 +67,7 @@ struct AdapterConfig {
     provider: String,
     base_url: String,
     model: String,
+    reasoning_effort: Option<String>,
 }
 
 #[tokio::main]
@@ -120,6 +121,7 @@ async fn health() -> Result<Json<Value>, (StatusCode, String)> {
         "adapter": match config.kind { AdapterKind::Codex => "codex", AdapterKind::ClaudeCode => "claude_code" },
         "provider": config.provider,
         "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
         "credential_gateway_reachable": true
     })))
 }
@@ -179,13 +181,25 @@ impl AdapterConfig {
         {
             bail!("Agent base URL 必须是无内嵌凭据、查询参数和片段的绝对 HTTP(S) URL");
         }
+        let reasoning_effort = optional_env("AURSMITH_AGENT_REASONING_EFFORT");
+        if reasoning_effort
+            .as_deref()
+            .is_some_and(|value| !reasoning_effort_is_valid(value))
+        {
+            bail!("AURSMITH_AGENT_REASONING_EFFORT 只能是 minimal、low、medium、high 或 xhigh");
+        }
         Ok(Self {
             kind,
             provider,
             base_url,
             model: required_env("AURSMITH_AGENT_MODEL")?,
+            reasoning_effort,
         })
     }
+}
+
+fn reasoning_effort_is_valid(value: &str) -> bool {
+    matches!(value, "minimal" | "low" | "medium" | "high" | "xhigh")
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {
@@ -194,6 +208,13 @@ fn required_env(name: &str) -> anyhow::Result<String> {
         bail!("{name} 不能为空");
     }
     Ok(value)
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn validate_request(request: &AuditRequest) -> anyhow::Result<()> {
@@ -239,7 +260,7 @@ async fn run_codex(
     let codex_home_path = workspace.join(".codex");
     fs::create_dir(&codex_home_path).await?;
     let codex_home = codex_home_path.to_string_lossy().into_owned();
-    let arguments = vec![
+    let mut arguments = vec![
         "exec".into(),
         "--ignore-user-config".into(),
         "--ignore-rules".into(),
@@ -263,8 +284,14 @@ async fn run_codex(
         format!("model_providers.aursmith.base_url={:?}", config.base_url),
         "--config".into(),
         "model_providers.aursmith.env_key=\"AURSMITH_MODEL_API_KEY\"".into(),
-        "-".into(),
     ];
+    if let Some(effort) = config.reasoning_effort.as_deref() {
+        arguments.extend([
+            "--config".into(),
+            format!("model_reasoning_effort={effort:?}"),
+        ]);
+    }
+    arguments.push("-".into());
     let output = execute(
         "/usr/local/bin/codex",
         &arguments,
@@ -461,6 +488,15 @@ mod tests {
             output_schema()["properties"]["verdict"]["enum"],
             serde_json::json!(["approve", "reject"])
         );
+    }
+
+    #[test]
+    fn codex_reasoning_effort_uses_a_fixed_allowlist() {
+        for effort in ["minimal", "low", "medium", "high", "xhigh"] {
+            assert!(reasoning_effort_is_valid(effort));
+        }
+        assert!(!reasoning_effort_is_valid("ultra"));
+        assert!(!reasoning_effort_is_valid("high --dangerously-bypass"));
     }
 
     #[tokio::test]
