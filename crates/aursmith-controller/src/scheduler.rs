@@ -1984,6 +1984,7 @@ fn infrastructure_failure(code: &str) -> bool {
             | "VM_FAILED"
             | "GUEST_RESULT_MISSING"
             | "RESULT_UNAVAILABLE"
+            | "WORKER_RESTARTED"
             | "WORKER_UNREACHABLE"
     )
 }
@@ -2520,6 +2521,7 @@ mod release_tests {
     #[test]
     fn only_infrastructure_failures_are_automatically_retried() {
         assert!(infrastructure_failure("VM_TIMEOUT"));
+        assert!(infrastructure_failure("WORKER_RESTARTED"));
         assert!(infrastructure_failure("BUILDER_INFRASTRUCTURE"));
         assert!(!infrastructure_failure("INPUT_INVALID"));
         assert!(!infrastructure_failure("PROFILE_DIGEST_MISMATCH"));

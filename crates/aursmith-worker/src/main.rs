@@ -378,6 +378,11 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         }
     }
     sqlx::query(
+        "UPDATE attempts SET status = 'failed', failure_code = 'WORKER_RESTARTED' WHERE status = 'running'",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
         "INSERT INTO worker_state(key, value) VALUES ('state', 'online') ON CONFLICT(key) DO NOTHING",
     )
     .execute(&pool)
