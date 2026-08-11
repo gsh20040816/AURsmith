@@ -1881,6 +1881,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             ));
         }
         crate::packages::complete_fetch(&mut transaction, &revision_id, fetch_result).await?;
+        advance_build_batch = true;
         if let Some(batch_id) = row.get::<Option<String>, _>("batch_id") {
             let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE batch_id = ? AND kind = 'fetch' AND status != 'succeeded'")
                 .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
