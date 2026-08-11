@@ -246,7 +246,7 @@ fn create_repository_keyring_package(
     fs::write(
         root.join("PKGBUILD"),
         format!(
-            "pkgname=aursmith-keyring\npkgver={pkgver}\npkgrel=1\npkgdesc='AURsmith repository signing keys'\narch=('any')\nurl='https://desktop.shgao.top:8443'\nlicense=('Apache-2.0')\ndepends=('pacman')\ninstall=aursmith-keyring.install\nsource=('aursmith.gpg' 'aursmith-trusted' 'aursmith-revoked')\nsha256sums=('{}' '{}' '{}')\n\npackage() {{\n  install -Dm644 aursmith.gpg \"$pkgdir/usr/share/pacman/keyrings/aursmith.gpg\"\n  install -Dm644 aursmith-trusted \"$pkgdir/usr/share/pacman/keyrings/aursmith-trusted\"\n  install -Dm644 aursmith-revoked \"$pkgdir/usr/share/pacman/keyrings/aursmith-revoked\"\n}}\n",
+            "pkgname=aursmith-keyring\npkgver={pkgver}\npkgrel=1\npkgdesc='AURsmith repository signing keys'\narch=('any')\nurl='https://desktop.shgao.top:8443'\nlicense=('Apache-2.0')\ndepends=('pacman')\ninstall=aursmith-keyring.install\noptions=('!strip' '!debug')\nsource=('aursmith.gpg' 'aursmith-trusted' 'aursmith-revoked')\nsha256sums=('{}' '{}' '{}')\n\npackage() {{\n  install -Dm644 aursmith.gpg \"$pkgdir/usr/share/pacman/keyrings/aursmith.gpg\"\n  install -Dm644 aursmith-trusted \"$pkgdir/usr/share/pacman/keyrings/aursmith-trusted\"\n  install -Dm644 aursmith-revoked \"$pkgdir/usr/share/pacman/keyrings/aursmith-revoked\"\n}}\n",
             checksums[0], checksums[1], checksums[2]
         ),
     )?;
