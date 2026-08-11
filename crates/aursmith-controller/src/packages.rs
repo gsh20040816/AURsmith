@@ -1054,6 +1054,29 @@ pub(crate) async fn schedule_rebuild_batch(
     sqlx::query("INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, 'awaiting_fetch', ?, NULL, ?, ?)")
         .bind(&batch_id).bind(serde_json::to_string(&batch_graph).map_err(ApiError::internal)?)
         .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    let mut superseded_batches = BTreeSet::new();
+    for package_base in &packages {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT release_batches.id FROM release_batches JOIN release_batch_revisions ON release_batch_revisions.batch_id = release_batches.id JOIN revisions ON revisions.id = release_batch_revisions.revision_id WHERE release_batches.id != ? AND revisions.package_base = ? AND release_batches.state IN ('awaiting_profile', 'awaiting_fetch', 'fetching', 'awaiting_audit', 'building', 'fetch_failed', 'build_failed', 'ready_to_publish', 'artifacts_ready')")
+            .bind(&batch_id).bind(package_base).fetch_all(&mut *transaction).await.map_err(ApiError::internal)?;
+        superseded_batches.extend(ids);
+    }
+    for old_batch_id in superseded_batches {
+        sqlx::query("UPDATE release_batches SET state = 'superseded', failure_reason = 'SUPERSEDED_REBUILD', updated_at = ? WHERE id = ?")
+            .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'SUPERSEDED_REBUILD', updated_at = ? WHERE batch_id = ? AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
+            .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE batch_id = ?) AND status NOT IN ('succeeded', 'failed', 'cancelled')")
+            .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        append_event_in_transaction(
+            &mut transaction,
+            "release_batch",
+            &old_batch_id,
+            "release_batch_superseded",
+            json!({"superseded_by": batch_id}),
+            actor,
+        )
+        .await?;
+    }
     for (index, package_base) in order.into_iter().enumerate() {
         let previous = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, rebuild_generation, metadata_json FROM revisions WHERE package_base = ? AND state != 'superseded' ORDER BY rebuild_generation DESC, created_at DESC LIMIT 1")
             .bind(&package_base).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
@@ -2502,6 +2525,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batches, 2);
+        let first_batch_state: String =
+            sqlx::query_scalar("SELECT state FROM release_batches WHERE id = ?")
+                .bind(first["batch_id"].as_str().unwrap())
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        assert_eq!(first_batch_state, "superseded");
         let state: String = sqlx::query_scalar("SELECT state FROM release_batches WHERE id = ?")
             .bind(batch_id)
             .fetch_one(&database)
