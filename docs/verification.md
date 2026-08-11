@@ -300,3 +300,13 @@
 - Controller 提供只接受管理员会话的 `/api/v1/client-ca.crt`；路由测试确认未登录返回 401，登录后返回 PEM 下载响应。设置页只在内部 CA 文件可用时显示下载按钮；用户证书 override 把证书和私钥作为 Docker secret 仅挂载给 Caddy，并让 Controller 进入外部信任链模式。
 - 默认和用户证书两套 Compose 均通过渲染；安全检查确认 CA 数据由 Caddy 持久写入且只读共享给 Controller。内部 CA 私钥不会进入 Controller 数据库或备份，必须按 README 单独离线备份。DNS、系统信任库导入和根 CA 轮换仍是部署验收，不声称已在当前开发机的其他客户端完成。
 - Controller 与 Web 两个派生镜像均实际构建成功，用户证书 Caddyfile 使用临时一天证书通过真实 `caddy validate`。最终执行 `bash scripts/test-all.sh`：全仓库 113 个 Rust 测试、前端 TypeScript 检查、8 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
+
+## 2026-08-11：Jackett 通用 Arch Guest 全流程
+
+- 失败现场确认 Jackett 的 .NET 编译已经产出全部 DLL，但 `dotnet build-server shutdown` 持续等待。Guest `/proc` 快照显示退出的 dotnet server 成为 `PPid=1` 的 zombie；根因是此前把 Guest Agent 直接指定为 PID 1，却没有标准 init 的孤儿进程回收行为，不是 Jackett、NuGet 或某个环境变量的问题。
+- Profile 本身已经是安装 `base`、`linux`、`base-devel`、`devtools` 和 `namcap` 的 Arch Linux 构建机。修复后由 Profile 自带 systemd 作为 PID 1，Guest Agent 作为一次性 service；没有保留 .NET 专用环境变量。Profile `0f552a4c63fba330d77494b528fe5a8a8a27faf4e3b158d623531962e15ecee6` 的真实 KVM fixture Job `b4b43ccd-d0b5-4ae1-ae57-19d2372a1d84` 成功。
+- 同一 AUR commit、VCS commit、完整 Source Manifest、Provider 选择和审计策略对应的历史自动通过结果可复用；人工批准不能复用。Jackett 新 Revision 的真实 Fetch 成功后直接生成 `approved` AuditBundle，没有再次创建三个 Agent Run。相关回归测试同时验证首次内容仍会创建三个低成本 Agent。
+- Jackett Build Job `60966ae4-0348-4579-adc2-d1adad915e8e` 使用 systemd Profile、直接公网和未注入生态专用变量，一次构建成功。Release `5517a782-9bff-4991-9109-025b943cd9b8` 已提交，Manifest SHA-256 为 `1e197117f22421c32cc4aad064068c865860378fe4585b2fd3e6929515608238`；ArchiveCopy `45719e5f-47a7-48ba-ba55-db64e304f4d0` 状态为 `verified`，Receipt SHA-256 为 `45f3136b02854dc8548113f7e1a0091fc54da775be0ca870b71fea7f43df9f52`。
+- Publisher hot set 实际包含并可通过 HTTP 200 下载 `jackett-0.24.2307-1-x86_64.pkg.tar.zst`（4,328,821 字节）及 `aursmith.db`。Controller 公网入口继续使用 `desktop.shgao.top` 的 Let's Encrypt 证书，签发者为 YE1，有效期至 2026-11-09。
+- 排查还发现已取消 Job 所属的旧 ReleaseBatch 会被后续状态推进再次唤醒。控制面现会在创建同包新重建批次时原子标记所有未完成旧批次为 `superseded`，取消其活跃 Job/Attempt，并记录事件。部署结束后 Controller、Builder、Publisher 和 Archiver 均健康，没有运行中、已派发或 uncertain Job，也没有残留 QEMU 进程。
+- 本轮实际执行 Guest 10 项、Worker 29 项和 Controller 47 项测试，均通过；最后的旧批次 supersede 改动另执行对应定向回归测试并通过。Compose 安全检查与 `git diff --check` 通过。没有把未运行的全仓库统一脚本描述为已验证。
