@@ -28,7 +28,7 @@ services:
       AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
       AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
       AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
-      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: /run/aursmith-caddy-data/caddy/pki/authorities/local/root.crt
+      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: ${AURSMITH_CLIENT_CA_CERTIFICATE_FILE-/run/aursmith-caddy-data/caddy/pki/authorities/local/root.crt}
       AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
       AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
       AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}

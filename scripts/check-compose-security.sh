@@ -110,6 +110,16 @@ if [[ "$(jq '(.services.web.networks | has("edge")) and (.services["backup-ssh"]
   echo "Web 和 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2
   exit 1
 fi
+external_tls_json="$(
+  AURSMITH_WEB_TLS_FULLCHAIN_FILE=/dev/null \
+  AURSMITH_WEB_TLS_PRIVATE_KEY_FILE=/dev/null \
+    docker compose -f deploy/controller/compose.yaml -f deploy/controller/compose.external-tls.yaml config --format json
+)"
+if [[ "$(jq '[.services.web.secrets[]? | select(.source == "web_tls_fullchain" or .source == "web_tls_private_key")] | length' <<<"${external_tls_json}")" != "2" ]] \
+  || jq -e '.services.controller.secrets[]? | select(.source == "web_tls_private_key")' <<<"${external_tls_json}" >/dev/null; then
+  echo "公网 TLS 私钥只能挂载到 Web 容器" >&2
+  exit 1
+fi
 
 archiver_json="$(docker compose -f deploy/archiver/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_pull_key" or .source == "publisher_known_hosts")] | length' <<<"${archiver_json}")" != "2" ]]; then

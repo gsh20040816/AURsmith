@@ -53,6 +53,8 @@ Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自�
 
 ## 启动顺序
 
+Controller Web 默认使用内部 CA。已有公网证书时，额外加载 `deploy/controller/compose.external-tls.yaml`，并通过 `AURSMITH_WEB_TLS_FULLCHAIN_FILE` 和 `AURSMITH_WEB_TLS_PRIVATE_KEY_FILE` 指向宿主证书副本。外部证书只作为 Web 容器的只读 secret，Controller 不挂载私钥；同时将 `AURSMITH_CLIENT_CA_CERTIFICATE_FILE` 设为空，客户端引导不再错误提示导入内部 CA。证书续期后必须替换 secret 副本并重建 Web 容器。
+
 1. 启动 Publisher 和 Archiver Stack。
 2. 启动至少一个 Builder Stack。
 3. 启动 Controller Stack。
