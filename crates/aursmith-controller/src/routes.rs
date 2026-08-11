@@ -99,6 +99,7 @@ pub fn router(state: AppState) -> Router {
             get(crate::profiles::recommendations),
         )
         .route("/api/v1/audits", get(crate::audits::list))
+        .route("/api/v1/audits/{bundle}/retry", post(crate::audits::retry))
         .route(
             "/api/v1/audits/{bundle}/manual-decision",
             post(crate::audits::manual_decision),

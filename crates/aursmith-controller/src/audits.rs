@@ -1,4 +1,8 @@
-use crate::{auth, error::ApiError, routes::AppState};
+use crate::{
+    auth,
+    error::ApiError,
+    routes::{AppState, append_event_in_transaction},
+};
 use aursmith_domain::{AgentVerdict, AuditDecision, LowCostRoute};
 use axum::{
     Json,
@@ -188,9 +192,9 @@ async fn record_failure(
     sqlx::query("UPDATE agent_runs SET status = 'failed', verdict = 'error', raw_output_json = ?, finished_at = ? WHERE id = ?")
         .bind(json!({"error": error}).to_string()).bind(Utc::now()).bind(run_id)
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    if attempt == 0 {
-        sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, ?, ?, 1, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
-            .bind(Uuid::new_v4().to_string()).bind(bundle).bind(tier).bind(slot)
+    if attempt % 2 == 0 {
+        sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, ?, ?, ?, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
+            .bind(Uuid::new_v4().to_string()).bind(bundle).bind(tier).bind(slot).bind(attempt + 1)
             .execute(&state.database).await.map_err(ApiError::internal)?;
         return Ok(());
     }
@@ -247,9 +251,25 @@ async fn evaluate(state: &AppState, bundle: &str, tier: &str) -> Result<(), ApiE
 }
 
 async fn schedule_high_cost(state: &AppState, bundle: &str) -> Result<(), ApiError> {
-    sqlx::query("INSERT OR IGNORE INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'high', 1, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
-        .bind(Uuid::new_v4().to_string()).bind(bundle).execute(&state.database).await.map_err(ApiError::internal)?;
+    let maximum: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(attempt) FROM agent_runs WHERE audit_bundle_sha256 = ? AND tier = 'high' AND slot = 1",
+    )
+    .bind(bundle)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let attempt = next_attempt_generation(maximum);
+    sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'high', 1, ?, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
+        .bind(Uuid::new_v4().to_string()).bind(bundle).bind(attempt).execute(&state.database).await.map_err(ApiError::internal)?;
     Ok(())
+}
+
+fn next_attempt_generation(maximum: Option<i64>) -> i64 {
+    match maximum {
+        None => 0,
+        Some(value) if value % 2 == 0 => value + 2,
+        Some(value) => value + 1,
+    }
 }
 
 fn random_high_cost_review_selected(bundle: &str, basis_points: i64) -> bool {
@@ -423,6 +443,93 @@ pub async fn manual_decision(
     Ok(Json(json!({"bundle_sha256": bundle, "decision": decision})))
 }
 
+pub async fn retry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(bundle): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    let row = sqlx::query("SELECT revision_id, state FROM audit_bundles WHERE sha256 = ?")
+        .bind(&bundle)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("AuditBundle 不存在"))?;
+    if row.get::<String, _>("state") != "manual_review" {
+        return Err(ApiError::conflict(
+            "AUDIT_NOT_RETRYABLE",
+            "只有处于人工复核状态的审计可以重新运行",
+        ));
+    }
+    let active_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runs WHERE audit_bundle_sha256 = ? AND status IN ('pending', 'running')",
+    )
+    .bind(&bundle)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    if active_runs != 0 {
+        return Err(ApiError::conflict(
+            "AUDIT_ALREADY_RUNNING",
+            "该审计已有正在等待或运行的 Agent",
+        ));
+    }
+    let revision_id: String = row.get("revision_id");
+    let mut attempts = Vec::with_capacity(3);
+    for slot in 1_i64..=3 {
+        let maximum: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(attempt) FROM agent_runs WHERE audit_bundle_sha256 = ? AND tier = 'low' AND slot = ?",
+        )
+        .bind(&bundle)
+        .bind(slot)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+        let attempt = next_attempt_generation(maximum);
+        sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'low', ?, ?, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&bundle)
+            .bind(slot)
+            .bind(attempt)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        attempts.push(json!({"slot": slot, "attempt": attempt}));
+    }
+    sqlx::query("UPDATE audit_bundles SET state = 'agent_pending' WHERE sha256 = ?")
+        .bind(&bundle)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE revisions SET state = 'audit_pending' WHERE id = ?")
+        .bind(&revision_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE manual_actions SET state = 'completed', completed_at = ? WHERE aggregate_type = 'revision' AND aggregate_id = ? AND state = 'pending'")
+        .bind(Utc::now())
+        .bind(&revision_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    append_event_in_transaction(
+        &mut transaction,
+        "revision",
+        &revision_id,
+        "audit_retried",
+        json!({"bundle_sha256": bundle, "attempts": attempts}),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "bundle_sha256": bundle,
+        "state": "agent_pending",
+        "attempts": attempts
+    })))
+}
+
 fn parse_json<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, ApiError> {
     serde_json::from_str(value).map_err(ApiError::internal)
 }
@@ -453,6 +560,15 @@ mod tests {
             ]),
             LowCostRoute::ManualReview
         );
+    }
+
+    #[test]
+    fn retry_starts_a_new_two_attempt_generation() {
+        assert_eq!(next_attempt_generation(None), 0);
+        assert_eq!(next_attempt_generation(Some(0)), 2);
+        assert_eq!(next_attempt_generation(Some(1)), 2);
+        assert_eq!(next_attempt_generation(Some(2)), 4);
+        assert_eq!(next_attempt_generation(Some(3)), 4);
     }
 
     async fn fixture(verdicts: [&str; 3]) -> AppState {
