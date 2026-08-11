@@ -142,6 +142,54 @@ pub async fn activate(
     Ok(Json(json!({"id": id, "state": "active"})))
 }
 
+pub async fn deactivate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    let row = sqlx::query("SELECT state, manifest_sha256 FROM build_profiles WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.database)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("Profile 不存在"))?;
+    if row.get::<String, _>("state") != "active" {
+        return Err(ApiError::conflict(
+            "PROFILE_NOT_ACTIVE",
+            "只有 active Profile 可以停用",
+        ));
+    }
+    let active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM build_profiles WHERE state = 'active'")
+            .fetch_one(&state.database)
+            .await
+            .map_err(ApiError::internal)?;
+    if active <= 1 {
+        return Err(ApiError::conflict(
+            "LAST_ACTIVE_PROFILE",
+            "至少保留一个 active Profile",
+        ));
+    }
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("UPDATE build_profiles SET state = 'inactive' WHERE id = ? AND state = 'active'")
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    crate::routes::append_event_in_transaction(
+        &mut transaction,
+        "build_profile",
+        &id,
+        "profile_deactivated",
+        json!({"profile_sha256": row.get::<String,_>("manifest_sha256")}),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"id": id, "state": "inactive"})))
+}
+
 pub async fn recommendations(
     State(state): State<AppState>,
     headers: HeaderMap,

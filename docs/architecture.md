@@ -123,7 +123,7 @@ pacoloco 暴露的请求、命中、未命中、错误、缓存字节和包数�
 
 Profile 构建器是按需启用的一次性 Compose 服务，不是常驻裸机工具。镜像构建阶段使用部署者选择的 Arch HTTPS 镜像安装完整且同步的 Arch 根文件系统，把同一 mirrorlist 写入 Guest，嵌入 Guest Agent、生成显式包含 virtio 块设备、控制台和 9p 驱动的 initramfs，并通过 `mkfs.ext4 -d` 和 `qemu-img` 生成 qcow2，无需 privileged 或宿主文件系统挂载。导出阶段断网、只读、零 capability，只产生固定四个文件和待 Controller 授权的 candidate；candidate 明确记录镜像地址。
 
-Profile 页面接受 profile-builder 生成的 `profile-candidate.json`，通过认证 API 得到 Controller 签名 Envelope 并提供下载；大体积 qcow2、内核和 initramfs 不经过浏览器，仍由管理员复制到 Builder Profile 卷。Builder 心跳发现对应摘要目录后才有资格接收 fixture Job，fixture 成功前 UI 和 API 都拒绝激活。
+Profile 页面接受 profile-builder 生成的 `profile-candidate.json`，通过认证 API 得到 Controller 签名 Envelope 并提供下载；大体积 qcow2、内核和 initramfs 不经过浏览器，仍由管理员复制到 Builder Profile 卷。Builder 心跳发现对应摘要目录后才有资格接收 fixture Job，fixture 成功前 UI 和 API 都拒绝激活。已激活 Profile 可通过正式接口停用并记录事件，但系统至少保留一个 active Profile，避免后续任务全部失去可用构建环境。
 
 开发期 KVM 冒烟使用协议 crate 下的 `prepare_kvm_fixture` example。它只使用固定测试密钥，在用户指定的临时目录中复用正式 Envelope 代码签署 ProfileFixture，不参与镜像或生产 Stack。验证结束必须删除临时运行目录；正式环境只能由 Controller 签发 Profile 和 JobSpec。
 

@@ -95,6 +95,10 @@ pub fn router(state: AppState) -> Router {
             post(crate::profiles::activate),
         )
         .route(
+            "/api/v1/profiles/{id}/deactivate",
+            post(crate::profiles::deactivate),
+        )
+        .route(
             "/api/v1/profile-recommendations",
             get(crate::profiles::recommendations),
         )
