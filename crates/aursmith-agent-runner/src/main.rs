@@ -439,7 +439,14 @@ async fn execute(
 
 fn ensure_success(output: &std::process::Output) -> anyhow::Result<()> {
     if !output.status.success() {
-        bail!("Agent 适配器非零退出（状态 {}）", output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .replace("credential-is-in-gateway", "[redacted]");
+        let diagnostic = stderr.chars().take(4096).collect::<String>();
+        bail!(
+            "Agent 适配器非零退出（状态 {}）：{}",
+            output.status,
+            diagnostic.trim()
+        );
     }
     Ok(())
 }
@@ -534,5 +541,19 @@ mod tests {
         .await
         .unwrap();
         assert!(ensure_success(&output).is_err());
+    }
+
+    #[test]
+    fn adapter_failure_keeps_bounded_stderr_without_gateway_credential() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"provider rejected credential-is-in-gateway".to_vec(),
+        };
+        let error = ensure_success(&output).unwrap_err().to_string();
+        assert!(error.contains("provider rejected [redacted]"));
+        assert!(!error.contains("credential-is-in-gateway"));
     }
 }
