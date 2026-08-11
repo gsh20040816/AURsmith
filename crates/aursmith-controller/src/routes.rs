@@ -85,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
+        .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/jobs/{id}/evidence", get(job_evidence))
         .route(
             "/api/v1/profiles",
@@ -1412,6 +1413,44 @@ async fn list_jobs(
         })
         .collect();
     Ok(Json(json!({"items": items})))
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = auth::require_administrator(&state, &headers).await?;
+    Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("INVALID_JOB_ID", "Job ID 无效"))?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("Job 不存在"))?;
+    if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Err(ApiError::conflict(
+            "JOB_ALREADY_TERMINAL",
+            "已结束的 Job 不能取消",
+        ));
+    }
+    let now = Utc::now();
+    sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'USER_CANCELLED', updated_at = ? WHERE id = ?")
+        .bind(now).bind(&id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status NOT IN ('succeeded', 'failed', 'cancelled')")
+        .bind(now).bind(&id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    append_event_in_transaction(
+        &mut transaction,
+        "job",
+        &id,
+        "job_cancelled",
+        json!({"previous_status": status}),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"id": id, "status": "cancelled"})))
 }
 
 async fn job_evidence(

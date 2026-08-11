@@ -795,7 +795,7 @@ pub(crate) async fn complete_fetch(
         serde_json::to_value(&result.resolved_dependencies).map_err(ApiError::internal)?;
     payload["selected_upstream_source_files"] =
         serde_json::to_value(&result.audit_files).map_err(ApiError::internal)?;
-    let coverage = json!({
+    let mut coverage = json!({
         "aur_wrapper": {
             "mode": "complete",
             "files": payload["files"].as_array().map(|files| files.iter().filter_map(|file| file["path"].as_str()).collect::<Vec<_>>()).unwrap_or_default()
@@ -810,22 +810,64 @@ pub(crate) async fn complete_fetch(
     });
     let findings: Value =
         serde_json::from_str(row.get("deterministic_findings_json")).map_err(ApiError::internal)?;
+    let reusable_audit = sqlx::query(
+        "SELECT audit_bundles.sha256, audit_decisions.decision, audit_decisions.report_sha256, previous.id AS revision_id FROM revisions AS current JOIN revisions AS previous ON previous.package_base = current.package_base AND previous.id != current.id AND previous.aur_commit = current.aur_commit AND COALESCE(previous.vcs_commit, '') = COALESCE(current.vcs_commit, '') AND previous.audit_policy_version = current.audit_policy_version AND previous.provider_selection_sha256 = current.provider_selection_sha256 JOIN audit_bundles ON audit_bundles.revision_id = previous.id AND audit_bundles.state = 'approved' JOIN audit_decisions ON audit_decisions.audit_bundle_sha256 = audit_bundles.sha256 AND audit_decisions.decision IN ('approved_by_low_cost', 'approved_by_high_cost') WHERE current.id = ? AND previous.source_manifest_sha256 = ? ORDER BY audit_decisions.created_at DESC LIMIT 1",
+    )
+    .bind(revision_id)
+    .bind(&result.source_manifest_sha256)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(reused) = &reusable_audit {
+        payload["audit_reuse"] = json!({
+            "source_bundle_sha256": reused.get::<String, _>("sha256"),
+            "source_revision_id": reused.get::<String, _>("revision_id"),
+            "reason": "AUR commit、VCS commit、源码清单、Provider 选择和审计策略均未变化"
+        });
+        coverage["audit_reuse"] = json!({
+            "mode": "content_addressed_automatic_decision",
+            "source_bundle_sha256": reused.get::<String, _>("sha256")
+        });
+    }
     let bundle_document = json!({
         "policy_version": "v1",
-        "payload": payload,
-        "coverage": coverage,
-        "deterministic_findings": findings
+        "payload": &payload,
+        "coverage": &coverage,
+        "deterministic_findings": &findings
     });
     let bundle_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&bundle_document).map_err(ApiError::internal)?,
     ));
-    sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', ?, ?, ?, 'agent_pending', ?)")
+    let audit_state = if reusable_audit.is_some() {
+        "approved"
+    } else {
+        "agent_pending"
+    };
+    sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', ?, ?, ?, ?, ?)")
         .bind(&bundle_sha256).bind(revision_id).bind(payload.to_string()).bind(coverage.to_string())
-        .bind(findings.to_string()).bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
-    for slot in 1..=3 {
-        sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'low', ?, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
-            .bind(Uuid::new_v4().to_string()).bind(&bundle_sha256).bind(slot)
+        .bind(findings.to_string()).bind(audit_state).bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+    if let Some(reused) = &reusable_audit {
+        sqlx::query("INSERT INTO audit_decisions(id, revision_id, audit_bundle_sha256, policy_version, decision, decided_by, rationale, report_sha256, created_at) VALUES (?, ?, ?, 'v1', ?, 'audit_reuse', ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(revision_id).bind(&bundle_sha256)
+            .bind(reused.get::<String,_>("decision"))
+            .bind(format!("复用内容完全相同的自动审计 {}", reused.get::<String,_>("sha256")))
+            .bind(reused.get::<String,_>("report_sha256")).bind(Utc::now())
             .execute(&mut **transaction).await.map_err(ApiError::internal)?;
+        append_event_in_transaction(
+            transaction,
+            "revision",
+            revision_id,
+            "audit_reused",
+            json!({"source_bundle_sha256": reused.get::<String,_>("sha256"), "audit_bundle_sha256": bundle_sha256}),
+            "scheduler",
+        )
+        .await?;
+    } else {
+        for slot in 1..=3 {
+            sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, 'low', ?, 0, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
+                .bind(Uuid::new_v4().to_string()).bind(&bundle_sha256).bind(slot)
+                .execute(&mut **transaction).await.map_err(ApiError::internal)?;
+        }
     }
     sqlx::query(
         "UPDATE audit_pre_scans SET state = 'consumed', consumed_at = ? WHERE revision_id = ?",
@@ -835,7 +877,13 @@ pub(crate) async fn complete_fetch(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("UPDATE revisions SET state = 'audit_pending', source_manifest_sha256 = ?, dependency_snapshot_sha256 = ? WHERE id = ?")
+    let revision_state = if reusable_audit.is_some() {
+        "audit_approved"
+    } else {
+        "audit_pending"
+    };
+    sqlx::query("UPDATE revisions SET state = ?, source_manifest_sha256 = ?, dependency_snapshot_sha256 = ? WHERE id = ?")
+    .bind(revision_state)
     .bind(&result.source_manifest_sha256)
     .bind(&result.dependency_snapshot_sha256)
     .bind(revision_id)
@@ -1031,7 +1079,11 @@ pub(crate) async fn schedule_rebuild_batch(
             .bind(previous.get::<String,_>("provider_selection_sha256")).bind(rebuild_generation).bind(&metadata_json).bind(now)
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("INSERT INTO revision_dependencies(revision_id, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json) SELECT ?, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json FROM revision_dependencies WHERE revision_id = ?")
-            .bind(&revision_id).bind(previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+            .bind(&revision_id).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'SUPERSEDED_REBUILD', updated_at = ? WHERE revision_id = ? AND kind IN ('fetch', 'build') AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
+            .bind(now).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE revision_id = ? AND failure_code = 'SUPERSEDED_REBUILD') AND status NOT IN ('succeeded', 'failed', 'cancelled')")
+            .bind(now).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         create_audit_pre_scan(&mut transaction, &revision_id, &snapshot).await?;
         sqlx::query("INSERT INTO release_batch_revisions(batch_id, revision_id, build_order) VALUES (?, ?, ?)")
             .bind(&batch_id).bind(&revision_id).bind(i64::try_from(index).map_err(ApiError::internal)?)
@@ -2716,6 +2768,109 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending_runs, 3, "完整 Fetch 结果必须启动三个低成本 Agent");
+    }
+
+    #[tokio::test]
+    async fn rebuild_reuses_unchanged_automatic_audit() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let created = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        let previous_revision = created["revision_id"].as_str().unwrap();
+        let source_manifest_sha256 = "a".repeat(64);
+        let previous_bundle = "e".repeat(64);
+        sqlx::query("UPDATE revisions SET source_manifest_sha256 = ?, state = 'audit_approved' WHERE id = ?")
+            .bind(&source_manifest_sha256)
+            .bind(previous_revision)
+            .execute(&database)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, ?, 'v1', '{}', '{}', '[]', 'approved', ?)")
+            .bind(&previous_bundle)
+            .bind(previous_revision)
+            .bind(Utc::now())
+            .execute(&database)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audit_decisions(id, revision_id, audit_bundle_sha256, policy_version, decision, decided_by, rationale, report_sha256, created_at) VALUES (?, ?, ?, 'v1', 'approved_by_low_cost', 'agent_orchestrator', NULL, ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(previous_revision)
+            .bind(&previous_bundle)
+            .bind("f".repeat(64))
+            .bind(Utc::now())
+            .execute(&database)
+            .await
+            .unwrap();
+
+        schedule_rebuild_batch(
+            &database,
+            BTreeSet::from(["demo".to_owned()]),
+            "tester",
+            "manual_rebuild",
+        )
+        .await
+        .unwrap();
+        let revision_id: String = sqlx::query_scalar(
+            "SELECT id FROM revisions WHERE package_base = 'demo' AND id != ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(previous_revision)
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        let job_id = Uuid::new_v4();
+        let mut transaction = database.begin().await.unwrap();
+        complete_fetch(
+            &mut transaction,
+            &revision_id,
+            &aursmith_protocol::FetchResult {
+                job_id,
+                attempt: aursmith_domain::AttemptRef {
+                    job_id,
+                    attempt_id: Uuid::new_v4(),
+                    generation: 0,
+                },
+                revision_sha256: "1".repeat(64),
+                source_manifest_sha256,
+                sources: vec![],
+                audit_files: vec![],
+                resolved_dependencies: vec![],
+                dependency_download_milliseconds: 0,
+                resolved_pkgver: None,
+                dependency_snapshot_sha256: "2".repeat(64),
+                log_sha256: "3".repeat(64),
+                finished_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let agent_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        let reused: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_decisions WHERE revision_id = ? AND decided_by = 'audit_reuse'",
+        )
+        .bind(&revision_id)
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM revisions WHERE id = ?")
+            .bind(&revision_id)
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(agent_runs, 0, "固定内容不应再次调用 Agent");
+        assert_eq!(reused, 1);
+        assert_eq!(state, "audit_approved");
     }
 
     #[tokio::test]
