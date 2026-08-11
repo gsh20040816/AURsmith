@@ -55,6 +55,7 @@
 - ADR-051：Controller Web 默认使用 Caddy 内部 CA，并把 Caddy `/data` 放在独立持久卷；Controller 只读共享根证书以提供认证下载和 Doctor，不共享 CA 私钥。用户证书通过 Compose override 和 Docker secret 只进入 Caddy。根 CA 轮换保持人工维护，避免单用户第一版引入自研 PKI。
 - ADR-052：Codex 思考强度不接受任意 CLI 片段，只允许 `minimal/low/medium/high/xhigh/max` 固定枚举并通过结构化 `--config model_reasoning_effort=...` 传入。空值表示使用 provider/model 默认值；部署模板可保留为空，不能把未填写值伪装成已配置。
 - ADR-053：替换 ADR-014、ADR-018、ADR-034 和 ADR-035 中“Build VM 固定无网”的部分。第一版以实用构建成功率为优先，Builder 通过 `AURSMITH_BUILD_NETWORK` 选择 Build VM 使用 `-nic none` 或 QEMU user networking 直接访问公网；默认关闭，部署者可显式开启。Fetch VM 的代理路径、KVM 边界、只读输入、Attempt 独立输出、非 root makepkg、密钥不进入 Guest 和产物复验保持不变。BuildResult 的 provenance 必须记录 `network=none/direct`。原因是 NuGet 等生态会在正常构建命令内解析依赖，强制离线需要为每个生态重复实现预取器，不符合第一版实用优先的范围。
+- ADR-054：Guest 对所有 makepkg 子进程设置 `DOTNET_CLI_USE_MSBUILD_SERVER=0` 和 `MSBUILDUSESERVER=0`。KVM Job 是一次性环境，不从长驻 MSBuild Server 获得复用收益；禁用它可避免 PKGBUILD 执行 `dotnet build-server shutdown` 后仍等待后台进程。该环境变量不改变源码、目标框架或依赖解析，只改变 .NET 构建进程生命周期。
 
 ## 已拒绝
 

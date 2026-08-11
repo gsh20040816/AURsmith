@@ -494,7 +494,9 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyh
         .env_clear()
         .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
         .env("HOME", "/home/builder")
-        .env("LANG", "C.UTF-8");
+        .env("LANG", "C.UTF-8")
+        .env("DOTNET_CLI_USE_MSBUILD_SERVER", "0")
+        .env("MSBUILDUSESERVER", "0");
     if network {
         command
             .env("http_proxy", "http://10.0.2.100:8080")
