@@ -14,6 +14,7 @@ services:
       - /dev/kvm:/dev/kvm
     group_add:
       - ${KVM_GID:?请设置宿主机 KVM_GID}
+      - ${AURSMITH_SECRET_GID:?请设置宿主机部署密钥所属 GID}
     environment:
       AURSMITH_WORKER_NAME: ${AURSMITH_WORKER_NAME:-compute-01}
       AURSMITH_WORKER_ROLE: builder
