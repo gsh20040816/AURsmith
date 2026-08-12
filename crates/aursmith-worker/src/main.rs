@@ -2328,15 +2328,26 @@ fn verify_and_publish_release(
         if artifact.path != file_name || !package_names.insert(file_name.clone()) {
             bail!("Release Artifact 必须使用唯一的纯文件名");
         }
-        verify_signed_entry(
-            worker,
-            signed,
-            &aursmith_protocol::ManifestEntry {
-                path: file_name,
-                sha256: artifact.sha256.clone(),
-                size: artifact.size,
-            },
-        )?;
+        let signed_artifact = signed.join(&file_name);
+        if signed_artifact.is_file() {
+            verify_signed_entry(
+                worker,
+                signed,
+                &aursmith_protocol::ManifestEntry {
+                    path: file_name,
+                    sha256: artifact.sha256.clone(),
+                    size: artifact.size,
+                },
+            )?;
+        } else {
+            let hot = worker
+                .repository_dir
+                .join(&worker.repository_arch)
+                .join(&artifact.path);
+            if !reusable_committed_artifact(worker, artifact, &hot)? {
+                bail!("Signer 未返回新增 Artifact，且没有可复用的已提交对象");
+            }
+        }
     }
     if let Some(keyring) = &manifest.repository_keyring {
         if !package_names.insert(keyring.path.clone()) {
@@ -2396,7 +2407,16 @@ fn verify_and_publish_release(
         if let Some(parent) = staging.join(name).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        copy_regular_synced(&signed.join(name), &staging.join(name))?;
+        let signed_source = signed.join(name);
+        if signed_source.is_file() {
+            copy_regular_synced(&signed_source, &staging.join(name))?;
+        } else {
+            let hot_source = arch_root.join(name);
+            if !hot_source.is_file() {
+                bail!("Release 缺少新增或可复用文件：{name}");
+            }
+            link_or_copy_regular(&hot_source, &staging.join(name))?;
+        }
     }
     sync_directory(&staging)?;
     std::fs::create_dir_all(&releases_root)?;
@@ -2799,6 +2819,18 @@ fn copy_regular_synced(source: &Path, target: &Path) -> anyhow::Result<()> {
     std::fs::copy(source, target)?;
     std::fs::File::open(target)?.sync_all()?;
     Ok(())
+}
+
+fn link_or_copy_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if !std::fs::symlink_metadata(source)?.file_type().is_file() {
+        bail!("拒绝复用非普通文件：{}", source.display());
+    }
+    match std::fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        // EXDEV 在 Linux 上固定为 18；仅跨文件系统时退回复制。
+        Err(error) if error.raw_os_error() == Some(18) => copy_regular_synced(source, target),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn copy_new_or_verify(source: &Path, target: &Path) -> anyhow::Result<()> {

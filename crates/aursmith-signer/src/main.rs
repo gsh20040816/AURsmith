@@ -119,7 +119,6 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     }
     fs::create_dir_all(&staging)?;
     let mut package_paths = Vec::new();
-    let mut reused_package_paths = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         let source = entry.path().join(&artifact.path);
         if source.is_file() {
@@ -133,7 +132,6 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
             package_paths.push(destination);
         } else {
             let reusable = find_reusable_package(cli, artifact)?;
-            reused_package_paths.insert(reusable.clone());
             package_paths.push(reusable);
         }
     }
@@ -197,16 +195,6 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         release_authorization: Some(file_entry(&authorization_destination)?),
         committed_at: Utc::now(),
     };
-    for artifact in &manifest.artifacts {
-        let source = cli.repository.join("x86_64").join(&artifact.path);
-        if reused_package_paths.contains(&source) {
-            fs::copy(&source, staging.join(&artifact.path))?;
-            fs::copy(
-                source.with_file_name(format!("{}.sig", artifact.path)),
-                staging.join(format!("{}.sig", artifact.path)),
-            )?;
-        }
-    }
     fs::write(
         staging.join("release-manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -409,11 +397,11 @@ fn validate_authorization(
             bail!("Artifact 不是 Arch 软件包");
         }
         let path = root.join(&artifact.path);
-        let path = if path.is_file() {
-            path
-        } else {
-            find_reusable_package(cli, artifact)?
-        };
+        if !path.is_file() {
+            find_reusable_package(cli, artifact)?;
+            package_names.insert(artifact.package_name.clone().unwrap_or_default());
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file()
             || metadata.len() != artifact.size
