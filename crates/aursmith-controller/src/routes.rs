@@ -528,6 +528,27 @@ async fn doctor_status(
     let profile_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM build_profiles WHERE state = 'active' AND last_verified_at IS NOT NULL")
         .fetch_one(&state.database).await.map_err(ApiError::internal)?;
     checks.push(json!({"id": "active-profile", "ok": profile_count > 0, "message": format!("已验证活跃 Profile：{profile_count}")}));
+    let reported_profiles = workers
+        .iter()
+        .filter(|row| row.get::<String, _>("role") == "builder")
+        .filter_map(|row| row.get::<Option<String>, _>("status_json"))
+        .filter_map(|value| serde_json::from_str::<Value>(&value).ok())
+        .flat_map(|status| status["profiles"].as_array().cloned().unwrap_or_default())
+        .filter_map(|profile| profile.as_str().map(ToOwned::to_owned))
+        .collect::<BTreeSet<_>>();
+    let authorized_profiles =
+        sqlx::query_scalar::<_, String>("SELECT manifest_sha256 FROM build_profiles")
+            .fetch_all(&state.database)
+            .await
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+    let unregistered_profiles = reported_profiles.difference(&authorized_profiles).count();
+    checks.push(json!({
+        "id": "builder-profile-registration",
+        "ok": unregistered_profiles == 0,
+        "message": format!("Builder 已存在但 Controller 未登记的 Profile：{unregistered_profiles}"),
+    }));
     let fingerprint_ready: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM system_settings WHERE key = 'repository_gpg_fingerprint'",
     )

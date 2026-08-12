@@ -700,8 +700,12 @@ async fn enqueue_fetch_jobs(
     let Some(profile_sha256) = profile_sha256 else {
         sqlx::query("UPDATE release_batches SET state = 'awaiting_profile', failure_reason = '没有已验证且激活的 Build Profile', updated_at = ? WHERE id = ?")
             .bind(Utc::now()).bind(batch_id).execute(&mut **transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE revisions SET state = 'awaiting_profile' WHERE id IN (SELECT revision_id FROM release_batch_revisions WHERE batch_id = ?) AND state = 'fetching'")
+            .bind(batch_id).execute(&mut **transaction).await.map_err(ApiError::internal)?;
         return Ok(false);
     };
+    sqlx::query("UPDATE revisions SET state = 'fetching' WHERE id IN (SELECT revision_id FROM release_batch_revisions WHERE batch_id = ?) AND state = 'awaiting_profile'")
+        .bind(batch_id).execute(&mut **transaction).await.map_err(ApiError::internal)?;
     let rows = sqlx::query(
         "SELECT revisions.id, revisions.input_sha256, audit_pre_scans.payload_json FROM release_batch_revisions JOIN revisions ON revisions.id = release_batch_revisions.revision_id JOIN audit_pre_scans ON audit_pre_scans.revision_id = revisions.id WHERE release_batch_revisions.batch_id = ? AND audit_pre_scans.state = 'ready_for_fetch' AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = release_batch_revisions.batch_id AND jobs.revision_id = revisions.id AND jobs.kind = 'fetch') ORDER BY release_batch_revisions.build_order",
     )
@@ -2547,6 +2551,12 @@ mod tests {
         assert_eq!(revisions.len(), 2);
         assert_eq!(revisions[0].0, first_revision);
         assert_eq!(revisions[0].1, revisions[1].1);
+        let revision_state: String = sqlx::query_scalar("SELECT state FROM revisions WHERE id = ?")
+            .bind(&revisions[1].0)
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(revision_state, "awaiting_profile");
         let new_pre_scan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_pre_scans WHERE revision_id = ? AND state = 'ready_for_fetch'")
             .bind(&revisions[1].0).fetch_one(&database).await.unwrap();
         assert_eq!(new_pre_scan, 1);
@@ -2743,7 +2753,7 @@ mod tests {
         .await
         .unwrap();
         assert!(states.contains(&"superseded".to_owned()));
-        assert!(states.contains(&"fetching".to_owned()));
+        assert!(states.contains(&"awaiting_profile".to_owned()));
         let agent_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
             .fetch_one(&database)
             .await

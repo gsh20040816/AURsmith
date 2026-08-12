@@ -445,6 +445,21 @@ fn makepkg_arguments(allow_check: bool) -> Vec<&'static str> {
     arguments
 }
 
+fn builder_command_arguments<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
+    let mut command = vec![
+        "-u",
+        "builder",
+        "--",
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/bin",
+        "HOME=/home/builder",
+        "LANG=C.UTF-8",
+    ];
+    command.extend_from_slice(arguments);
+    command
+}
+
 fn validate_expected_outputs(
     artifacts: &[ArtifactRecord],
     expected_outputs: &[String],
@@ -486,7 +501,7 @@ fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)
 
 fn run_as_builder(arguments: &[&str], log: Option<&Path>) -> anyhow::Result<()> {
     let mut command = Command::new("/usr/bin/runuser");
-    command.args(["-u", "builder", "--"]).args(arguments);
+    command.args(builder_command_arguments(arguments));
     command.current_dir(BUILD).stdin(Stdio::null());
     command
         .env_clear()
@@ -893,6 +908,16 @@ mod tests {
         assert!(!command_line_enables_build_network(
             "root=/dev/vda aursmith.build_network=0"
         ));
+    }
+
+    #[test]
+    fn builder_command_resets_the_post_pam_environment() {
+        let command = builder_command_arguments(&["/usr/bin/makepkg", "--verifysource"]);
+        assert_eq!(command[3], "/usr/bin/env");
+        assert_eq!(command[4], "-i");
+        assert!(command.contains(&"HOME=/home/builder"));
+        assert!(!command.iter().any(|value| value.contains("PROXY")));
+        assert_eq!(command.last(), Some(&"--verifysource"));
     }
 
     #[test]
