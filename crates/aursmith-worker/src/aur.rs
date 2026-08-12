@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::Path, process::Stdio, time::Duration};
@@ -148,15 +148,28 @@ impl AurClient {
         let name = validate_package_base(name)?;
         let mut url = Url::parse("https://archlinux.org/packages/search/json/")?;
         url.query_pairs_mut().append_pair("q", name);
-        let payload: OfficialSearchResponse = self
-            .http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("Arch 官方仓库接口返回无效 JSON")?;
+        let mut delay = Duration::from_millis(500);
+        let payload = loop {
+            let response = self.http.get(url.clone()).send().await?;
+            if response.status().is_success() {
+                break response
+                    .json::<OfficialSearchResponse>()
+                    .await
+                    .context("Arch 官方仓库接口返回无效 JSON")?;
+            }
+            if !matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ) || delay > Duration::from_secs(2)
+            {
+                response.error_for_status()?;
+            }
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        };
         Ok(payload
             .results
             .into_iter()
