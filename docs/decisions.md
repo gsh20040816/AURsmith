@@ -60,6 +60,7 @@
 - ADR-056：Guest 恢复标准 Arch Linux 启动模型。真实 Jackett 诊断显示 Guest Agent 被错误地指定为 PID 1，却未回收孤儿进程，多个 GPG 和 .NET 进程成为 `PPid=1` 的 zombie；`dotnet build-server shutdown` 因等待已退出但未回收的 server PID 而阻塞 makepkg。本机 init 会正常回收，故同一 PKGBUILD 本机构建无此问题。修复方式是由 Profile 已安装的 systemd 作为 PID 1，并把 Guest Agent 注册成一次性 service；不自行实现 init，也不注入生态专用变量。这对所有会派生后台进程的构建工具生效。
 - ADR-057：每个 Release 固定包含 Signer 派生的 `aursmith-keyring`，而不是由 Publisher 手工写入 hot 目录。Controller 只授权生成行为，私钥仍不离开断网 Signer；Publisher 使用自己固定的公钥指纹复验包内 keyring。首次信任仍要求人工核对指纹，后续安装和轮换使用标准 `pacman-key --populate aursmith`。
 - ADR-058：真实单用户拓扑将 Controller、Agent、Publisher、Signer 和第一版 Archiver 放在公网 `netcup`，Builder 留在具有 KVM 的家庭桌面机。Builder 不开放公网入站端口，Controller 不再主动 SSH 调度它；Builder 以持久 Ed25519 身份通过 HTTPS 长轮询领取 Controller 签名 JobSpec、上报 Journal 状态，并使用 Controller 签名 TransferCapability 主动 rsync 推送产物到 Publisher。拒绝端口映射、反向隧道和让公网 Publisher 回连家庭 Builder；Publisher 与 Archiver 同机只是第一版部署选择，不取消 ArchiveCopy 的独立状态和未来迁移边界。
+- ADR-059：替换 ADR-002、ADR-022、ADR-028、ADR-029 和 ADR-058 中“第一版必须部署独立 Archiver”的部分。单用户、少量客户端不需要永久保存每个完整 Release；第一版由 Publisher 根据 GPG 签名的 Release Manifest 自动保留当前 Release、最近 30 天全部 Release，以及每个 `pkgname` 最近 3 个不同版本所需的 Release。任何清单、签名或当前指针异常都会停止清理。外部 Archiver 协议代码作为未来可选能力保留，但默认不调度、不进入 Doctor 必选项，也不部署 Archiver Stack。Controller 每日签名备份继续保存在自身持久卷，密钥材料仍要求离线备份。
 
 ## 已拒绝
 

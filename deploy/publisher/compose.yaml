@@ -29,6 +29,8 @@ services:
       AURSMITH_REPOSITORY_ARCH: ${AURSMITH_REPOSITORY_ARCH:-x86_64}
       AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE: /run/secrets/repository_gpg_public_key
       AURSMITH_PUBLISHER_GPG_HOME: /run/aursmith-gpg
+      AURSMITH_RELEASE_RETENTION_DAYS: ${AURSMITH_RELEASE_RETENTION_DAYS:-30}
+      AURSMITH_RELEASE_RETENTION_MIN_VERSIONS: ${AURSMITH_RELEASE_RETENTION_MIN_VERSIONS:-3}
       AURSMITH_JOBS_DIR: /jobs
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     volumes:
@@ -97,6 +99,7 @@ services:
     volumes:
       - worker-run:/run/aursmith
       - publisher-staging:/jobs:ro
+      - publisher-landing:/landing
       - ../common/sshd_config:/etc/ssh/sshd_config:ro
     secrets:
       - ssh_host_ed25519_key

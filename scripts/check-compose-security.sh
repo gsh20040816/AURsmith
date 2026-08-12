@@ -80,6 +80,10 @@ if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_pu
   echo "Publisher Worker 必须只获得仓库 GPG 公钥" >&2
   exit 1
 fi
+if [[ "$(jq '[.services.ssh.volumes[]? | select(.target == "/landing" and .source == "publisher-landing" and (.read_only // false) == false)] | length' <<<"${publisher_json}")" != "1" ]]; then
+  echo "Publisher SSH 必须只通过 Publisher landing 卷接收受限 Builder 推送" >&2
+  exit 1
+fi
 if jq -e '.services.signer.secrets[]? | select(.source == "repository_gpg_public_key")' <<<"${publisher_json}" >/dev/null; then
   echo "Signer 不需要挂载仓库 GPG 公钥 secret" >&2
   exit 1

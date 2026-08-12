@@ -326,3 +326,10 @@
 - 成功 Build 的 Artifact 与三份完整证据仍由原 `TransferCapability` 绑定。Controller 先让 Publisher 建立 Capability 专属 partial 接收目录，Builder 再通过固定 host key 和独立推送密钥主动 rsync；客户端和 forced command 两侧都只允许 `/landing/.<Capability ID>.partial/` 的固定 receiver 形态。Publisher 复验完整文件集合后原子接管，Builder 下一轮签名上报完成状态；确认响应丢失时不会重复上传已经标记为 pushed 的内容。
 - `bash scripts/test-all.sh` 实际通过：全部 Rust 测试、前端 8 个 Vitest、TypeScript 检查、生产构建和 Compose 安全检查均成功。随后修改节点亲和性和断线幂等逻辑后，再次执行相关 Rust 测试、前端检查/测试/构建、Compose 检查和 `git diff --check`，全部通过。旧 Builder SSH 冒烟脚本已改为验证反向 Builder 无入站服务及推送凭据存在，实际通过。
 - 未验证范围：尚未把 Stack 迁移到 `netcup`，也未在真实公网链路上执行一次完整的“轮询领取 → KVM 构建 → rsync 推送 → Release 发布”。因此当前结论是协议、实现、Compose 与本地测试通过，不宣称远程部署已经完成。
+
+## 2026-08-12：Publisher 内置历史保留
+
+- 第一版默认拓扑不再部署独立 Archiver。Controller 只有显式设置 `AURSMITH_EXTERNAL_ARCHIVER_ENABLED=true` 才运行旧的归档传输和库存巡检；Doctor 和 Web Worker 注册默认只要求 Builder、Publisher。
+- Publisher 每次发布后和每天启动定时任务时，从 GPG 签名 Release Manifest 计算保留集合：当前 Release、最近 30 天全部 Release、每个包最近 3 个不同版本。删除 Release 后同步把 Publisher Journal 标记为 `expired`；任何签名、Manifest、目录 ID 或当前链接异常都会使整轮失败关闭。
+- 单元测试覆盖 30 天窗口、按包三个版本和当前 Release 永不删除。Controller 47 项、Worker 29 项、Journal 2 项测试全部通过；前端生产构建、Compose 安全检查和 `git diff --check` 通过。
+- netcup Compose dry run 只包含 Controller 与 Publisher 的内部 backbone；公网只需要控制台 HTTPS、仓库 HTTPS、Builder 推送 SSH 和 Fetch 代理。尚未实际迁移数据、修改 DNS 或启动远端容器，不能声称真实部署完成。

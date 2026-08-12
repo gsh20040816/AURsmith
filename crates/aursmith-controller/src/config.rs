@@ -28,6 +28,7 @@ pub struct Config {
     pub backup_dir: String,
     pub backup_export_dir: String,
     pub backup_export_socket: String,
+    pub external_archiver_enabled: bool,
 }
 
 impl Config {
@@ -103,6 +104,8 @@ impl Config {
                 .unwrap_or_else(|_| "/var/lib/aursmith/transfers".into()),
             backup_export_socket: env::var("AURSMITH_BACKUP_EXPORT_SOCKET")
                 .unwrap_or_else(|_| "/run/aursmith-controller/export.sock".into()),
+            external_archiver_enabled: env::var("AURSMITH_EXTERNAL_ARCHIVER_ENABLED")
+                .is_ok_and(|value| value == "true"),
         })
     }
 

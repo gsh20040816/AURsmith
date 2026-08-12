@@ -28,16 +28,16 @@
 | B03 | 已验证 | JobSpec、签名 Profile、完整 source tree/License、完整 Build/Fetch/QEMU/namcap 日志、依赖、GuestResult 和 Artifact 均由摘要绑定并随 Release 传输 | 第一版会重复压缩相同 Profile，后续可按内容寻址优化空间 |
 | B04 | 已验证 | 依赖统计、两周期加入/三周期移除迟滞、Profile 授权/fixture/激活/回滚有测试；无特权 pacoloco 经 Caddy 连续请求实际产生 1 miss、1 hit，指标进入 Publisher 心跳和 Controller API | Profile 的实际节省时间需在用户工作负载积累 20 次后评估 |
 | B05 | 已验证 | 清华 HTTPS 镜像进入 Profile 摘要并实际构建 Profile；Fetch Guest 真实下载、验签并记录 `tree 2.3.2-1` 与包摘要 | 无 |
-| W01 | 已验证 | 四套 Compose、无裸机服务、静态安全检查和真实容器启动 | 无 |
-| W02 | 已验证 | Builder/Publisher/Archiver 独立 Stack 与静态端点 | 无 |
+| W01 | 已验证 | 第一版三套 Compose、无裸机服务、静态安全检查和真实容器启动 | netcup 远程部署尚未实际执行 |
+| W02 | 已验证 | Builder 仅出站、Publisher 公网端点与 Controller 内部控制拓扑可渲染 | 尚未在真实公网完成端到端构建 |
 | W03 | 已验证 | OpenSSH forced command、固定 host key、rsync 跨容器传输 | 无 |
 | W04 | 已验证 | Journal、幂等、迟到拒绝、uncertain 30 分钟、最多两次基础设施重试 | 跨 Builder 的 Build 输入迁移按计划未实现，当前失败关闭 |
-| W05 | 已验证 | 多 Builder 调度、单 writer epoch、单主 Archiver | 无人值守 Publisher failover 明确延期 |
+| W05 | 已验证 | 多 Builder 调度、单 writer epoch；外部 Archiver 默认不调度 | 无人值守 Publisher failover 明确延期 |
 | R01 | 已验证 | Publisher 路径/元数据/ELF/capability 检查，断网 Signer 与 GPG | capability 包尚未走完整 Publisher→Signer E2E |
 | R02 | 已验证 | 完整 Release、repo-add、签名和数据库最后原子切换实际验证 | 空仓库签名 E2E 尚未执行，但真实 pacman 已能读取空 DB |
-| R03 | 已验证 | 签名 Release 保存 Audit、Agent、provenance、完整 Profile/Source/License/日志证据；ArchiveReceipt 绑定递归文件集合，rsync 快照恢复测试逐字节通过；控制面备份恢复测试通过 | 跨物理设备恢复仍应在实际部署后按手册演练 |
+| R03 | 已验证 | Publisher 从签名 Manifest 保留当前 Release、30 天内全部 Release 和每包最近 3 个版本；签名 Release 保存 Audit、Agent、provenance、完整 Profile/Source/License/日志证据；控制面备份恢复测试通过 | 文件系统 GC 故障注入和 netcup 实际部署后恢复演练尚未执行 |
 | R04 | 已验证 | 服务端签名 Release 回滚和真实客户端 `pacman -U` 降级 | 自动客户端降级明确延期 |
-| U01 | 已验证 | 搜索、包、审计、构建、Worker、Profile、Release、归档、告警、设置页面；Job 可查看成功/失败有界日志，Release 可展开签名证据文档 | 不要求第一版实现复杂日志搜索 |
+| U01 | 已验证 | 搜索、包、审计、构建、Worker、Profile、Release、告警、设置页面；Job 可查看成功/失败有界日志，Release 可展开签名证据文档 | 不要求第一版实现复杂日志搜索 |
 | U02 | 已验证 | 单管理员认证、一次性初始化、GPG/pacman 引导、稳定 URL；内部 CA 持久化、认证下载和有效期 Doctor；用户证书 Compose override | DNS、客户端导入和根 CA 轮换按设计由部署者人工执行 |
 | U03 | 已验证 | Worker/磁盘/时钟、Agent/Fetch Doctor、告警、Webhook/ntfy、备份与库存页面 | 外部 Webhook/ntfy 未使用真实服务冒烟 |
 | O01 | 已验证 | 包装 makepkg、repo-add、pacman、QEMU、OpenSSH、rsync、GnuPG、Caddy | 无 |

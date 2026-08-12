@@ -644,6 +644,7 @@ mod tests {
             backup_dir: "/不存在".into(),
             backup_export_dir: "/不存在".into(),
             backup_export_socket: "/不存在".into(),
+            external_archiver_enabled: false,
         };
         AppState::new(
             database,

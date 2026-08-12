@@ -511,6 +511,7 @@ mod tests {
                 .join("export.sock")
                 .to_string_lossy()
                 .into(),
+            external_archiver_enabled: false,
         };
         let database = crate::db::connect(&config.database_url).await.unwrap();
         sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('backup-fixture', '\"before\"', ?)")

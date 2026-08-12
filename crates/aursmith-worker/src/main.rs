@@ -20,7 +20,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -98,6 +98,14 @@ struct Cli {
         default_value = "/run/aursmith-gpg"
     )]
     publisher_gpg_home: PathBuf,
+    #[arg(long, env = "AURSMITH_RELEASE_RETENTION_DAYS", default_value_t = 30)]
+    release_retention_days: u32,
+    #[arg(
+        long,
+        env = "AURSMITH_RELEASE_RETENTION_MIN_VERSIONS",
+        default_value_t = 3
+    )]
+    release_retention_min_versions: usize,
     #[arg(long, env = "AURSMITH_ARCHIVE_DIR", default_value = "/archive")]
     archive_dir: PathBuf,
     #[arg(long, env = "AURSMITH_CONTROLLER_POLL_URL")]
@@ -147,6 +155,8 @@ struct Worker {
     repository_dir: PathBuf,
     repository_arch: String,
     publisher_gpg_home: PathBuf,
+    release_retention_days: u32,
+    release_retention_min_versions: usize,
     jobs_dir: PathBuf,
     archive_dir: PathBuf,
     identity_signing_key: SigningKey,
@@ -258,6 +268,9 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
     let cli = Cli::parse();
+    if cli.release_retention_days == 0 || cli.release_retention_min_versions == 0 {
+        bail!("Publisher Release 保留天数和最少版本数都必须大于 0");
+    }
     let trusted_controller_key = hex::decode(&cli.controller_verifying_key_hex)
         .context("Controller verifying key 必须是十六进制")?;
     if trusted_controller_key.len() != 32 {
@@ -311,6 +324,8 @@ async fn main() -> anyhow::Result<()> {
         repository_dir: cli.repository_dir,
         repository_arch: cli.repository_arch,
         publisher_gpg_home: cli.publisher_gpg_home,
+        release_retention_days: cli.release_retention_days,
+        release_retention_min_versions: cli.release_retention_min_versions,
         jobs_dir,
         archive_dir: cli.archive_dir,
         identity_signing_key,
@@ -2072,6 +2087,16 @@ fn publish_repository_public_key(worker: &Worker, public_key: &Path) -> anyhow::
 }
 
 fn spawn_publisher(worker: Arc<Worker>) {
+    let retention_worker = worker.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = reconcile_publisher_retention(&retention_worker).await {
+                tracing::warn!(%error, "Publisher 定期保留策略执行失败，未影响当前仓库");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -2100,11 +2125,27 @@ async fn reconcile_publisher_one(worker: &Worker) -> anyhow::Result<()> {
         Ok(manifest_sha256) => {
             sqlx::query("UPDATE publisher_releases SET state = 'published', manifest_sha256 = ?, last_error = NULL, updated_at = ? WHERE release_id = ?")
                 .bind(manifest_sha256).bind(Utc::now()).bind(release_id).execute(&worker.database).await?;
+            if let Err(error) = reconcile_publisher_retention(worker).await {
+                tracing::warn!(%error, "Publisher Release 保留策略执行失败，未影响当前仓库");
+            }
         }
         Err(error) => {
             sqlx::query("UPDATE publisher_releases SET state = 'failed', last_error = ?, updated_at = ? WHERE release_id = ?")
                 .bind(error.to_string()).bind(Utc::now()).bind(release_id).execute(&worker.database).await?;
         }
+    }
+    Ok(())
+}
+
+async fn reconcile_publisher_retention(worker: &Worker) -> anyhow::Result<()> {
+    for release_id in prune_publisher_releases(worker)? {
+        sqlx::query(
+            "UPDATE publisher_releases SET state = 'expired', updated_at = ? WHERE release_id = ?",
+        )
+        .bind(Utc::now())
+        .bind(release_id.to_string())
+        .execute(&worker.database)
+        .await?;
     }
     Ok(())
 }
@@ -2264,6 +2305,160 @@ fn verify_and_publish_release(
 
     activate_committed_release(worker, &committed)?;
     Ok(manifest_sha256)
+}
+
+#[derive(Debug, Clone)]
+struct RetentionRelease {
+    id: uuid::Uuid,
+    committed_at: chrono::DateTime<Utc>,
+    artifacts: Vec<ArtifactRecord>,
+}
+
+fn select_retained_releases(
+    releases: &[RetentionRelease],
+    current_release: uuid::Uuid,
+    cutoff: chrono::DateTime<Utc>,
+    minimum_versions: usize,
+) -> BTreeSet<uuid::Uuid> {
+    let mut retained = BTreeSet::from([current_release]);
+    let mut newest = releases.iter().collect::<Vec<_>>();
+    newest.sort_by_key(|release| std::cmp::Reverse(release.committed_at));
+    for release in &newest {
+        if release.committed_at >= cutoff {
+            retained.insert(release.id);
+        }
+    }
+    let mut versions = BTreeMap::<String, BTreeSet<String>>::new();
+    for release in newest {
+        for artifact in &release.artifacts {
+            let (Some(package_name), Some(package_version)) =
+                (&artifact.package_name, &artifact.package_version)
+            else {
+                continue;
+            };
+            let seen = versions.entry(package_name.clone()).or_default();
+            if seen.len() < minimum_versions && seen.insert(package_version.clone()) {
+                retained.insert(release.id);
+            }
+        }
+    }
+    retained
+}
+
+fn prune_publisher_releases(worker: &Worker) -> anyhow::Result<Vec<uuid::Uuid>> {
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
+    let releases_root = arch_root.join("releases");
+    if !releases_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let repository_name = worker_repository_name(&releases_root)?;
+    aursmith_protocol::validate_relative_path(&repository_name)?;
+    if Path::new(&repository_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(repository_name.as_str())
+    {
+        bail!("仓库名称必须是纯文件名");
+    }
+    let current_target = std::fs::read_link(arch_root.join(format!("{repository_name}.db")))?;
+    let current_release = current_target
+        .components()
+        .nth(1)
+        .and_then(|component| component.as_os_str().to_str())
+        .context("当前仓库数据库链接没有 Release ID")?
+        .parse::<uuid::Uuid>()?;
+
+    let mut releases = Vec::new();
+    let mut all_artifact_paths = BTreeSet::new();
+    for entry in std::fs::read_dir(&releases_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(directory_name) = entry.file_name().to_str().map(str::to_owned) else {
+            bail!("Release 目录名不是 UTF-8");
+        };
+        let directory_id = directory_name.parse::<uuid::Uuid>()?;
+        let manifest_path = entry.path().join("release-manifest.json");
+        verify_gpg_signature(
+            &worker.publisher_gpg_home,
+            &manifest_path,
+            &entry.path().join("release-manifest.json.sig"),
+        )?;
+        let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        if manifest.release_id != directory_id {
+            bail!("Release Manifest 与目录 ID 不一致");
+        }
+        let artifacts = manifest
+            .artifacts
+            .iter()
+            .chain(manifest.repository_keyring.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        all_artifact_paths.extend(artifacts.iter().map(|artifact| artifact.path.clone()));
+        releases.push(RetentionRelease {
+            id: manifest.release_id,
+            committed_at: manifest.committed_at,
+            artifacts,
+        });
+    }
+    if !releases.iter().any(|release| release.id == current_release) {
+        bail!("当前仓库指向的 Release 不存在");
+    }
+    let cutoff = Utc::now() - chrono::Duration::days(i64::from(worker.release_retention_days));
+    let retained = select_retained_releases(
+        &releases,
+        current_release,
+        cutoff,
+        worker.release_retention_min_versions,
+    );
+    let retained_artifact_paths = releases
+        .iter()
+        .filter(|release| retained.contains(&release.id))
+        .flat_map(|release| {
+            release
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.path.clone())
+        })
+        .collect::<BTreeSet<_>>();
+
+    let expired = releases
+        .iter()
+        .filter(|release| !retained.contains(&release.id))
+        .map(|release| release.id)
+        .collect::<Vec<_>>();
+    for release_id in &expired {
+        std::fs::remove_dir_all(releases_root.join(release_id.to_string()))?;
+    }
+    for path in all_artifact_paths.difference(&retained_artifact_paths) {
+        let package = arch_root.join(path);
+        let signature = arch_root.join(format!("{path}.sig"));
+        if package.is_file() {
+            std::fs::remove_file(package)?;
+        }
+        if signature.is_file() {
+            std::fs::remove_file(signature)?;
+        }
+    }
+    sync_directory(&releases_root)?;
+    sync_directory(&arch_root)?;
+    Ok(expired)
+}
+
+fn worker_repository_name(releases_root: &Path) -> anyhow::Result<String> {
+    for entry in std::fs::read_dir(releases_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("release-manifest.json");
+        if path.is_file() {
+            let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(path)?)?;
+            return Ok(manifest.repository_name);
+        }
+    }
+    bail!("Publisher 没有可读取的 Release Manifest")
 }
 
 fn activate_committed_release(
@@ -3240,6 +3435,53 @@ mod transfer_tests {
     }
 
     #[test]
+    fn publisher_retention_keeps_recent_releases_and_three_versions_per_package() {
+        let now = Utc::now();
+        let releases = (0..5)
+            .map(|index| RetentionRelease {
+                id: uuid::Uuid::new_v4(),
+                committed_at: now - chrono::Duration::days(index * 20),
+                artifacts: vec![ArtifactRecord {
+                    path: format!("fixture-{}-1-any.pkg.tar.zst", 5 - index),
+                    sha256: "a".repeat(64),
+                    size: 1,
+                    package_name: Some("fixture".into()),
+                    package_version: Some(format!("{}-1", 5 - index)),
+                    architecture: Some("any".into()),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let retained = select_retained_releases(
+            &releases,
+            releases[0].id,
+            now - chrono::Duration::days(30),
+            3,
+        );
+        assert_eq!(retained.len(), 3);
+        assert!(retained.contains(&releases[0].id));
+        assert!(retained.contains(&releases[1].id));
+        assert!(retained.contains(&releases[2].id));
+        assert!(!retained.contains(&releases[3].id));
+    }
+
+    #[test]
+    fn publisher_retention_never_removes_current_release() {
+        let now = Utc::now();
+        let current = RetentionRelease {
+            id: uuid::Uuid::new_v4(),
+            committed_at: now - chrono::Duration::days(365),
+            artifacts: Vec::new(),
+        };
+        let retained = select_retained_releases(
+            std::slice::from_ref(&current),
+            current.id,
+            now - chrono::Duration::days(30),
+            3,
+        );
+        assert_eq!(retained, BTreeSet::from([current.id]));
+    }
+
+    #[test]
     fn archive_inventory_distinguishes_shallow_and_full_digest_checks() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("release-manifest.json"), b"good").unwrap();
@@ -3312,6 +3554,8 @@ mod transfer_tests {
             repository_dir: root.path().join("repository"),
             repository_arch: "x86_64".into(),
             publisher_gpg_home: root.path().join("gpg"),
+            release_retention_days: 30,
+            release_retention_min_versions: 3,
             jobs_dir: root.path().join("jobs"),
             archive_dir: archive_dir.clone(),
             identity_signing_key: SigningKey::from_bytes(&[31; 32]),

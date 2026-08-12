@@ -7,11 +7,11 @@
 - AUR 文件、下载源码、构建 Guest、构建产物和软件包元数据均不可信。
 - Publisher 负责校验产物，但不能访问仓库签名私钥。
 - Signer 完全断网，只接受已签名的 `ReleaseAuthorization`。
-- Archiver 独立保存不可变 Release 和回执，归档状态不影响 Release 已发布状态。
+- Publisher 在原子发布之外负责短期历史保留，保留策略失败不影响当前 Release 服务。
 
 ## 部署
 
-系统由 Controller、Builder、Publisher 和 Archiver 四套 Docker Compose Stack 组成，每个 Worker 实例只承担一个角色。同一物理设备可以运行多套 Stack，但不能共享可写服务状态。
+第一版由 Controller、Builder 和 Publisher 三套 Docker Compose Stack 组成，每个 Worker 实例只承担一个角色。外部 Archiver 协议保留为以后可选能力，但默认不部署也不参与调度。
 
 Controller Web Caddy 默认在 8443 使用内部 CA，CA 状态持久化到专用 `caddy-data` 卷；Controller 只能只读访问根证书，不能读取 CA 私钥。管理员会话可以下载根证书，Doctor 使用固定 openssl 参数检查格式和未来 30 天有效期。已有受信任证书时使用 `compose.user-tls.yaml` 覆盖：证书与私钥作为 Docker secret 只进入 Web Caddy，同时关闭内部 CA 下载。DNS、根证书首次分发和根 CA 轮换仍是明确的人工运维动作。
 
@@ -19,7 +19,7 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 第一版 Publisher 提供两个职责分离的网络服务。无特权 Squid source-proxy 供 Fetch VM 获取 AUR source，QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。pacoloco 只缓存 Arch 官方仓库文件，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。仓库 Caddy 在 `/arch-cache/` 下反向代理 pacoloco；部署者可以把该稳定 HTTPS 地址写入新 Profile，Fetch Guest 随后沿同一镜像下载官方依赖，Build Guest 仍然无网。
 
-公网节点内的控制流继续使用固定 host key 和 forced command 的 OpenSSH。家庭网络中的 Builder 不暴露 SSH、HTTP 或任何公网入站端口，也不要求路由器端口映射：Builder 只通过 HTTPS 出站长轮询 Controller，使用持久 Ed25519 Worker 身份签署领取和上报消息；Controller 返回的任务仍是原有签名 `JobSpec`。大文件不经过 Controller，Builder 获得短期有效的 Controller 签名 `TransferCapability` 后，主动通过受限 rsync/SSH 推送到 Publisher 公网入口。Publisher 与同机 Archiver 继续通过内部 Docker 网络和受限 rsync 传输。
+公网节点内的控制流继续使用固定 host key 和 forced command 的 OpenSSH。家庭网络中的 Builder 不暴露 SSH、HTTP 或任何公网入站端口，也不要求路由器端口映射：Builder 只通过 HTTPS 出站长轮询 Controller，使用持久 Ed25519 Worker 身份签署领取和上报消息；Controller 返回的任务仍是原有签名 `JobSpec`。大文件不经过 Controller，Builder 获得短期有效的 Controller 签名 `TransferCapability` 后，主动通过受限 rsync/SSH 推送到 Publisher 公网入口。Publisher 在公网节点本地提交完整不可变 Release，不再为第一版启动同机 Archiver。
 
 每个 Worker 首次启动时在 SQLite Journal 中生成持久化实例 UUID 和 Ed25519 身份。公网可达 Worker 注册时由 Controller 通过固定 host key 探测；反向 Builder 则由管理员在 UI 中录入容器本地显示的 UUID、身份公钥、标签和 Profile，并完成一次挑战签名后启用。名称、角色、协议或后续身份不一致时标记为 incompatible。反向请求绑定 Worker UUID、随机 nonce、请求类型和短有效期；Controller 持久化 nonce，重复请求不能再次领取任务或推进状态。
 
@@ -29,7 +29,7 @@ ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当�
 
 清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。其他包保持不变。非空结果继续由 repo-add 从完整包集合重建。清除最后一个包时，Signer 使用 bsdtar 创建标准空 gzip tar 数据库和 files 数据库后照常签名，Publisher 原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。
 
-Release 提交后，Controller 从 Publisher 读取只含路径、大小和摘要的 Release 文件清单，签发绑定 Publisher、Archiver、writer epoch 和 Release ID 的 TransferCapability。Archiver 使用静态 Publisher UUID→SSH 地址及独立只读拉取密钥直接拉取，按完整文件集合复验后通过 `rsync --link-dest` 创建不可变快照。每个 Worker 首次启动还会在本地 Journal 生成持久化 Ed25519 身份密钥；Controller 注册时固定公钥，ArchiveReceipt 必须由对应 Archiver 签署并与 Release Manifest 及 Capability 文件集合完全一致。Controller 只有在 Receipt 验证通过后才调用源端导出清理，清理失败会保留待重试状态，不能通过提前删除释放空间。
+Release 提交并原子切换后，Publisher 从全部 GPG 签名 Manifest 计算保留集合：当前数据库指向的 Release 永久进入集合；提交时间在最近 30 天内的 Release 全部进入；再按时间倒序为每个 `pkgname` 保留至少 3 个不同 `package_version` 所在的 Release。证据文件随对应 Release 一起保留。任一 Manifest、签名、目录 ID 或当前数据库链接异常时，本轮清理整体停止，不能按文件名猜测后删除。
 
 服务端回滚使用短期 ReleaseRollbackAuthorization，只允许当前 writer epoch 的 Publisher 激活已经存在的不可变 Release。Publisher 在切换前重新验证 Manifest、包、db/files 数据库和全部 GPG 签名，不重新构建、运行 repo-add 或调用 Signer。Controller 单独保存当前 Release 指针，并从目标 Release Artifact 清单生成客户端 `pacman -U` 命令；服务端操作不会被描述成客户端自动降级。
 
@@ -43,9 +43,9 @@ Fetch Guest 实测官方依赖下载耗时并随 FetchResult 返回，Controller
 
 ## 运维健康与背压
 
-Controller 对公网可达 Worker定期执行固定 host key 的 `status`；反向 Builder 则在每次长轮询中附带签名状态快照，空闲时默认 15 秒长轮询并在网络失败后指数退避，最长不超过 60 秒。快照包含角色、协议、实例身份、UTC 时间、cgroup v2、KVM 能力以及数据卷空间。Controller 根据最后上报时间判断 online/degraded/offline，不尝试回连 Builder。Doctor 将至少一个近期上报且具备 KVM 的 Builder、Publisher、Archiver、已验证 Profile、仓库 GPG 指纹和四个 Agent Runner 作为运行前条件。
+Controller 对公网可达 Worker定期执行固定 host key 的 `status`；反向 Builder 则在每次长轮询中附带签名状态快照，空闲时默认 15 秒长轮询并在网络失败后指数退避，最长不超过 60 秒。快照包含角色、协议、实例身份、UTC 时间、cgroup v2、KVM 能力以及数据卷空间。Controller 根据最后上报时间判断 online/degraded/offline，不尝试回连 Builder。Doctor 将至少一个近期上报且具备 KVM 的 Builder、Publisher、已验证 Profile、仓库 GPG 指纹和四个 Agent Runner 作为运行前条件。
 
-可用空间低于 15% 时产生 warning，低于 10% 时产生 critical。活动 Publisher 低于 10% 时，持久化的 `publication_backpressure` 同时阻止新 Job 调度和新 Release 授权，已经提交的仓库继续提供服务；恢复到阈值以上后自动解除。未获得有效 ArchiveReceipt 的已发布 Artifact 合计超过 20 GiB 时独立告警，不能通过把 Release 改回失败来隐藏欠归档状态。Worker 不可达、时钟偏差超过 60 秒、缺少 cgroup v2 或 Builder 缺少 KVM 都使用稳定 fingerprint 更新同一告警。
+可用空间低于 15% 时产生 warning，低于 10% 时产生 critical。活动 Publisher 低于 10% 时，持久化的 `publication_backpressure` 同时阻止新 Job 调度和新 Release 授权，已经提交的仓库继续提供服务；恢复到阈值以上后自动解除。Worker 不可达、时钟偏差超过 60 秒、缺少 cgroup v2 或 Builder 缺少 KVM 都使用稳定 fingerprint 更新同一告警。
 
 告警具有 `open → acknowledged → resolved` 生命周期。页面可查看和确认告警，结构化容器日志记录新打开的运维故障。可选 Webhook 使用 JSON 负载和 `X-AURsmith-Signature: sha256=<HMAC-SHA256>`，可选 ntfy 使用固定目标 URL；目标不能包含 URL 用户名或密码。通知先写 SQLite outbox，每个状态和通道只投递一次，失败最多尝试三次并保留最后错误，不会因为通知服务故障阻塞调度器。
 
@@ -55,13 +55,13 @@ Controller 对公网可达 Worker定期执行固定 host key 的 `status`；反�
 
 Controller 每 24 小时或按管理员请求执行一次控制面一致性备份。备份使用 SQLite `VACUUM INTO` 从 WAL 数据库生成单文件快照，随后执行 `PRAGMA integrity_check`、计算 SHA-256，并用 Controller Ed25519 身份签署版本化 `ControlPlaneBackup`。数据库文件和签名 Envelope 先在同一文件系统暂存、同步，再以目录 rename 提交；失败记录不会冒充 verified。控制面数据库保存密码哈希和业务状态但不保存 GPG、SSH、CA 或 Agent API 私钥，因此这些 secret 仍必须按首次向导要求另行离线备份。
 
-每个 verified 控制面备份还会进入独立归档调度。Controller 根据自身 Ed25519 公钥确定一个稳定、非秘密的传输源 UUID，签发同时绑定 Backup ID、Archiver UUID、两份文件摘要和期限的 TransferCapability，并把最小导出目录只读暴露给同 Stack 的 `backup-ssh`。该 SSH sidecar 与 Worker 一样禁止 Shell、PTY 和转发，只允许 rsync sender 读取数据库和备份 Envelope。Archiver 通过静态 UUID→SSH 端点主动拉取，既复验 Capability 文件集合，又验证内部 `ControlPlaneBackup` 确由当前 Controller 签署，随后保存到 `control-plane-backups/<Backup ID>` 并返回自身签名的 `BackupArchiveReceipt`。Controller 只有核对 Receipt 身份、Backup ID 和完整文件集合后才标记独立归档完成并清理临时导出。
+每个 verified 控制面备份由 SQLite 原生快照、摘要和 Controller 签名 Envelope 组成，保存在 Controller 持久卷。第一版不自动复制到独立故障域，因此初始化向导和设置页必须继续提示离线保存 Controller、GPG、CA 私钥和管理员恢复材料。
 
 Doctor 不通过付费模型请求伪造“Agent 可用”。每个 Agent Runner 的 `/healthz` 只验证 Codex/Claude Code 固定 CLI 文件、adapter/provider/model 配置，以及到凭据网关的 TCP；凭据网关在启动时已经验证 API key secret 和 provider HTTPS URL。Controller 实际请求三个低成本和一个高成本 Runner 的健康端点。Publisher 的 `publisher-doctor` 同时执行无结果也合法的 AUR RPC 查询、经配置的 source proxy 请求公开 Arch HTTPS 文件，并读取 pacoloco `/metrics`；它不执行 PKGBUILD，也不给 Build VM 网络。
 
 离线恢复命令先核对当前 Controller 公钥、Envelope、固定文件名、大小、摘要和 SQLite 完整性，再复制到目标文件系统复验。替换前把原数据库及 WAL/SHM 一并移动到带 UTC 时间和 Backup ID 的 `recovery` 目录，恢复中途失败时尝试放回原数据库。恢复要求先停止 Controller；在线 API 不提供数据库替换能力。
 
-Archiver 每周对所有 Release ArchiveReceipt 和 BackupArchiveReceipt 执行一次集合巡检：复验 Receipt 自身签名，确认每个快照的文件集合、普通文件类型和大小完全一致。每九十天执行完整摘要巡检，在相同检查上重新计算所有文件 SHA-256。Archiver 用自身持久化 Ed25519 身份签署 `ArchiveInventory`；Controller 固定核对 Worker UUID、身份公钥和请求的巡检级别后才保存报告。发现任一损坏会产生 critical 告警，不能以更新 Receipt 或忽略多余文件来制造通过。
+外部 Archiver 的 TransferCapability、ArchiveReceipt 和库存巡检协议仍保留在代码中，只有显式设置 `AURSMITH_EXTERNAL_ARCHIVER_ENABLED=true` 才调度，属于第一版默认拓扑之外的可选能力。
 
 ## AUR 同步与依赖闭包
 
@@ -71,7 +71,7 @@ Controller 不直接访问 AUR。浏览器请求由 Controller 认证后，经�
 
 Controller 在写数据库前遍历最多 64 个 AUR pkgbase 的依赖闭包。精确同名 AUR 依赖成为隐式订阅；虚拟依赖查询 `provides`，唯一候选可以解析，多个候选进入 `awaiting_provider_selection`。全部上游输入获取成功后，直接订阅、隐式引用、不可变 Revision、依赖边和 ReleaseBatch 才进入同一个控制面事务。循环依赖进入 `blocked_cycle`，不会猜测顺序。
 
-单用户 Web UI 可以直接注册 Builder、Publisher 和 Archiver：提交名称、角色、SSH 端点、已人工核对的 host key 指纹和标签后，Controller 通过严格 known_hosts 连接并核对 Worker 持久化 UUID、角色、协议和身份签名公钥。依赖存在多个 Provider 时，包详情页展示候选并允许固定其中一个；选择会写入直接订阅并重新生成绑定 Provider 摘要的 Revision。
+单用户 Web UI 第一版直接注册 Builder 和 Publisher：提交名称、连接模式、SSH 端点、已人工核对的 host key 指纹和标签后，Controller 核对 Worker 持久化 UUID、角色、协议和身份签名公钥。依赖存在多个 Provider 时，包详情页展示候选并允许固定其中一个；选择会写入直接订阅并重新生成绑定 Provider 摘要的 Revision。
 
 普通包的 AUR commit 变化就产生新 Revision。`-git` 包还从 `.SRCINFO` 的 `git+https` source 查询上游 commit；查询前拒绝私网、回环、链路本地和保留地址，并禁用 Git 重定向及 file/ext 协议。AUR commit、VCS commit 或固定 Provider 变化都会产生新 Revision，未开始发布的旧 Revision 标记为 `superseded`。split outputs 始终整体固定和构建，用户选择只表示客户端关注项。
 

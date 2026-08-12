@@ -487,7 +487,12 @@ async fn doctor_status(
     let workers = sqlx::query("SELECT id, name, role, state, endpoint, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY role, name")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let mut checks = Vec::new();
-    for role in ["builder", "publisher", "archiver"] {
+    let required_roles = if state.config.external_archiver_enabled {
+        vec!["builder", "publisher", "archiver"]
+    } else {
+        vec!["builder", "publisher"]
+    };
+    for role in required_roles {
         let online = workers
             .iter()
             .filter(|row| {
@@ -1743,6 +1748,7 @@ mod tests {
             backup_dir: "/不存在".into(),
             backup_export_dir: "/不存在".into(),
             backup_export_socket: "/不存在".into(),
+            external_archiver_enabled: false,
         };
         router(AppState::new(
             database,

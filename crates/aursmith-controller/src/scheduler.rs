@@ -15,6 +15,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use uuid::Uuid;
 
 pub fn spawn(state: AppState) {
+    let external_archiver_enabled = state.config.external_archiver_enabled;
     let heartbeat_state = state.clone();
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(30));
@@ -105,17 +106,19 @@ pub fn spawn(state: AppState) {
             }
         }
     });
-    let inventory_state = state.clone();
-    tokio::spawn(async move {
-        let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
-        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            timer.tick().await;
-            if let Err(error) = run_archive_inventory_if_due(&inventory_state).await {
-                tracing::warn!(%error, "Archiver 库存巡检失败");
+    if external_archiver_enabled {
+        let inventory_state = state.clone();
+        tokio::spawn(async move {
+            let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
+            timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                if let Err(error) = run_archive_inventory_if_due(&inventory_state).await {
+                    tracing::warn!(%error, "Archiver 库存巡检失败");
+                }
             }
-        }
-    });
+        });
+    }
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(2));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -133,11 +136,13 @@ pub fn spawn(state: AppState) {
             if let Err(error) = dispatch_release_one(&state).await {
                 tracing::warn!(%error, "Release 发布调度失败");
             }
-            if let Err(error) = dispatch_archive_one(&state).await {
-                tracing::warn!(%error, "Release 归档调度失败");
-            }
-            if let Err(error) = dispatch_backup_archive_one(&state).await {
-                tracing::warn!(%error, "控制面备份归档调度失败");
+            if external_archiver_enabled {
+                if let Err(error) = dispatch_archive_one(&state).await {
+                    tracing::warn!(%error, "Release 归档调度失败");
+                }
+                if let Err(error) = dispatch_backup_archive_one(&state).await {
+                    tracing::warn!(%error, "控制面备份归档调度失败");
+                }
             }
         }
     });
@@ -2567,6 +2572,7 @@ mod release_tests {
                 backup_dir: "/不存在".into(),
                 backup_export_dir: "/不存在".into(),
                 backup_export_socket: "/不存在".into(),
+                external_archiver_enabled: false,
             },
             ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
         )

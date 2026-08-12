@@ -1,0 +1,14 @@
+services:
+  controller:
+    environment:
+      AURSMITH_EXTERNAL_ARCHIVER_ENABLED: "false"
+    networks:
+      - control
+      - agent
+      - egress
+      - backbone
+
+networks:
+  backbone:
+    external: true
+    name: aursmith-backbone
