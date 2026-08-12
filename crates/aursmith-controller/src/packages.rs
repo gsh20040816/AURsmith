@@ -1165,7 +1165,7 @@ pub async fn package_detail(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("软件包尚未同步"))?;
-    let revisions = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, published_version, input_sha256, state, created_at FROM revisions WHERE package_base = ? ORDER BY created_at DESC")
+    let revisions = sqlx::query("SELECT revisions.id, revisions.aur_commit, revisions.vcs_commit, revisions.upstream_version, revisions.published_version, revisions.input_sha256, revisions.state, revisions.created_at, (SELECT release_batches.state FROM release_batch_revisions JOIN release_batches ON release_batches.id = release_batch_revisions.batch_id WHERE release_batch_revisions.revision_id = revisions.id ORDER BY release_batches.created_at DESC LIMIT 1) AS release_state FROM revisions WHERE revisions.package_base = ? ORDER BY revisions.created_at DESC")
         .bind(&package_base)
         .fetch_all(&state.database)
         .await
@@ -1212,7 +1212,8 @@ pub async fn package_detail(
             "id": row.get::<String, _>("id"), "aur_commit": row.get::<String, _>("aur_commit"),
             "vcs_commit": row.get::<Option<String>, _>("vcs_commit"), "upstream_version": row.get::<String, _>("upstream_version"),
             "published_version": row.get::<Option<String>, _>("published_version"), "input_sha256": row.get::<String, _>("input_sha256"),
-            "state": row.get::<String, _>("state"), "created_at": row.get::<String, _>("created_at")
+            "state": row.get::<String, _>("state"), "release_state": row.get::<Option<String>, _>("release_state"),
+            "created_at": row.get::<String, _>("created_at")
         })).collect::<Vec<_>>(),
         "dependency_resolution": blockers.into_iter().map(|row| json!({
             "name": row.get::<String, _>("dependency_name"), "kind": row.get::<String, _>("dependency_kind"),

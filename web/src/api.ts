@@ -102,7 +102,7 @@ export type PackageDetail = {
     requested_at: string;
     decided_at: string | null;
   } | null;
-  revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; created_at: string }>;
+  revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; release_state: string | null; created_at: string }>;
   dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
   events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
 };
