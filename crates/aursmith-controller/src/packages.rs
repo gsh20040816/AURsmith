@@ -976,7 +976,7 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
             .bind(dependency_snapshot_sha256).bind(worker_id).bind(source_attempt_id)
             .bind(serde_json::to_string(&snapshot.outputs).map_err(ApiError::internal)?)
             .bind(allow_check)
-            .bind(r#"{"cpu_count":2,"memory_mib":4096,"disk_mib":16384,"timeout_seconds":3600}"#)
+            .bind(r#"{"cpu_count":2,"memory_mib":4096,"disk_mib":32768,"timeout_seconds":3600}"#)
             .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE revisions SET state = 'build_pending' WHERE id = ?")
             .bind(&revision_id)

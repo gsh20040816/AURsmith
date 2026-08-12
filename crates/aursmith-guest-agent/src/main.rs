@@ -68,6 +68,9 @@ fn run() -> anyhow::Result<()> {
     if spec.kind == JobKind::Fetch || (spec.kind == JobKind::Build && build_network_enabled()?) {
         configure_network()?;
     }
+    // Builder 会按 JobSpec 扩大临时 qcow2 overlay；根文件系统在启动后在线扩容，
+    // 使 disk_mib 成为真实生效的任务资源限制，而不是只记录在 provenance 中。
+    run_checked("/usr/bin/resize2fs", &["/dev/vda"], None)?;
     reset_build_directory()?;
     copy_tree(Path::new(INPUT), Path::new(BUILD), true)?;
     if spec.kind == JobKind::ProfileFixture {
@@ -215,6 +218,7 @@ fn apply_published_pkgrel(
 
 fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     let log = Path::new(OUTPUT).join("fetch.log");
+    import_declared_pgp_keys(Path::new(BUILD))?;
     run_as_builder(
         &["/usr/bin/makepkg", "--verifysource", "--noconfirm"],
         Some(&log),
@@ -245,6 +249,71 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
         log_sha256: file_digest(&log)?,
         finished_at: Utc::now(),
     })
+}
+
+fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
+    let srcinfo = fs::read_to_string(build.join(".SRCINFO")).context("AUR 快照缺少 .SRCINFO")?;
+    let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
+    if fingerprints.is_empty() {
+        return Ok(());
+    }
+    let mut arguments = vec![
+        "/usr/bin/gpg".to_owned(),
+        "--batch".to_owned(),
+        "--keyserver".to_owned(),
+        "hkps://keyserver.ubuntu.com".to_owned(),
+        "--recv-keys".to_owned(),
+    ];
+    arguments.extend(fingerprints.iter().cloned());
+    let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    run_as_builder(&argument_refs, None)?;
+
+    for fingerprint in fingerprints {
+        let output = Command::new("/usr/bin/runuser")
+            .args(builder_command_arguments(&[
+                "/usr/bin/gpg",
+                "--batch",
+                "--with-colons",
+                "--fingerprint",
+                &fingerprint,
+            ]))
+            .current_dir(BUILD)
+            .stdin(Stdio::null())
+            .env_clear()
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
+            .env("HOME", "/home/builder")
+            .env("LANG", "C.UTF-8")
+            .output()?;
+        let exact_match = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("fpr:::::::::"))
+            .filter_map(|line| line.strip_suffix(':'))
+            .any(|received| received.eq_ignore_ascii_case(&fingerprint));
+        if !output.status.success() || !exact_match {
+            bail!("导入的 OpenPGP 密钥与 .SRCINFO 声明的指纹不一致：{fingerprint}");
+        }
+    }
+    Ok(())
+}
+
+fn declared_pgp_fingerprints(srcinfo: &str) -> anyhow::Result<Vec<String>> {
+    let mut fingerprints = BTreeSet::new();
+    for line in srcinfo.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if key.trim() != "validpgpkeys" {
+            continue;
+        }
+        let fingerprint = value.trim().to_ascii_uppercase();
+        if !matches!(fingerprint.len(), 40 | 64)
+            || !fingerprint.chars().all(|value| value.is_ascii_hexdigit())
+        {
+            bail!(".SRCINFO validpgpkeys 必须是完整 OpenPGP 指纹");
+        }
+        fingerprints.insert(fingerprint);
+    }
+    Ok(fingerprints.into_iter().collect())
 }
 
 fn download_official_dependencies(
@@ -925,6 +994,17 @@ mod tests {
         assert!(command.contains(&"HOME=/home/builder"));
         assert!(!command.iter().any(|value| value.contains("PROXY")));
         assert_eq!(command.last(), Some(&"--verifysource"));
+    }
+
+    #[test]
+    fn full_declared_pgp_fingerprints_are_parsed_and_deduplicated() {
+        let fingerprint = "EF6E286DDA85EA2A4BA7DE684E2C6E8793298290";
+        let srcinfo = format!(
+            "pkgbase = demo\n\tvalidpgpkeys = {fingerprint}\n\tvalidpgpkeys = {fingerprint}\n"
+        );
+        assert_eq!(declared_pgp_fingerprints(&srcinfo).unwrap(), [fingerprint]);
+        assert!(declared_pgp_fingerprints("validpgpkeys = 93298290").is_err());
+        assert!(declared_pgp_fingerprints("validpgpkeys = not-a-key").is_err());
     }
 
     #[test]

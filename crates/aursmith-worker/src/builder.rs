@@ -416,6 +416,21 @@ async fn execute_attempt(
         std::time::Duration::from_secs(30),
     )
     .await?;
+    // qcow2 清单中的 size 是压缩文件大小，不是虚拟容量。仅在 JobSpec 请求容量
+    // 大于基础镜像虚拟容量时扩大 overlay，绝不缩小 Profile。
+    let requested_bytes = spec.limits.disk_mib.saturating_mul(1024 * 1024);
+    if requested_bytes > qemu_img_virtual_size(&overlay).await? {
+        run_checked(
+            "/usr/bin/qemu-img",
+            &[
+                "resize".into(),
+                overlay.as_os_str().into(),
+                format!("{}M", spec.limits.disk_mib).into(),
+            ],
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+    }
     let paths = VmPaths {
         overlay,
         input_directory: staging.join("input"),
@@ -600,6 +615,25 @@ async fn run_checked(
         bail!("子进程失败：{}", executable)
     }
     Ok(())
+}
+
+async fn qemu_img_virtual_size(path: &Path) -> anyhow::Result<u64> {
+    let output = timeout(
+        std::time::Duration::from_secs(30),
+        Command::new("/usr/bin/qemu-img")
+            .args(["info", "--output=json"])
+            .arg(path)
+            .output(),
+    )
+    .await
+    .context("读取 qcow2 信息超时")??;
+    if !output.status.success() {
+        bail!("无法读取 qcow2 虚拟容量")
+    }
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    document["virtual-size"]
+        .as_u64()
+        .context("qemu-img 输出缺少 virtual-size")
 }
 
 fn classify_failure(error: &anyhow::Error) -> &'static str {
@@ -1023,6 +1057,21 @@ mod tests {
         );
         assert!(!args.iter().any(|value| value.contains("guestfwd=")));
         assert!(!args.windows(2).any(|pair| pair == ["-nic", "none"]));
+    }
+
+    #[test]
+    fn qemu_plan_uses_the_requested_memory_and_the_overlay_root() {
+        let root = Path::new("/jobs/attempt");
+        let mut spec = job(JobKind::Build);
+        spec.limits.disk_mib = 32768;
+        let plan = QemuPlan::for_job(&profile(root), &spec, paths(root), false).unwrap();
+        let args = plan
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|value| value.contains("overlay.qcow2")));
+        assert_eq!(spec.limits.disk_mib, 32768);
     }
 
     #[test]
