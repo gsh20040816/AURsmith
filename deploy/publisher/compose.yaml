@@ -114,7 +114,10 @@ services:
       - /run/private:uid=0,gid=0,mode=0755,size=2m
     ports:
       - ${AURSMITH_SSH_BIND:-127.0.0.1:2223}:2222
-    networks: [control, backbone]
+    networks:
+      control:
+      backbone:
+        aliases: [publisher-ssh]
     depends_on:
       worker:
         condition: service_healthy
