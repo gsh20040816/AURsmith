@@ -19,9 +19,11 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 第一版 Publisher 提供两个职责分离的网络服务。无特权 Squid source-proxy 供 Fetch VM 获取 AUR source，QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。pacoloco 只缓存 Arch 官方仓库文件，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。仓库 Caddy 在 `/arch-cache/` 下反向代理 pacoloco；部署者可以把该稳定 HTTPS 地址写入新 Profile，Fetch Guest 随后沿同一镜像下载官方依赖，Build Guest 仍然无网。
 
-控制流使用固定 host key 和 forced command 的 OpenSSH。大文件使用 rsync 在 Builder 与 Publisher、Publisher 与 Archiver 之间直接传输，并由短期有效的 Controller 签名 `TransferCapability` 授权。
+公网节点内的控制流继续使用固定 host key 和 forced command 的 OpenSSH。家庭网络中的 Builder 不暴露 SSH、HTTP 或任何公网入站端口，也不要求路由器端口映射：Builder 只通过 HTTPS 出站长轮询 Controller，使用持久 Ed25519 Worker 身份签署领取和上报消息；Controller 返回的任务仍是原有签名 `JobSpec`。大文件不经过 Controller，Builder 获得短期有效的 Controller 签名 `TransferCapability` 后，主动通过受限 rsync/SSH 推送到 Publisher 公网入口。Publisher 与同机 Archiver 继续通过内部 Docker 网络和受限 rsync 传输。
 
-每个 Worker 首次启动时在 SQLite Journal 中生成持久化实例 UUID，Controller 注册前必须通过固定 host key 探测并采用该 UUID；名称、角色、协议、Publisher writer epoch 或后续心跳 UUID 不一致时标记为 incompatible。TransferCapability 绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限，Publisher 必须核对本地配置的 writer epoch。Builder 把清单中逐个复验的文件复制到只读 export 目录；SSH forced command 只接受固定 rsync sender 参数和 `/jobs/transfers/<capability UUID>`。Publisher 通过静态 UUID→SSH 端点映射和独立只读拉取密钥直接 rsync，落入 partial 目录，全部摘要复验后才 rename 为 landing。Controller 不转发包字节。
+每个 Worker 首次启动时在 SQLite Journal 中生成持久化实例 UUID 和 Ed25519 身份。公网可达 Worker 注册时由 Controller 通过固定 host key 探测；反向 Builder 则由管理员在 UI 中录入容器本地显示的 UUID、身份公钥、标签和 Profile，并完成一次挑战签名后启用。名称、角色、协议或后续身份不一致时标记为 incompatible。反向请求绑定 Worker UUID、随机 nonce、请求类型和短有效期；Controller 持久化 nonce，重复请求不能再次领取任务或推进状态。
+
+`TransferCapability` 继续绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限。反向 Builder 把清单中逐个复验的文件复制到只读 export 目录，通过 Publisher 的 forced command rsync receiver 主动上传到 Capability 专属 partial 目录；远端命令不能选择 Capability 以外的路径。Publisher 全部复验后才 rename 为 landing，并返回绑定 Capability 和文件集合的完成状态。Controller 不代理或落盘包字节。公网可达源节点仍可沿用目标主动拉取模式，两种方向共用同一 Capability 数据模型和摘要门禁。
 
 ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
 
@@ -41,7 +43,7 @@ Fetch Guest 实测官方依赖下载耗时并随 FetchResult 返回，Controller
 
 ## 运维健康与背压
 
-Controller 定期通过已经固定 host key 的 Worker `status` 命令获取角色、协议、实例身份、UTC 时间、cgroup v2、Builder KVM 能力以及角色数据卷所在文件系统的总量和可用量。Worker 只以固定参数执行 `/usr/bin/df`，不会接收 Controller 提供的命令或路径。原始状态快照和计算出的时钟偏差写入控制面，Doctor 将至少一个在线 Builder、Publisher、Archiver、已验证 Profile、仓库 GPG 指纹和四个 Agent Runner 作为运行前条件。
+Controller 对公网可达 Worker定期执行固定 host key 的 `status`；反向 Builder 则在每次长轮询中附带签名状态快照，空闲时默认 15 秒长轮询并在网络失败后指数退避，最长不超过 60 秒。快照包含角色、协议、实例身份、UTC 时间、cgroup v2、KVM 能力以及数据卷空间。Controller 根据最后上报时间判断 online/degraded/offline，不尝试回连 Builder。Doctor 将至少一个近期上报且具备 KVM 的 Builder、Publisher、Archiver、已验证 Profile、仓库 GPG 指纹和四个 Agent Runner 作为运行前条件。
 
 可用空间低于 15% 时产生 warning，低于 10% 时产生 critical。活动 Publisher 低于 10% 时，持久化的 `publication_backpressure` 同时阻止新 Job 调度和新 Release 授权，已经提交的仓库继续提供服务；恢复到阈值以上后自动解除。未获得有效 ArchiveReceipt 的已发布 Artifact 合计超过 20 GiB 时独立告警，不能通过把 Release 改回失败来隐藏欠归档状态。Worker 不可达、时钟偏差超过 60 秒、缺少 cgroup v2 或 Builder 缺少 KVM 都使用稳定 fingerprint 更新同一告警。
 

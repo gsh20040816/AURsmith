@@ -6,6 +6,8 @@ export KVM_GID="${KVM_GID:-996}"
 export AURSMITH_CONTROLLER_VERIFYING_KEY_HEX="${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_FETCH_PROXY="${AURSMITH_FETCH_PROXY:-192.0.2.10:8080}"
 export AURSMITH_TRANSFER_ENDPOINTS_JSON="${AURSMITH_TRANSFER_ENDPOINTS_JSON:-{\"00000000-0000-0000-0000-000000000001\":\"ssh://aursmith@192.0.2.10:2222\"}}"
+export AURSMITH_CONTROLLER_POLL_URL="${AURSMITH_CONTROLLER_POLL_URL:-https://controller.example.test/api/v1/reverse-workers/poll}"
+export AURSMITH_REVERSE_PUBLISHER_ENDPOINT="${AURSMITH_REVERSE_PUBLISHER_ENDPOINT:-ssh://aursmith@192.0.2.20:2223}"
 
 for stack in controller builder publisher archiver; do
   json="$(docker compose -f "deploy/${stack}/compose.yaml" config --format json)"
@@ -41,6 +43,15 @@ done < <(rg '^FROM ' deploy/images)
 builder_json="$(docker compose -f deploy/builder/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.devices[]? | select(.source == "/dev/kvm")] | length' <<<"${builder_json}")" != "1" ]]; then
   echo "Builder 必须且只能显式获得 /dev/kvm 构建设备" >&2
+  exit 1
+fi
+if jq -e '.services | has("ssh")' <<<"${builder_json}" >/dev/null \
+  || jq -e '.services.worker.ports[]?' <<<"${builder_json}" >/dev/null; then
+  echo "反向 Builder 禁止 SSH sidecar 和公网入站端口" >&2
+  exit 1
+fi
+if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_push_key" or .source == "publisher_known_hosts")] | length' <<<"${builder_json}")" != "2" ]]; then
+  echo "反向 Builder 必须使用独立 Publisher 推送密钥和固定 known_hosts" >&2
   exit 1
 fi
 

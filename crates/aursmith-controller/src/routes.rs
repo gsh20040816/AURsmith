@@ -1,6 +1,9 @@
 use crate::{auth, config::Config, error::ApiError, transport};
 use aursmith_domain::{REQUIREMENTS, WorkerRole, WorkerState};
-use aursmith_protocol::{InlineInput, JobKind, ManifestEntry, ResourceLimits};
+use aursmith_protocol::{
+    InlineInput, JobKind, ManifestEntry, ResourceLimits, ReverseWorkerLease, ReverseWorkerPoll,
+    SignedEnvelope,
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -82,6 +85,7 @@ pub fn router(state: AppState) -> Router {
             post(schedule_rebuild_recommendation),
         )
         .route("/api/v1/workers", get(list_workers).post(register_worker))
+        .route("/api/v1/reverse-workers/poll", post(reverse_worker_poll))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
         .route("/api/v1/workers/{id}/probe", post(probe_worker))
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
@@ -1018,6 +1022,12 @@ struct RegisterWorkerRequest {
     protocol_version: u16,
     #[serde(default)]
     labels: Vec<String>,
+    #[serde(default)]
+    connection_mode: Option<String>,
+    #[serde(default)]
+    worker_id: Option<Uuid>,
+    #[serde(default)]
+    identity_signing_key_hex: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1027,6 +1037,7 @@ struct WorkerResponse {
     role: String,
     state: String,
     endpoint: String,
+    connection_mode: String,
     protocol_version: i64,
     labels: Vec<String>,
     last_seen_at: Option<String>,
@@ -1040,13 +1051,64 @@ async fn register_worker(
     Json(request): Json<RegisterWorkerRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let administrator_id = auth::require_administrator(&state, &headers).await?;
-    if request.name.trim().is_empty() || request.endpoint.trim().is_empty() {
+    let connection_mode = request.connection_mode.as_deref().unwrap_or("direct");
+    if request.name.trim().is_empty()
+        || !matches!(connection_mode, "direct" | "reverse")
+        || (connection_mode == "direct" && request.endpoint.trim().is_empty())
+    {
         return Err(ApiError::bad_request(
             "INVALID_WORKER",
             "Worker 名称和端点不能为空",
         ));
     }
     let role = role_name(request.role);
+    if connection_mode == "reverse" {
+        if role != "builder" {
+            return Err(ApiError::bad_request(
+                "INVALID_REVERSE_WORKER",
+                "反向连接模式第一版只允许 Builder",
+            ));
+        }
+        let id = request.worker_id.ok_or_else(|| {
+            ApiError::bad_request("WORKER_ID_MISSING", "反向 Builder 必须提供实例 UUID")
+        })?;
+        let identity = request
+            .identity_signing_key_hex
+            .as_deref()
+            .filter(|value| {
+                value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "WORKER_SIGNING_KEY_MISSING",
+                    "反向 Builder 必须提供 32 字节 Ed25519 身份公钥",
+                )
+            })?;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, identity_signing_key_hex, connection_mode, created_at, updated_at) VALUES (?, ?, 'builder', 'offline', '', '', ?, ?, ?, 'reverse', ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(request.name.trim())
+        .bind(i64::from(request.protocol_version))
+        .bind(serde_json::to_string(&request.labels).map_err(ApiError::internal)?)
+        .bind(identity.to_ascii_lowercase())
+        .bind(now)
+        .bind(now)
+        .execute(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+        append_event(
+            &state.database,
+            "worker",
+            &id.to_string(),
+            "reverse_worker_registered",
+            json!({"name": request.name, "role": role}),
+            &administrator_id,
+        )
+        .await?;
+        return Ok((StatusCode::CREATED, Json(json!({"id": id}))));
+    }
     let remote = transport::status(&state.config, request.endpoint.trim()).await?;
     let id = remote.data["instance_id"]
         .as_str()
@@ -1129,13 +1191,101 @@ async fn register_worker(
     Ok((StatusCode::CREATED, Json(json!({"id": id}))))
 }
 
+async fn reverse_worker_poll(
+    State(state): State<AppState>,
+    Json(envelope): Json<SignedEnvelope>,
+) -> Result<Json<ReverseWorkerLease>, ApiError> {
+    if envelope.schema_major != aursmith_protocol::PROTOCOL_MAJOR {
+        return Err(ApiError::conflict(
+            "INCOMPATIBLE_PROTOCOL",
+            "协议 major version 不兼容",
+        ));
+    }
+    let poll: ReverseWorkerPoll = envelope
+        .verify("aursmith.reverse_worker_poll")
+        .map_err(|error| ApiError::conflict("INVALID_WORKER_SIGNATURE", error.to_string()))?;
+    if (Utc::now() - poll.sent_at).num_seconds().unsigned_abs() > 120 {
+        return Err(ApiError::conflict(
+            "STALE_WORKER_POLL",
+            "Builder 轮询时间戳已过期",
+        ));
+    }
+    let worker = sqlx::query(
+        "SELECT identity_signing_key_hex, protocol_version FROM workers WHERE id = ? AND role = 'builder' AND connection_mode = 'reverse'",
+    )
+    .bind(poll.worker_id.to_string())
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::not_found("反向 Builder 尚未注册"))?;
+    let expected_key: String = worker.get("identity_signing_key_hex");
+    if hex::encode(&envelope.verifying_key) != expected_key.to_ascii_lowercase() {
+        return Err(ApiError::conflict(
+            "WORKER_IDENTITY_MISMATCH",
+            "Builder 身份公钥不匹配",
+        ));
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO reverse_worker_nonces(worker_id, nonce, seen_at) VALUES (?, ?, ?)",
+    )
+    .bind(poll.worker_id.to_string())
+    .bind(poll.nonce.to_string())
+    .bind(Utc::now())
+    .execute(&state.database)
+    .await;
+    if inserted.is_err() {
+        return Err(ApiError::conflict(
+            "WORKER_POLL_REPLAY",
+            "Builder 轮询 nonce 已使用",
+        ));
+    }
+    for report in poll.attempts {
+        sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
+            .bind(poll.worker_id.to_string()).bind(report.job_id.to_string())
+            .bind(report.response.to_string()).bind(Utc::now())
+            .execute(&state.database).await.map_err(ApiError::internal)?;
+    }
+    for capability_id in poll.completed_transfers {
+        sqlx::query("UPDATE transfer_capabilities SET state = 'verified', last_error = NULL, export_cleaned_at = COALESCE(export_cleaned_at, ?), updated_at = ? WHERE id = ? AND source_worker_id = ? AND state IN ('export_ready', 'verified')")
+            .bind(Utc::now())
+            .bind(Utc::now()).bind(capability_id.to_string()).bind(poll.worker_id.to_string())
+            .execute(&state.database).await.map_err(ApiError::internal)?;
+    }
+    let status = &poll.status;
+    if status["instance_id"].as_str() != Some(&poll.worker_id.to_string())
+        || status["role"].as_str() != Some("builder")
+        || status["protocol_major"].as_i64() != Some(worker.get("protocol_version"))
+    {
+        sqlx::query("UPDATE workers SET state = 'incompatible', status_json = ?, updated_at = ? WHERE id = ?")
+            .bind(status.to_string()).bind(Utc::now()).bind(poll.worker_id.to_string())
+            .execute(&state.database).await.map_err(ApiError::internal)?;
+        return Err(ApiError::conflict(
+            "WORKER_IDENTITY_MISMATCH",
+            "Builder 状态身份或协议不匹配",
+        ));
+    }
+    sqlx::query("UPDATE workers SET state = 'online', profiles_json = ?, status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ? AND state != 'draining'")
+        .bind(status["profiles"].to_string()).bind(status.to_string())
+        .bind(Utc::now()).bind(Utc::now()).bind(poll.worker_id.to_string())
+        .execute(&state.database).await.map_err(ApiError::internal)?;
+    let job = crate::scheduler::lease_reverse_job(&state, poll.worker_id).await?;
+    let transfer = crate::scheduler::lease_reverse_transfer(&state, poll.worker_id).await?;
+    Ok(Json(ReverseWorkerLease {
+        worker_id: poll.worker_id,
+        job,
+        transfer,
+        issued_at: Utc::now(),
+        next_poll_seconds: 15,
+    }))
+}
+
 async fn list_workers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, name, role, state, endpoint, protocol_version, labels_json, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY name",
+        "SELECT id, name, role, state, endpoint, connection_mode, protocol_version, labels_json, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY name",
     )
     .fetch_all(&state.database)
     .await
@@ -1153,6 +1303,7 @@ async fn list_workers(
                 role: row.get("role"),
                 state: row.get("state"),
                 endpoint: row.get("endpoint"),
+                connection_mode: row.get("connection_mode"),
                 protocol_version: row.get("protocol_version"),
                 labels: serde_json::from_str(&labels_json).map_err(ApiError::internal)?,
                 last_seen_at: row.get("last_seen_at"),

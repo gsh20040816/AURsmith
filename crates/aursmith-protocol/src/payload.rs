@@ -1,3 +1,4 @@
+use crate::SignedEnvelope;
 use aursmith_domain::{ArchiveState, AttemptRef, WorkerRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -218,6 +219,35 @@ pub struct TransferCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseAttemptReport {
+    pub job_id: Uuid,
+    pub response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseWorkerPoll {
+    pub worker_id: Uuid,
+    pub nonce: Uuid,
+    pub status: serde_json::Value,
+    #[serde(default)]
+    pub attempts: Vec<ReverseAttemptReport>,
+    #[serde(default)]
+    pub completed_transfers: Vec<Uuid>,
+    pub sent_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseWorkerLease {
+    pub worker_id: Uuid,
+    #[serde(default)]
+    pub job: Option<SignedEnvelope>,
+    #[serde(default)]
+    pub transfer: Option<SignedEnvelope>,
+    pub issued_at: DateTime<Utc>,
+    pub next_poll_seconds: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseAuthorization {
     pub release_id: Uuid,
     pub batch_id: Uuid,
@@ -371,6 +401,38 @@ mod tests {
         let decoded: JobSpec = serde_json::from_value(legacy).unwrap();
         assert!(decoded.allow_check, "旧 JobSpec 必须保持默认执行 check()");
         assert!(decoded.expected_outputs.is_empty());
+    }
+
+    #[test]
+    fn reverse_worker_poll_and_lease_keep_signed_identity_and_job() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let worker_id = Uuid::new_v4();
+        let poll = ReverseWorkerPoll {
+            worker_id,
+            nonce: Uuid::new_v4(),
+            status: serde_json::json!({"role": "builder"}),
+            attempts: Vec::new(),
+            completed_transfers: Vec::new(),
+            sent_at: Utc::now(),
+        };
+        let envelope = SignedEnvelope::sign("aursmith.reverse_worker_poll", &poll, &key).unwrap();
+        assert_eq!(
+            envelope
+                .verify::<ReverseWorkerPoll>("aursmith.reverse_worker_poll")
+                .unwrap(),
+            poll
+        );
+        let lease = ReverseWorkerLease {
+            worker_id,
+            job: Some(envelope.clone()),
+            transfer: None,
+            issued_at: Utc::now(),
+            next_poll_seconds: 15,
+        };
+        let encoded = serde_json::to_vec(&lease).unwrap();
+        let decoded: ReverseWorkerLease = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.worker_id, worker_id);
+        assert_eq!(decoded.job.unwrap().payload_sha256, envelope.payload_sha256);
     }
 
     #[test]

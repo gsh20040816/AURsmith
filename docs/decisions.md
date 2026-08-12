@@ -59,6 +59,7 @@
 - ADR-055：Guest 对有日志的长任务执行通用无侵入诊断。日志连续 120 秒不增长时，将 `/proc` 中进程的名称、状态、PID/PPID、线程数、命令行和内核等待点追加到任务日志；不终止任务、不改变环境。该证据用于区分构建脚本、子进程回收、文件系统和 Guest PID 1 问题，确认根因后再实施修复。
 - ADR-056：Guest 恢复标准 Arch Linux 启动模型。真实 Jackett 诊断显示 Guest Agent 被错误地指定为 PID 1，却未回收孤儿进程，多个 GPG 和 .NET 进程成为 `PPid=1` 的 zombie；`dotnet build-server shutdown` 因等待已退出但未回收的 server PID 而阻塞 makepkg。本机 init 会正常回收，故同一 PKGBUILD 本机构建无此问题。修复方式是由 Profile 已安装的 systemd 作为 PID 1，并把 Guest Agent 注册成一次性 service；不自行实现 init，也不注入生态专用变量。这对所有会派生后台进程的构建工具生效。
 - ADR-057：每个 Release 固定包含 Signer 派生的 `aursmith-keyring`，而不是由 Publisher 手工写入 hot 目录。Controller 只授权生成行为，私钥仍不离开断网 Signer；Publisher 使用自己固定的公钥指纹复验包内 keyring。首次信任仍要求人工核对指纹，后续安装和轮换使用标准 `pacman-key --populate aursmith`。
+- ADR-058：真实单用户拓扑将 Controller、Agent、Publisher、Signer 和第一版 Archiver 放在公网 `netcup`，Builder 留在具有 KVM 的家庭桌面机。Builder 不开放公网入站端口，Controller 不再主动 SSH 调度它；Builder 以持久 Ed25519 身份通过 HTTPS 长轮询领取 Controller 签名 JobSpec、上报 Journal 状态，并使用 Controller 签名 TransferCapability 主动 rsync 推送产物到 Publisher。拒绝端口映射、反向隧道和让公网 Publisher 回连家庭 Builder；Publisher 与 Archiver 同机只是第一版部署选择，不取消 ArchiveCopy 的独立状态和未来迁移边界。
 
 ## 已拒绝
 

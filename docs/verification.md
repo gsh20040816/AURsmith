@@ -318,3 +318,11 @@
 - Jackett 同版本重建的 Build Job `2682e517-68bb-43ad-8673-928cfd40a153` 成功，发布版本递增为 `0.24.2307-1.1`。Release `0deee4fc-9c52-4f36-a788-90733407b236` 已提交，Manifest SHA-256 为 `b545f6001b65323b024ffd1ae5a864907f4022cf50bda5990ce9b1dee03fe33b`；ArchiveCopy `d7a3acdd-d010-4ee9-93e5-63ffa3187f42` 已验证，Receipt SHA-256 为 `9fc98125b4cff8050d9ea3d9c8c407565669196a63d73ec09a70ed2e305b2bb2`。
 - 公开仓库数据库经 `bsdtar` 实际读取，包含 `jackett-0.24.2307-1.1` 和 `aursmith-keyring-20260811.155833.ded1c44f.0deee4fc-1`。在全新的 `archlinux:base` 容器中完成 `pacman-key --init`、导入并本地签署人工核对过的指纹、`pacman -Sy` 和 `pacman -S aursmith-keyring`；安装脚本实际输出“Appending keys from aursmith.gpg”，随后三个 keyring 文件存在，trusted 文件精确包含 `BE59BEA40D9F50E7DA64BCBAFE313D9CC82D812D:4:`，pacman 信任库可读取同一指纹，`pacman -Q` 返回已安装版本。
 - 信任边界不变：首次接入仍必须通过独立渠道人工核对指纹并导入公钥，因为尚未建立信任根时，签名仓库不能靠仓库内的 Keyring 软件包自证可信。首次安装后，后续密钥发布和轮换可由标准软件包升级与 `pacman-key --populate aursmith` 完成。
+
+## 2026-08-12：家庭 Builder 仅出站协议
+
+- 真实部署拓扑固定为 Controller、Agent、Publisher、Signer 和第一版 Archiver 位于公网节点，KVM Builder 留在家庭桌面机。Builder Compose 已删除 SSH sidecar、宿主端口映射、SSH host key 和入站 authorized_keys；安全检查会拒绝这些配置重新出现。
+- Builder 使用 Journal 中持久 Ed25519 身份签署 HTTPS 轮询，消息绑定 Worker UUID、一次性 nonce、时间、状态和最多 32 个近期 Attempt。Controller 固定身份公钥、持久化 nonce 防重放、按最后上报时间维护 Worker 状态，并返回原有 Controller 签名 JobSpec；反向调度继续实施标签、Profile、preferred worker 和 ReleaseBatch 节点亲和性。
+- 成功 Build 的 Artifact 与三份完整证据仍由原 `TransferCapability` 绑定。Controller 先让 Publisher 建立 Capability 专属 partial 接收目录，Builder 再通过固定 host key 和独立推送密钥主动 rsync；客户端和 forced command 两侧都只允许 `/landing/.<Capability ID>.partial/` 的固定 receiver 形态。Publisher 复验完整文件集合后原子接管，Builder 下一轮签名上报完成状态；确认响应丢失时不会重复上传已经标记为 pushed 的内容。
+- `bash scripts/test-all.sh` 实际通过：全部 Rust 测试、前端 8 个 Vitest、TypeScript 检查、生产构建和 Compose 安全检查均成功。随后修改节点亲和性和断线幂等逻辑后，再次执行相关 Rust 测试、前端检查/测试/构建、Compose 检查和 `git diff --check`，全部通过。旧 Builder SSH 冒烟脚本已改为验证反向 Builder 无入站服务及推送凭据存在，实际通过。
+- 未验证范围：尚未把 Stack 迁移到 `netcup`，也未在真实公网链路上执行一次完整的“轮询领取 → KVM 构建 → rsync 推送 → Release 发布”。因此当前结论是协议、实现、Compose 与本地测试通过，不宣称远程部署已经完成。

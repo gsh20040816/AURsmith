@@ -32,7 +32,9 @@ describe("AURsmith 控制台", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Worker/ }));
     expect(await screen.findByText("注册 Worker")).toBeInTheDocument();
     expect(screen.getByLabelText("实例名称")).toBeInTheDocument();
-    expect(screen.getByLabelText("SSH host key 指纹")).toBeInTheDocument();
+    expect(screen.getByLabelText("连接模式")).toHaveValue("reverse");
+    expect(screen.getByLabelText("Builder 实例 UUID")).toBeInTheDocument();
+    expect(screen.getByLabelText("Builder 身份公钥")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "探测并注册" })).toBeInTheDocument();
   });
 

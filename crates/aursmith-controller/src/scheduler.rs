@@ -1199,7 +1199,7 @@ fn push_evidence(
 }
 
 async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
-    let cleanup = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.envelope_json, workers.endpoint FROM transfer_capabilities JOIN workers ON workers.id = transfer_capabilities.source_worker_id WHERE transfer_capabilities.state = 'verified' AND transfer_capabilities.export_cleaned_at IS NULL ORDER BY transfer_capabilities.updated_at LIMIT 1")
+    let cleanup = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.envelope_json, workers.endpoint FROM transfer_capabilities JOIN workers ON workers.id = transfer_capabilities.source_worker_id WHERE transfer_capabilities.state = 'verified' AND transfer_capabilities.export_cleaned_at IS NULL AND workers.connection_mode = 'direct' ORDER BY transfer_capabilities.updated_at LIMIT 1")
         .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
     if let Some(row) = cleanup {
         let envelope: SignedEnvelope =
@@ -1218,7 +1218,7 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
     }
     sqlx::query("UPDATE transfer_capabilities SET state = 'expired', updated_at = ? WHERE state IN ('issued', 'export_ready') AND expires_at <= ?")
         .bind(Utc::now()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
-    let pending = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.state, transfer_capabilities.envelope_json, transfer_capabilities.attempt_count, source.endpoint AS source_endpoint, destination.endpoint AS destination_endpoint FROM transfer_capabilities JOIN workers AS source ON source.id = transfer_capabilities.source_worker_id JOIN workers AS destination ON destination.id = transfer_capabilities.destination_worker_id WHERE transfer_capabilities.state IN ('issued', 'export_ready') AND transfer_capabilities.expires_at > ? ORDER BY transfer_capabilities.updated_at LIMIT 1")
+    let pending = sqlx::query("SELECT transfer_capabilities.id, transfer_capabilities.state, transfer_capabilities.envelope_json, transfer_capabilities.attempt_count, source.endpoint AS source_endpoint, destination.endpoint AS destination_endpoint FROM transfer_capabilities JOIN workers AS source ON source.id = transfer_capabilities.source_worker_id JOIN workers AS destination ON destination.id = transfer_capabilities.destination_worker_id WHERE transfer_capabilities.state IN ('issued', 'export_ready') AND transfer_capabilities.expires_at > ? AND source.connection_mode = 'direct' ORDER BY transfer_capabilities.updated_at LIMIT 1")
         .bind(Utc::now()).fetch_optional(&state.database).await.map_err(ApiError::internal)?;
     if let Some(row) = pending {
         let id: String = row.get("id");
@@ -1540,15 +1540,229 @@ async fn upsert_operational_alert(
 }
 
 async fn probe_all_workers(state: &AppState) -> Result<(), ApiError> {
-    let worker_ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM workers WHERE state != 'draining'")
-            .fetch_all(&state.database)
-            .await
-            .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE workers SET state = CASE WHEN last_seen_at < ? THEN 'offline' ELSE 'degraded' END, updated_at = ? WHERE connection_mode = 'reverse' AND state NOT IN ('draining', 'incompatible') AND (last_seen_at IS NULL OR last_seen_at < ?)")
+        .bind(Utc::now() - Duration::minutes(5))
+        .bind(Utc::now())
+        .bind(Utc::now() - Duration::minutes(1))
+        .execute(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    let worker_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM workers WHERE state != 'draining' AND connection_mode = 'direct'",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
     for worker_id in worker_ids {
         let _ = probe_worker(state, &worker_id).await;
     }
     Ok(())
+}
+
+pub(crate) async fn lease_reverse_job(
+    state: &AppState,
+    worker_id: Uuid,
+) -> Result<Option<SignedEnvelope>, ApiError> {
+    if publication_backpressure(&state.database).await? {
+        return Ok(None);
+    }
+    let worker = sqlx::query(
+        "SELECT labels_json, profiles_json FROM workers WHERE id = ? AND role = 'builder' AND connection_mode = 'reverse' AND state = 'online'",
+    )
+    .bind(worker_id.to_string())
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(worker) = worker else {
+        return Ok(None);
+    };
+    let profiles: BTreeSet<String> =
+        serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
+    let labels: BTreeSet<String> =
+        serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
+    let rows = sqlx::query(
+        "SELECT id, batch_id, profile_sha256, preferred_worker_id, required_labels_json FROM jobs WHERE required_role = 'builder' AND status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at",
+    )
+    .bind(Utc::now())
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let mut selected = None;
+    for row in rows {
+        let required_labels: BTreeSet<String> =
+            serde_json::from_str(row.get("required_labels_json")).unwrap_or_default();
+        let explicit_preference: Option<String> = row.get("preferred_worker_id");
+        let batch_preference = if let Some(batch_id) = row.get::<Option<String>, _>("batch_id") {
+            sqlx::query_scalar::<_, String>("SELECT worker_id FROM jobs WHERE batch_id = ? AND worker_id IS NOT NULL ORDER BY created_at LIMIT 1")
+                .bind(batch_id).fetch_optional(&state.database).await.map_err(ApiError::internal)?
+        } else {
+            None
+        };
+        let eligible = required_labels.is_subset(&labels)
+            && explicit_preference
+                .or(batch_preference)
+                .is_none_or(|preferred| preferred == worker_id.to_string())
+            && row
+                .get::<Option<String>, _>("profile_sha256")
+                .as_ref()
+                .is_none_or(|profile| profiles.contains(profile));
+        if eligible {
+            selected = Some(row);
+            break;
+        }
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let job_id: String = selected.get("id");
+    let envelope = dispatch_job_to_worker(state, &job_id, worker_id).await?;
+    resolve_alert(state, &format!("no-eligible-worker:{job_id}")).await?;
+    Ok(Some(envelope))
+}
+
+pub(crate) async fn lease_reverse_transfer(
+    state: &AppState,
+    worker_id: Uuid,
+) -> Result<Option<SignedEnvelope>, ApiError> {
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT envelope_json FROM transfer_capabilities WHERE source_worker_id = ? AND state = 'export_ready' AND expires_at > ? ORDER BY updated_at LIMIT 1",
+    )
+    .bind(worker_id.to_string())
+    .bind(Utc::now())
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(value) = existing {
+        return serde_json::from_str(&value)
+            .map(Some)
+            .map_err(ApiError::internal);
+    }
+    let issued = sqlx::query(
+        "SELECT envelope_json FROM transfer_capabilities WHERE source_worker_id = ? AND state = 'issued' AND expires_at > ? ORDER BY updated_at LIMIT 1",
+    )
+    .bind(worker_id.to_string())
+    .bind(Utc::now())
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(issued) = issued else {
+        return Ok(None);
+    };
+    let value: String = issued.get("envelope_json");
+    let envelope: SignedEnvelope = serde_json::from_str(&value).map_err(ApiError::internal)?;
+    let capability: aursmith_protocol::TransferCapability = envelope
+        .verify("aursmith.transfer_capability")
+        .map_err(ApiError::internal)?;
+    let publisher = sqlx::query(
+        "SELECT endpoint FROM workers WHERE id = ? AND role = 'publisher' AND state = 'online'",
+    )
+    .bind(capability.destination_worker.to_string())
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(publisher) = publisher else {
+        return Ok(None);
+    };
+    transport::prepare_push_import(&state.config, publisher.get("endpoint"), &envelope).await?;
+    sqlx::query("UPDATE transfer_capabilities SET state = 'export_ready', updated_at = ? WHERE id = ? AND state = 'issued'")
+        .bind(Utc::now()).bind(capability.id.to_string())
+        .execute(&state.database).await.map_err(ApiError::internal)?;
+    Ok(Some(envelope))
+}
+
+async fn dispatch_job_to_worker(
+    state: &AppState,
+    job_id: &str,
+    worker_id: Uuid,
+) -> Result<SignedEnvelope, ApiError> {
+    let job = sqlx::query(
+        "SELECT required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
+    )
+    .bind(job_id)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::conflict("JOB_ALREADY_LEASED", "任务已被其他 Builder 领取"))?;
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(generation), -1) + 1 FROM attempts WHERE job_id = ?",
+    )
+    .bind(job_id)
+    .fetch_one(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let parsed_job_id = Uuid::parse_str(job_id).map_err(ApiError::internal)?;
+    let attempt_id = Uuid::new_v4();
+    let attempt = AttemptRef {
+        job_id: parsed_job_id,
+        attempt_id,
+        generation: u32::try_from(generation).map_err(ApiError::internal)?,
+    };
+    let now = Utc::now();
+    let limits: ResourceLimits = serde_json::from_str(
+        job.get::<Option<String>, _>("limits_json")
+            .as_deref()
+            .unwrap_or(
+                "{\"cpu_count\":1,\"memory_mib\":1024,\"disk_mib\":4096,\"timeout_seconds\":600}",
+            ),
+    )
+    .map_err(ApiError::internal)?;
+    let spec = JobSpec {
+        job_id: parsed_job_id,
+        attempt: attempt.clone(),
+        required_role: parse_role(job.get("required_role"))?,
+        kind: parse_job_kind(job.get("kind"))?,
+        revision_sha256: job
+            .get::<Option<String>, _>("revision_sha256")
+            .unwrap_or_else(|| "0".repeat(64)),
+        source_manifest_sha256: job.get("source_manifest_sha256"),
+        dependency_snapshot_sha256: job.get("dependency_snapshot_sha256"),
+        profile_sha256: job.get("profile_sha256"),
+        upstream_pkgrel: job.get("upstream_pkgrel"),
+        published_pkgrel: job.get("published_pkgrel"),
+        source_attempt_id: job
+            .get::<Option<String>, _>("source_attempt_id")
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(ApiError::internal)?,
+        dependency_attempt_ids: load_batch_dependency_attempts(state, job_id).await?,
+        dependencies: load_job_dependencies(state, job_id).await?,
+        inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
+        inline_inputs: serde_json::from_str(job.get("inline_inputs_json"))
+            .map_err(ApiError::internal)?,
+        expected_outputs: serde_json::from_str(job.get("expected_outputs_json"))
+            .map_err(ApiError::internal)?,
+        allow_check: job.get::<i64, _>("allow_check") != 0,
+        limits,
+        issued_at: now,
+        expires_at: now + Duration::minutes(10),
+    };
+    let envelope = SignedEnvelope::sign("aursmith.job_spec", &spec, &state.signing_key)
+        .map_err(ApiError::internal)?;
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO attempts(id, job_id, generation, token_sha256, status) VALUES (?, ?, ?, ?, 'dispatched')")
+        .bind(attempt_id.to_string())
+        .bind(job_id)
+        .bind(generation)
+        .bind(&envelope.payload_sha256)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    let updated = sqlx::query("UPDATE jobs SET worker_id = ?, status = 'dispatched', failure_code = NULL, next_attempt_at = NULL, signed_spec_json = ?, updated_at = ? WHERE id = ? AND status IN ('queued', 'no_eligible_worker')")
+        .bind(worker_id.to_string())
+        .bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+        .bind(now)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "JOB_ALREADY_LEASED",
+            "任务已被其他 Builder 领取",
+        ));
+    }
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(envelope)
 }
 
 async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
@@ -1568,7 +1782,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     let required_labels: BTreeSet<String> =
         serde_json::from_str(job.get("required_labels_json")).map_err(ApiError::internal)?;
     let workers = sqlx::query(
-        "SELECT id, endpoint, labels_json, profiles_json FROM workers WHERE role = ? AND state = 'online' AND protocol_version = ? ORDER BY name",
+        "SELECT id, endpoint, labels_json, profiles_json FROM workers WHERE role = ? AND state = 'online' AND protocol_version = ? AND connection_mode = 'direct' ORDER BY name",
     )
     .bind(&role)
     .bind(i64::from(aursmith_protocol::PROTOCOL_MAJOR))
@@ -1713,7 +1927,7 @@ async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, A
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.profile_sha256, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.profile_sha256, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
     )
     .bind(Utc::now() - Duration::minutes(30))
     .fetch_optional(&state.database)
@@ -1721,8 +1935,23 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     .map_err(ApiError::internal)?;
     let Some(row) = row else { return Ok(()) };
     let job_id: String = row.get("id");
+    let connection_mode: String = row.get("connection_mode");
+    let remote_reply = if connection_mode == "reverse" {
+        row.get::<Option<String>, _>("response_json")
+            .map(|value| serde_json::from_str::<transport::WorkerReply>(&value))
+            .transpose()
+            .map_err(ApiError::internal)?
+    } else {
+        None
+    };
     let endpoint: String = row.get("endpoint");
-    let reply = match transport::query(&state.config, &endpoint, &job_id).await {
+    let reply = match if let Some(reply) = remote_reply {
+        Ok(reply)
+    } else if connection_mode == "reverse" {
+        return Ok(());
+    } else {
+        transport::query(&state.config, &endpoint, &job_id).await
+    } {
         Ok(reply) => reply,
         Err(error) if row.get::<String, _>("controller_status") == "uncertain" => {
             handle_uncertain_timeout(
@@ -1822,6 +2051,14 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
+    if connection_mode == "reverse" {
+        sqlx::query("DELETE FROM reverse_worker_reports WHERE worker_id = (SELECT worker_id FROM jobs WHERE id = ?) AND job_id = ?")
+            .bind(&job_id)
+            .bind(&job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     if status == "succeeded"
         || evidence_logs
             .as_array()

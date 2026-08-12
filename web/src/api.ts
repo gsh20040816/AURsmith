@@ -38,6 +38,7 @@ export type Worker = {
   role: "builder" | "publisher" | "archiver";
   state: "online" | "draining" | "offline" | "degraded" | "incompatible";
   endpoint: string;
+  connection_mode: "direct" | "reverse";
   protocol_version: number;
   labels: string[];
   last_seen_at: string | null;
@@ -287,6 +288,9 @@ export const api = {
     ssh_host_key_sha256: string;
     protocol_version: number;
     labels: string[];
+    connection_mode?: "direct" | "reverse";
+    worker_id?: string;
+    identity_signing_key_hex?: string;
   }) => request<{ id: string }>("/api/v1/workers", {
     method: "POST",
     body: JSON.stringify(worker)

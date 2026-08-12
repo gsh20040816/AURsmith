@@ -230,7 +230,7 @@ function WorkersView() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [draft, setDraft] = useState({ name: "", role: "builder" as Worker["role"], endpoint: "", hostKey: "", labels: "" });
+  const [draft, setDraft] = useState({ name: "", role: "builder" as Worker["role"], mode: "reverse" as "direct" | "reverse", endpoint: "", hostKey: "", workerId: "", identityKey: "", labels: "" });
   const refresh = () => void api.workers().then((response) => setWorkers(response.items)).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
   const register = async (event: FormEvent) => {
@@ -239,9 +239,12 @@ function WorkersView() {
       await api.registerWorker({
         name: draft.name.trim(), role: draft.role, endpoint: draft.endpoint.trim(),
         ssh_host_key_sha256: draft.hostKey.trim(), protocol_version: 1,
+        connection_mode: draft.mode,
+        worker_id: draft.mode === "reverse" ? draft.workerId.trim() : undefined,
+        identity_signing_key_hex: draft.mode === "reverse" ? draft.identityKey.trim() : undefined,
         labels: draft.labels.split(",").map((label) => label.trim()).filter(Boolean)
       });
-      setDraft({ name: "", role: "builder", endpoint: "", hostKey: "", labels: "" });
+      setDraft({ name: "", role: "builder", mode: "reverse", endpoint: "", hostKey: "", workerId: "", identityKey: "", labels: "" });
       refresh();
     } catch (reason) { setError(messageOf(reason)); } finally { setBusy(false); }
   };
@@ -250,16 +253,22 @@ function WorkersView() {
       <header className="page-header compact"><div><p className="eyebrow">W02 / W04</p><h1>Worker</h1><p className="lede">角色分离部署，任务在本地 Journal 中保持幂等。</p></div></header>
       {error && <Notice kind="error">{error}</Notice>}
       <section className="work-panel">
-        <div className="section-heading"><div><p className="eyebrow">固定 SSH 身份</p><h2>注册 Worker</h2></div></div>
+        <div className="section-heading"><div><p className="eyebrow">固定 Worker 身份</p><h2>注册 Worker</h2></div></div>
         <form className="worker-form" onSubmit={(event) => void register(event)}>
           <label>实例名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="compute-01" required /></label>
-          <label>角色<select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Worker["role"] })}><option value="builder">Builder</option><option value="publisher">Publisher</option><option value="archiver">Archiver</option></select></label>
-          <label>SSH 端点<input value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} placeholder="ssh://aursmith@192.0.2.10:2222" required /></label>
-          <label>SSH host key 指纹<input value={draft.hostKey} onChange={(event) => setDraft({ ...draft, hostKey: event.target.value })} placeholder="SHA256:…" required /></label>
+          <label>角色<select value={draft.role} onChange={(event) => { const role = event.target.value as Worker["role"]; setDraft({ ...draft, role, mode: role === "builder" ? draft.mode : "direct" }); }}><option value="builder">Builder</option><option value="publisher">Publisher</option><option value="archiver">Archiver</option></select></label>
+          <label>连接模式<select value={draft.mode} onChange={(event) => setDraft({ ...draft, mode: event.target.value as "direct" | "reverse" })}><option value="reverse" disabled={draft.role !== "builder"}>Builder 主动轮询</option><option value="direct">Controller 直连 SSH</option></select></label>
+          {draft.mode === "direct" ? <>
+            <label>SSH 端点<input value={draft.endpoint} onChange={(event) => setDraft({ ...draft, endpoint: event.target.value })} placeholder="ssh://aursmith@192.0.2.10:2222" required /></label>
+            <label>SSH host key 指纹<input value={draft.hostKey} onChange={(event) => setDraft({ ...draft, hostKey: event.target.value })} placeholder="SHA256:…" required /></label>
+          </> : <>
+            <label>Builder 实例 UUID<input value={draft.workerId} onChange={(event) => setDraft({ ...draft, workerId: event.target.value })} placeholder="从本地 Worker status 复制" required /></label>
+            <label>Builder 身份公钥<input value={draft.identityKey} onChange={(event) => setDraft({ ...draft, identityKey: event.target.value })} placeholder="64 位十六进制 Ed25519 公钥" required /></label>
+          </>}
           <label>标签（逗号分隔）<input value={draft.labels} onChange={(event) => setDraft({ ...draft, labels: event.target.value })} placeholder="nvme,large-memory" /></label>
           <button className="secondary-button" disabled={busy}>{busy ? "正在探测…" : "探测并注册"}</button>
         </form>
-        <p className="panel-note">端点必须已经写入 Controller 的 known_hosts；注册时会连接 Worker，并核对实例名称、角色、协议和持久化身份公钥。</p>
+        <p className="panel-note">家庭 Builder 使用主动轮询，不开放公网端口；实例 UUID 和身份公钥从本地 Worker status 复制。Publisher/Archiver 直连模式仍要求端点已写入 Controller known_hosts。</p>
       </section>
       <section className="table-panel">
         <div className="section-heading"><h2>已注册节点</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>
@@ -267,7 +276,7 @@ function WorkersView() {
           <div className="empty-state"><span className="empty-symbol">＋</span><div><strong>尚未注册 Worker</strong><p>先部署对应 Compose Stack，再固定 SSH host key 并注册端点。</p></div></div>
         ) : (
           <div className="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>端点</th><th>资源</th><th>标签</th><th /></tr></thead><tbody>
-            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}</td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td><code>{worker.endpoint}</code></td><td>{worker.storage ? `${worker.storage.available_percent}% 可用` : "等待探测"}<small className="cell-note">时钟 {worker.clock_skew_seconds ?? "?"} 秒</small></td><td>{worker.labels.join(" · ") || "—"}</td><td><div className="row-actions"><button className="text-button" onClick={() => void api.probeWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>探测</button>{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</div></td></tr>)}
+            {workers.map((worker) => <tr key={worker.id}><td><strong>{worker.name}</strong></td><td>{roleLabel(worker.role)}<small className="cell-note">{worker.connection_mode === "reverse" ? "主动轮询" : "SSH 直连"}</small></td><td><span className={`state ${worker.state}`}>{worker.state}</span></td><td>{worker.connection_mode === "reverse" ? "仅出站" : <code>{worker.endpoint}</code>}</td><td>{worker.storage ? `${worker.storage.available_percent}% 可用` : "等待上报"}<small className="cell-note">时钟 {worker.clock_skew_seconds ?? "?"} 秒</small></td><td>{worker.labels.join(" · ") || "—"}</td><td><div className="row-actions">{worker.connection_mode === "direct" && <button className="text-button" onClick={() => void api.probeWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>探测</button>}{worker.state === "online" && <button className="text-button" onClick={() => void api.drainWorker(worker.id).then(refresh).catch((reason) => setError(messageOf(reason)))}>排空</button>}</div></td></tr>)}
           </tbody></table></div>
         )}
       </section>

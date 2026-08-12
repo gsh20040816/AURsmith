@@ -7,7 +7,8 @@ use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
     ArchiveInventory, ArchiveReceipt, ArtifactRecord, BackupArchiveReceipt, ControlPlaneBackup,
     JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, ReleaseRollbackAuthorization,
-    SignedEnvelope, TransferCapability,
+    ReverseAttemptReport, ReverseWorkerLease, ReverseWorkerPoll, SignedEnvelope,
+    TransferCapability,
 };
 use chrono::Utc;
 use clap::Parser;
@@ -30,6 +31,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "aursmith-worker", version)]
@@ -98,6 +100,14 @@ struct Cli {
     publisher_gpg_home: PathBuf,
     #[arg(long, env = "AURSMITH_ARCHIVE_DIR", default_value = "/archive")]
     archive_dir: PathBuf,
+    #[arg(long, env = "AURSMITH_CONTROLLER_POLL_URL")]
+    controller_poll_url: Option<String>,
+    #[arg(long, env = "AURSMITH_REVERSE_PUBLISHER_ENDPOINT")]
+    reverse_publisher_endpoint: Option<String>,
+    #[arg(long, env = "AURSMITH_REVERSE_PUSH_SSH_IDENTITY_FILE")]
+    reverse_push_ssh_identity_file: Option<PathBuf>,
+    #[arg(long, env = "AURSMITH_REVERSE_PUSH_SSH_KNOWN_HOSTS_FILE")]
+    reverse_push_ssh_known_hosts_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -141,6 +151,9 @@ struct Worker {
     archive_dir: PathBuf,
     identity_signing_key: SigningKey,
     repository_gpg_fingerprint: Option<String>,
+    reverse_publisher_endpoint: Option<String>,
+    reverse_push_ssh_identity_file: Option<PathBuf>,
+    reverse_push_ssh_known_hosts_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +195,15 @@ enum WorkerCommand {
         envelope: SignedEnvelope,
     },
     AuthorizeImport {
+        envelope: SignedEnvelope,
+    },
+    PreparePushImport {
+        envelope: SignedEnvelope,
+    },
+    ResolveImport {
+        capability_id: String,
+    },
+    FinalizePushImport {
         envelope: SignedEnvelope,
     },
     AuthorizeRelease {
@@ -293,6 +315,9 @@ async fn main() -> anyhow::Result<()> {
         archive_dir: cli.archive_dir,
         identity_signing_key,
         repository_gpg_fingerprint,
+        reverse_publisher_endpoint: cli.reverse_publisher_endpoint,
+        reverse_push_ssh_identity_file: cli.reverse_push_ssh_identity_file,
+        reverse_push_ssh_known_hosts_file: cli.reverse_push_ssh_known_hosts_file,
     });
     if worker.builder.is_some() {
         builder::spawn(
@@ -310,6 +335,21 @@ async fn main() -> anyhow::Result<()> {
         )?;
         spawn_publisher(worker.clone());
     }
+    if let Some(poll_url) = cli.controller_poll_url {
+        if worker.role != WorkerRole::Builder {
+            bail!("反向轮询模式第一版只允许 Builder");
+        }
+        let parsed = url::Url::parse(&poll_url).context("Controller poll URL 无效")?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!("Controller poll URL 必须是无凭据、查询参数和片段的 HTTPS URL");
+        }
+        spawn_reverse_poll(worker.clone(), parsed);
+    }
     prepare_socket(&cli.socket).await?;
     let listener = UnixListener::bind(&cli.socket)
         .with_context(|| format!("无法监听 Unix Socket {}", cli.socket))?;
@@ -323,6 +363,256 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+}
+
+fn spawn_reverse_poll(worker: Arc<Worker>, poll_url: url::Url) {
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, "无法创建 Builder 反向轮询客户端");
+                return;
+            }
+        };
+        let mut failure_delay = 2_u64;
+        loop {
+            match reverse_poll_once(&client, &worker, &poll_url).await {
+                Ok(next_poll) => {
+                    failure_delay = 2;
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::from(next_poll))).await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, delay_seconds = failure_delay, "Builder 反向轮询失败");
+                    tokio::time::sleep(std::time::Duration::from_secs(failure_delay)).await;
+                    failure_delay = (failure_delay * 2).min(60);
+                }
+            }
+        }
+    });
+}
+
+async fn reverse_poll_once(
+    client: &reqwest::Client,
+    worker: &Worker,
+    poll_url: &url::Url,
+) -> anyhow::Result<u16> {
+    let status_response = status(worker).await;
+    if !status_response.ok {
+        bail!("无法生成 Builder 状态：{}", status_response.message);
+    }
+    let worker_id = status_response.data["instance_id"]
+        .as_str()
+        .context("Builder 状态缺少 instance_id")?
+        .parse::<uuid::Uuid>()?;
+    let rows = sqlx::query("SELECT job_id FROM attempts ORDER BY received_at DESC LIMIT 32")
+        .fetch_all(&worker.database)
+        .await?;
+    let mut attempts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let job_id: String = row.get("job_id");
+        let response = query(worker, &job_id).await;
+        attempts.push(ReverseAttemptReport {
+            job_id: job_id.parse()?,
+            response: serde_json::to_value(response)?,
+        });
+    }
+    let completed_transfers: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT capability_id FROM transfer_exports WHERE state = 'pushed' ORDER BY capability_id",
+    )
+    .fetch_all(&worker.database)
+    .await?
+    .into_iter()
+    .filter_map(|value: String| value.parse().ok())
+    .collect();
+    let poll = ReverseWorkerPoll {
+        worker_id,
+        nonce: uuid::Uuid::new_v4(),
+        status: status_response.data,
+        attempts,
+        completed_transfers: completed_transfers.clone(),
+        sent_at: Utc::now(),
+    };
+    let envelope = SignedEnvelope::sign(
+        "aursmith.reverse_worker_poll",
+        &poll,
+        &worker.identity_signing_key,
+    )?;
+    let response = client.post(poll_url.clone()).json(&envelope).send().await?;
+    if !response.status().is_success() {
+        bail!(
+            "Controller 拒绝 Builder 轮询：HTTP {} {}",
+            response.status(),
+            response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect::<String>()
+        );
+    }
+    let lease: ReverseWorkerLease = response.json().await?;
+    if lease.worker_id != worker_id {
+        bail!("Controller 返回了其他 Worker 的租约");
+    }
+    if let Some(job) = lease.job {
+        let accepted = submit(worker, job).await;
+        if !accepted.ok {
+            bail!(
+                "Builder 拒绝领取任务：{} {}",
+                accepted.code,
+                accepted.message
+            );
+        }
+    }
+    if let Some(transfer) = lease.transfer {
+        push_transfer(worker, transfer).await?;
+    }
+    for capability_id in completed_transfers {
+        sqlx::query("UPDATE transfer_exports SET state = 'completed' WHERE capability_id = ? AND state = 'pushed'")
+            .bind(capability_id.to_string()).execute(&worker.database).await?;
+        let directory = worker
+            .jobs_dir
+            .join("transfers")
+            .join(capability_id.to_string());
+        if directory.exists() {
+            std::fs::remove_dir_all(directory)?;
+        }
+    }
+    Ok(lease.next_poll_seconds.clamp(2, 60))
+}
+
+async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Result<()> {
+    let capability: TransferCapability = envelope.verify("aursmith.transfer_capability")?;
+    let local_state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM transfer_exports WHERE capability_id = ?")
+            .bind(capability.id.to_string())
+            .fetch_optional(&worker.database)
+            .await?;
+    if matches!(local_state.as_deref(), Some("pushed" | "completed")) {
+        return Ok(());
+    }
+    let prepared = authorize_export(worker, envelope.clone()).await;
+    if !prepared.ok {
+        bail!(
+            "Builder 无法准备 Artifact 导出：{} {}",
+            prepared.code,
+            prepared.message
+        );
+    }
+    let endpoint = worker
+        .reverse_publisher_endpoint
+        .as_deref()
+        .context("反向 Builder 未配置 Publisher SSH 端点")?;
+    let identity = worker
+        .reverse_push_ssh_identity_file
+        .as_deref()
+        .context("反向 Builder 未配置 Publisher 推送私钥")?;
+    let known_hosts = worker
+        .reverse_push_ssh_known_hosts_file
+        .as_deref()
+        .context("反向 Builder 未配置 Publisher known_hosts")?;
+    let endpoint = url::Url::parse(endpoint)?;
+    if endpoint.scheme() != "ssh"
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.host_str().is_none()
+    {
+        bail!("Publisher SSH 端点无效");
+    }
+    let host = endpoint.host_str().unwrap_or_default();
+    let user = if endpoint.username().is_empty() {
+        "aursmith"
+    } else {
+        endpoint.username()
+    };
+    let remote = if host.contains(':') {
+        format!("{user}@[{host}]")
+    } else {
+        format!("{user}@{host}")
+    };
+    let source = worker
+        .jobs_dir
+        .join("transfers")
+        .join(capability.id.to_string());
+    let destination = format!("{remote}:/landing/.{}.partial/", capability.id);
+    let control_tool = std::env::current_exe()?
+        .parent()
+        .map(|parent| parent.join("aursmithctl"))
+        .filter(|path| path.is_file())
+        .context("Worker 同目录缺少 aursmithctl")?;
+    let output = tokio::process::Command::new("/usr/bin/rsync")
+        .args(["-a", "--numeric-ids", "--partial", "--delay-updates", "-e"])
+        .arg(format!("{} rsync-ssh", control_tool.display()))
+        .arg(format!("{}/", source.display()))
+        .arg(destination)
+        .env("AURSMITH_RSYNC_SSH_IDENTITY_FILE", identity)
+        .env("AURSMITH_RSYNC_SSH_KNOWN_HOSTS_FILE", known_hosts)
+        .env(
+            "AURSMITH_RSYNC_SSH_PORT",
+            endpoint.port().unwrap_or(22).to_string(),
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!(
+            "Artifact rsync 推送失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        );
+    }
+    let envelope_file = tempfile::NamedTempFile::new()?;
+    std::fs::write(envelope_file.path(), serde_json::to_vec(&envelope)?)?;
+    let finalize = tokio::process::Command::new("/usr/bin/ssh")
+        .args(["-T", "-p", &endpoint.port().unwrap_or(22).to_string(), "-i"])
+        .arg(identity)
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ])
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg(remote)
+        .arg("finalize-push-import")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let bytes = std::fs::read(envelope_file.path())?;
+    let mut finalize = finalize;
+    finalize
+        .stdin
+        .take()
+        .context("无法打开 Publisher SSH stdin")?
+        .write_all(&bytes)
+        .await?;
+    let output = finalize.wait_with_output().await?;
+    if !output.status.success() {
+        bail!(
+            "Publisher 拒绝完成 Artifact 推送：{}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        );
+    }
+    sqlx::query("UPDATE transfer_exports SET state = 'pushed' WHERE capability_id = ?")
+        .bind(capability.id.to_string())
+        .execute(&worker.database)
+        .await?;
+    Ok(())
 }
 
 async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
@@ -471,6 +761,15 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         }
         WorkerCommand::CompleteExport { envelope } => complete_export(worker, envelope).await,
         WorkerCommand::AuthorizeImport { envelope } => authorize_import(worker, envelope).await,
+        WorkerCommand::PreparePushImport { envelope } => {
+            prepare_push_import(worker, envelope).await
+        }
+        WorkerCommand::ResolveImport { capability_id } => {
+            resolve_import(worker, &capability_id).await
+        }
+        WorkerCommand::FinalizePushImport { envelope } => {
+            finalize_push_import(worker, envelope).await
+        }
         WorkerCommand::AuthorizeRelease { envelope } => authorize_release(worker, envelope).await,
         WorkerCommand::QueryRelease { release_id } => query_release(worker, &release_id).await,
         WorkerCommand::ReleaseFiles { release_id } => release_files(worker, &release_id).await,
@@ -911,6 +1210,143 @@ async fn authorize_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerRe
         Ok(_) => WorkerResponse::ok(
             "IMPORT_VERIFIED",
             serde_json::json!({"capability_id": capability.id, "files": capability.files.len()}),
+        ),
+        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    }
+}
+
+async fn prepare_push_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher {
+        return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以接收 Builder 推送");
+    }
+    if envelope.verifying_key != worker.trusted_controller_key {
+        return WorkerResponse::error("UNTRUSTED_CONTROLLER", "TransferCapability 签名无效");
+    }
+    let capability: TransferCapability = match envelope.verify("aursmith.transfer_capability") {
+        Ok(value) => value,
+        Err(error) => return WorkerResponse::error("INVALID_CAPABILITY", error.to_string()),
+    };
+    if capability.expires_at < Utc::now()
+        || capability.files.is_empty()
+        || capability.attempt.is_none()
+        || capability.writer_epoch != worker.writer_epoch
+    {
+        return WorkerResponse::error("INVALID_CAPABILITY", "Builder 推送授权无效或已过期");
+    }
+    let instance_id: Result<String, _> =
+        sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'instance_id'")
+            .fetch_one(&worker.database)
+            .await;
+    if !matches!(instance_id.as_deref(), Ok(value) if value == capability.destination_worker.to_string())
+    {
+        return WorkerResponse::error(
+            "CAPABILITY_DESTINATION_MISMATCH",
+            "Capability 不属于本 Publisher",
+        );
+    }
+    let final_directory = worker.landing_dir.join(capability.id.to_string());
+    if final_directory.exists() {
+        return match verify_manifest_directory(&final_directory, &capability.files) {
+            Ok(()) => WorkerResponse::ok(
+                "IDEMPOTENT_IMPORT",
+                serde_json::json!({"capability_id": capability.id}),
+            ),
+            Err(error) => WorkerResponse::error("CAPABILITY_CONFLICT", error.to_string()),
+        };
+    }
+    let staging = worker
+        .landing_dir
+        .join(format!(".{}.partial", capability.id));
+    if let Err(error) = std::fs::create_dir_all(&staging) {
+        return WorkerResponse::error("LANDING_ERROR", error.to_string());
+    }
+    let result = sqlx::query("INSERT INTO transfer_imports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, ?, ?, 'receiving') ON CONFLICT(capability_id) DO UPDATE SET expires_at = excluded.expires_at, manifest_json = excluded.manifest_json WHERE transfer_imports.state = 'receiving'")
+        .bind(capability.id.to_string()).bind(capability.expires_at)
+        .bind(staging.to_string_lossy().as_ref()).bind(serde_json::to_string(&capability.files).unwrap_or_default())
+        .execute(&worker.database).await;
+    match result {
+        Ok(_) => WorkerResponse::ok(
+            "IMPORT_READY",
+            serde_json::json!({"capability_id": capability.id}),
+        ),
+        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    }
+}
+
+async fn resolve_import(worker: &Worker, capability_id: &str) -> WorkerResponse {
+    if Uuid::parse_str(capability_id).is_err() {
+        return WorkerResponse::error("INVALID_CAPABILITY", "Capability ID 无效");
+    }
+    let row = sqlx::query("SELECT directory, expires_at FROM transfer_imports WHERE capability_id = ? AND state = 'receiving'")
+        .bind(capability_id).fetch_optional(&worker.database).await;
+    match row {
+        Ok(Some(row))
+            if row
+                .get::<String, _>("expires_at")
+                .parse::<chrono::DateTime<Utc>>()
+                .is_ok_and(|expires| expires >= Utc::now()) =>
+        {
+            WorkerResponse::ok(
+                "IMPORT_ALLOWED",
+                serde_json::json!({"directory": row.get::<String, _>("directory")}),
+            )
+        }
+        Ok(Some(_)) => WorkerResponse::error("CAPABILITY_EXPIRED", "Capability 已过期"),
+        Ok(None) => WorkerResponse::error("CAPABILITY_NOT_FOUND", "Capability 未准备接收"),
+        Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    }
+}
+
+async fn finalize_push_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
+    if envelope.verifying_key != worker.trusted_controller_key {
+        return WorkerResponse::error("UNTRUSTED_CONTROLLER", "TransferCapability 签名无效");
+    }
+    let capability: TransferCapability = match envelope.verify("aursmith.transfer_capability") {
+        Ok(value) => value,
+        Err(error) => return WorkerResponse::error("INVALID_CAPABILITY", error.to_string()),
+    };
+    let row = sqlx::query(
+        "SELECT directory, manifest_json, state FROM transfer_imports WHERE capability_id = ?",
+    )
+    .bind(capability.id.to_string())
+    .fetch_optional(&worker.database)
+    .await;
+    let row = match row {
+        Ok(Some(value)) => value,
+        Ok(None) => return WorkerResponse::error("CAPABILITY_NOT_FOUND", "Capability 未准备接收"),
+        Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
+    };
+    let state: String = row.get("state");
+    let final_directory = worker.landing_dir.join(capability.id.to_string());
+    if state == "verified" {
+        return WorkerResponse::ok(
+            "IDEMPOTENT_IMPORT",
+            serde_json::json!({"capability_id": capability.id}),
+        );
+    }
+    if row.get::<String, _>("manifest_json")
+        != serde_json::to_string(&capability.files).unwrap_or_default()
+    {
+        return WorkerResponse::error("CAPABILITY_CONFLICT", "接收 Manifest 与授权不一致");
+    }
+    let staging = PathBuf::from(row.get::<String, _>("directory"));
+    if let Err(error) = verify_manifest_directory(&staging, &capability.files) {
+        return WorkerResponse::error("TRANSFER_DIGEST_MISMATCH", error.to_string());
+    }
+    if let Err(error) = std::fs::rename(&staging, &final_directory) {
+        return WorkerResponse::error("LANDING_ERROR", error.to_string());
+    }
+    match sqlx::query(
+        "UPDATE transfer_imports SET state = 'verified', directory = ? WHERE capability_id = ?",
+    )
+    .bind(final_directory.to_string_lossy().as_ref())
+    .bind(capability.id.to_string())
+    .execute(&worker.database)
+    .await
+    {
+        Ok(_) => WorkerResponse::ok(
+            "IMPORT_VERIFIED",
+            serde_json::json!({"capability_id": capability.id}),
         ),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
@@ -2880,6 +3316,9 @@ mod transfer_tests {
             archive_dir: archive_dir.clone(),
             identity_signing_key: SigningKey::from_bytes(&[31; 32]),
             repository_gpg_fingerprint: None,
+            reverse_publisher_endpoint: None,
+            reverse_push_ssh_identity_file: None,
+            reverse_push_ssh_known_hosts_file: None,
         };
         let envelope = archive_release(&worker, &capability, &imported)
             .await

@@ -24,9 +24,10 @@
 | B05 | 允许为 Profile 构建和 Fetch Guest 的官方依赖下载配置 Arch HTTPS 镜像源，并在 Profile 与 provenance 中固定实际镜像 | Profile 构建与协议测试 |
 | W01 | 通过 Docker Compose 部署所有 AURsmith 服务 | Compose 策略测试 |
 | W02 | Builder、Publisher 和 Archiver 可部署在不同主机 | 分布式冒烟测试 |
-| W03 | 使用固定 OpenSSH host key 和受限 rsync | 传输测试 |
+| W03 | 公网节点使用固定 OpenSSH host key 和受限 rsync；家庭网络 Builder 只允许主动连接公网节点 | 传输测试 |
 | W04 | 使用 Attempt、Journal 和迟到结果拒绝保证任务幂等 | Worker 测试 |
 | W05 | 支持多 Builder、单活动 Publisher 和单主 Archiver | 调度测试 |
+| W06 | Builder 不开放公网入站端口；它以持久身份签名，通过 HTTPS 长轮询领取任务和上报结果，并以一次性 Capability 主动推送产物 | 反向 Worker 端到端测试 |
 | R01 | 把产物视为不可信内容，仅允许离线 Signer 签名 | Signer 测试 |
 | R02 | 原子发布完整、不可变的 pacman Release | 崩溃测试 |
 | R03 | 归档 Release、审计证据、provenance 和 Controller 备份 | 恢复测试 |

@@ -96,6 +96,10 @@ pub const REQUIREMENTS: &[Requirement] = &[
         title: "静态多 Builder 拓扑",
     },
     Requirement {
+        id: "W06",
+        title: "Builder 仅出站轮询与推送",
+    },
+    Requirement {
         id: "R01",
         title: "产物校验和离线 Signer",
     },
