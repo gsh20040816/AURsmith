@@ -353,10 +353,8 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
     if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
         bail!("aursmith-keyring 是 Signer 生成的保留包名");
     }
-    if (!authorization.artifacts.is_empty() && authorization.evidence_files.is_empty())
-        || authorization.evidence_files.len() > 4096
-    {
-        bail!("Release 缺少证据文件或数量超过上限");
+    if authorization.evidence_files.len() > 4096 {
+        bail!("Release 证据文件数量超过上限");
     }
     for evidence in &authorization.evidence_files {
         aursmith_protocol::validate_relative_path(&evidence.path)?;
@@ -492,6 +490,51 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn authorization_accepts_package_without_transferred_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let package_root = tempfile::tempdir().unwrap();
+        fs::write(
+            package_root.path().join(".PKGINFO"),
+            "pkgname = fixture\npkgver = 1-1\narch = any\n",
+        )
+        .unwrap();
+        let package = root.path().join("fixture-1-1-any.pkg.tar.zst");
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["-cf"])
+            .arg(&package)
+            .arg("-C")
+            .arg(package_root.path())
+            .arg(".PKGINFO")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let authorization = ReleaseAuthorization {
+            release_id: Uuid::new_v4(),
+            batch_id: Uuid::new_v4(),
+            writer_epoch: 1,
+            repository_name: "aursmith".into(),
+            source_git_commit: "a".repeat(40),
+            revision_sha256s: vec!["b".repeat(64)],
+            audit_report_sha256s: vec!["c".repeat(64)],
+            artifacts: vec![ArtifactRecord {
+                path: "fixture-1-1-any.pkg.tar.zst".into(),
+                sha256: digest_file(&package).unwrap(),
+                size: fs::metadata(&package).unwrap().len(),
+                package_name: Some("fixture".into()),
+                package_version: Some("1-1".into()),
+                architecture: Some("any".into()),
+            }],
+            evidence_files: vec![],
+            removed_package_names: vec![],
+            include_repository_keyring: true,
+            evidence: Default::default(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::minutes(5),
+        };
+        assert!(validate_authorization(&authorization, root.path()).is_ok());
+    }
 
     #[test]
     fn authorization_rejects_traversal_before_running_tools() {
