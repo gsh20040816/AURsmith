@@ -218,7 +218,6 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     run_as_builder(
         &["/usr/bin/makepkg", "--verifysource", "--noconfirm"],
         Some(&log),
-        true,
     )?;
     let prepared = Path::new(OUTPUT).join("prepared");
     fs::create_dir_all(&prepared)?;
@@ -279,9 +278,7 @@ fn download_official_dependencies(
         .args(&names)
         .stdin(Stdio::null())
         .env_clear()
-        .env("PATH", "/usr/bin")
-        .env("http_proxy", "http://10.0.2.100:8080")
-        .env("https_proxy", "http://10.0.2.100:8080");
+        .env("PATH", "/usr/bin");
     let status = command.status()?;
     if !status.success() {
         bail!("官方依赖下载失败，状态 {status}");
@@ -360,7 +357,7 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     let log = Path::new(OUTPUT).join("build.log");
     let makepkg_arguments = makepkg_arguments(spec.allow_check);
     let network = build_network_enabled()?;
-    run_as_builder(&makepkg_arguments, Some(&log), false)?;
+    run_as_builder(&makepkg_arguments, Some(&log))?;
     let packages = collect_package_files(Path::new(BUILD))?;
     if packages.is_empty() {
         bail!("makepkg 未生成软件包");
@@ -392,7 +389,7 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         .map(|artifact| format!("{OUTPUT}/{}", artifact.path))
         .collect::<Vec<_>>();
     namcap_arguments.extend(artifact_paths.iter().map(String::as_str));
-    run_as_builder(&namcap_arguments, Some(&namcap_log), false)?;
+    run_as_builder(&namcap_arguments, Some(&namcap_log))?;
     Ok(BuildResult {
         job_id: spec.job_id,
         attempt: spec.attempt.clone(),
@@ -487,7 +484,7 @@ fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)
     Ok((value("pkgname")?, value("pkgver")?, value("arch")?))
 }
 
-fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyhow::Result<()> {
+fn run_as_builder(arguments: &[&str], log: Option<&Path>) -> anyhow::Result<()> {
     let mut command = Command::new("/usr/bin/runuser");
     command.args(["-u", "builder", "--"]).args(arguments);
     command.current_dir(BUILD).stdin(Stdio::null());
@@ -496,11 +493,6 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>, network: bool) -> anyh
         .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
         .env("HOME", "/home/builder")
         .env("LANG", "C.UTF-8");
-    if network {
-        command
-            .env("http_proxy", "http://10.0.2.100:8080")
-            .env("https_proxy", "http://10.0.2.100:8080");
-    }
     if let Some(path) = log {
         let stdout = File::create(path)?;
         let stderr = stdout.try_clone()?;

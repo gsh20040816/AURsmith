@@ -10,7 +10,6 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::Read,
-    net::SocketAddr,
     path::{Path, PathBuf},
 };
 use tokio::{process::Command, time::timeout};
@@ -19,16 +18,14 @@ use tokio::{process::Command, time::timeout};
 pub struct BuilderRuntime {
     profiles_dir: PathBuf,
     jobs_dir: PathBuf,
-    fetch_proxy: Option<SocketAddr>,
     build_network: bool,
 }
 
 impl BuilderRuntime {
-    pub fn new(profiles_dir: PathBuf, jobs_dir: PathBuf, fetch_proxy: Option<SocketAddr>) -> Self {
+    pub fn new(profiles_dir: PathBuf, jobs_dir: PathBuf) -> Self {
         Self {
             profiles_dir,
             jobs_dir,
-            fetch_proxy,
             build_network: false,
         }
     }
@@ -449,16 +446,7 @@ async fn execute_attempt(
         output_directory: work.join("output"),
         control_socket: work.join("control.sock"),
     };
-    if spec.kind == JobKind::Fetch && runtime.fetch_proxy.is_none() {
-        bail!("Fetch VM 必须配置唯一源码代理");
-    }
-    let plan = QemuPlan::for_job(
-        &profile,
-        &spec,
-        paths,
-        runtime.fetch_proxy,
-        runtime.build_network,
-    )?;
+    let plan = QemuPlan::for_job(&profile, &spec, paths, runtime.build_network)?;
     let qemu = Command::new(plan.executable)
         .args(&plan.arguments)
         .stdin(std::process::Stdio::null())
@@ -870,7 +858,6 @@ impl QemuPlan {
         profile: &VerifiedProfile,
         spec: &JobSpec,
         paths: VmPaths,
-        fetch_relay: Option<SocketAddr>,
         build_network: bool,
     ) -> anyhow::Result<Self> {
         if spec.required_role != aursmith_domain::WorkerRole::Builder {
@@ -878,9 +865,6 @@ impl QemuPlan {
         }
         if spec.limits.cpu_count == 0 || spec.limits.memory_mib < 512 {
             bail!("VM 至少需要 1 个 CPU 和 512 MiB 内存");
-        }
-        if spec.kind == JobKind::Fetch && fetch_relay.is_none() {
-            bail!("Fetch VM 必须配置本地源码代理中继");
         }
         let memory = spec.limits.memory_mib.to_string();
         let mut arguments: Vec<OsString> = [
@@ -953,11 +937,7 @@ impl QemuPlan {
         ]);
         match spec.kind {
             JobKind::Fetch => {
-                fetch_relay.expect("前置校验保证存在 Fetch proxy");
-                arguments.extend([
-                    "-nic".into(),
-                    "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-cmd:/usr/local/bin/aursmithctl tcp-relay".into(),
-                ]);
+                arguments.extend(["-nic".into(), "user,model=virtio-net-pci".into()]);
             }
             JobKind::Build if build_network => {
                 arguments.extend(["-nic".into(), "user,model=virtio-net-pci".into()]);
@@ -1088,14 +1068,8 @@ mod tests {
     #[test]
     fn build_vm_has_no_network_device() {
         let root = Path::new("/jobs/attempt");
-        let plan = QemuPlan::for_job(
-            &profile(root),
-            &job(JobKind::Build),
-            paths(root),
-            None,
-            false,
-        )
-        .unwrap();
+        let plan =
+            QemuPlan::for_job(&profile(root), &job(JobKind::Build), paths(root), false).unwrap();
         let args: Vec<_> = plan
             .arguments
             .iter()
@@ -1121,14 +1095,8 @@ mod tests {
     #[test]
     fn build_vm_can_use_direct_network_when_enabled() {
         let root = Path::new("/jobs/attempt");
-        let plan = QemuPlan::for_job(
-            &profile(root),
-            &job(JobKind::Build),
-            paths(root),
-            None,
-            true,
-        )
-        .unwrap();
+        let plan =
+            QemuPlan::for_job(&profile(root), &job(JobKind::Build), paths(root), true).unwrap();
         let args: Vec<_> = plan
             .arguments
             .iter()
@@ -1149,33 +1117,27 @@ mod tests {
     }
 
     #[test]
-    fn fetch_vm_can_only_reach_the_fixed_proxy_forward() {
+    fn fetch_vm_uses_direct_user_networking() {
         let root = Path::new("/jobs/attempt");
-        let proxy: SocketAddr = "127.0.0.1:3129".parse().unwrap();
-        let plan = QemuPlan::for_job(
-            &profile(root),
-            &job(JobKind::Fetch),
-            paths(root),
-            Some(proxy),
-            false,
-        )
-        .unwrap();
+        let plan =
+            QemuPlan::for_job(&profile(root), &job(JobKind::Fetch), paths(root), false).unwrap();
         let args: Vec<_> = plan
             .arguments
             .iter()
             .map(|value| value.to_string_lossy())
             .collect();
-        assert!(args.iter().any(|value| value.as_ref()
-            == "user,model=virtio-net-pci,restrict=on,guestfwd=tcp:10.0.2.100:8080-cmd:/usr/local/bin/aursmithctl tcp-relay"));
-        assert!(!args.iter().any(|value| value.contains("127.0.0.1:3129")));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-nic", "user,model=virtio-net-pci"])
+        );
+        assert!(!args.iter().any(|value| value.contains("guestfwd=")));
         assert!(!args.windows(2).any(|pair| pair == ["-nic", "none"]));
     }
 
     #[test]
     fn inline_inputs_are_verified_before_materialization() {
         let root = tempfile::tempdir().unwrap();
-        let runtime =
-            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"));
         let mut spec = job(JobKind::Fetch);
         let content = b"pkgname=aursmith-fixture\n";
         let manifest = entry("snapshot/PKGBUILD", content);
@@ -1197,8 +1159,7 @@ mod tests {
     #[test]
     fn invalid_inline_input_is_removed_without_partial_staging() {
         let root = tempfile::tempdir().unwrap();
-        let runtime =
-            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"));
         let mut spec = job(JobKind::Fetch);
         spec.inputs.push(entry("PKGBUILD", b"trusted"));
         spec.inline_inputs.push(aursmith_protocol::InlineInput {
@@ -1220,8 +1181,7 @@ mod tests {
     #[test]
     fn build_source_is_bound_to_a_completed_fetch_attempt() {
         let root = tempfile::tempdir().unwrap();
-        let runtime =
-            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"));
         let source_attempt = Uuid::new_v4();
         let output = runtime
             .jobs_dir
@@ -1393,7 +1353,7 @@ mod tests {
             vec![b'x'; 128 * 1024 + 1],
         )
         .unwrap();
-        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().into(), None);
+        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().into());
         let logs = runtime.attempt_logs(&attempt, true).unwrap();
         let qemu = logs
             .iter()
@@ -1434,8 +1394,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let runtime =
-            BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"), None);
+        let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"));
         let entries = runtime.completed_evidence_files(&attempt).unwrap();
         assert_eq!(entries.len(), 3);
         assert!(entries.iter().all(|entry| {

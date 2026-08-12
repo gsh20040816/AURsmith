@@ -17,7 +17,7 @@ Controller Web Caddy 默认在 8443 使用内部 CA，CA 状态持久化到专�
 
 Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docker Socket、libvirt Socket、TUN 或 privileged 权限。受限联网的 Fetch Guest 通过 Publisher 代理获取源码；全新的 Build Guest 不带网卡，只接收不可变且已经审计的输入。
 
-第一版 Publisher 提供两个职责分离的网络服务。无特权 Squid source-proxy 供 Fetch VM 获取 AUR source，QEMU 只把 Guest 内固定的 `10.0.2.100:8080` 转发到该代理；代理只转发 HTTP/HTTPS 并在 DNS 解析后拒绝私网、回环、链路本地和保留目标。pacoloco 只缓存 Arch 官方仓库文件，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。仓库 Caddy 在 `/arch-cache/` 下反向代理 pacoloco；部署者可以把该稳定 HTTPS 地址写入新 Profile，Fetch Guest 随后沿同一镜像下载官方依赖，Build Guest 仍然无网。
+第一版 Publisher 保留 pacoloco 作为 Arch 官方包缓存，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。仓库 Caddy 在 `/arch-cache/` 下反向代理 pacoloco。Fetch VM 使用 QEMU user networking 直接访问公网，不部署 HTTP source proxy；Build Guest 是否联网由 Builder 独立配置。
 
 公网节点内的控制流继续使用固定 host key 和 forced command 的 OpenSSH。家庭网络中的 Builder 不暴露 SSH、HTTP 或任何公网入站端口，也不要求路由器端口映射：Builder 只通过 HTTPS 出站长轮询 Controller，使用持久 Ed25519 Worker 身份签署领取和上报消息；Controller 返回的任务仍是原有签名 `JobSpec`。大文件不经过 Controller，Builder 获得短期有效的 Controller 签名 `TransferCapability` 后，主动通过受限 rsync/SSH 推送到 Publisher 公网入口。Publisher 在公网节点本地提交完整不可变 Release，不再为第一版启动同机 Archiver。
 
@@ -109,7 +109,7 @@ Builder Worker 的 Journal 保存完整签名 JobSpec。执行循环以条件更
 
 Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`、`initramfs-linux.img` 和 `profile-envelope.json`。Envelope 由 Controller Ed25519 密钥签署，内容摘要由三个文件的 Manifest、已安装包清单、创建时间和可选的官方仓库镜像确定，不采用无法实现的“包含自身摘要再求哈希”。旧 Profile 未声明镜像时仍按原摘要读取；新 Profile 一旦声明镜像，修改地址就必须产生新摘要。Builder 在启动 VM 前验证签名、文件类型、大小和 SHA-256；Profile 的任何单字节变化都会拒绝任务。
 
-每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出通过 QEMU 内置 virtio-9p 的 `mapped-xattr` 模式提供，输入 `fsdev` 额外固定 `readonly=on`，输出只指向该 Attempt 的独立目录；不启动需要 root 或额外 capability 的宿主文件共享 daemon。控制通道使用 virtio-serial。Build 与 ProfileFixture 明确传入 `-nic none`。Fetch 使用 QEMU user networking 的 `restrict=on`，只把 Guest 内固定的 `10.0.2.100:8080` 转发到 Builder 为该 Attempt 建立的 `127.0.0.1` 随机端口；该短生命周期中继再连接配置中唯一的 Publisher source proxy。中继随 Attempt 结束而取消，不监听容器外地址，也不能由 Guest 选择目标，因此 Guest 不能任意访问局域网或互联网。
+每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出通过 QEMU 内置 virtio-9p 的 `mapped-xattr` 模式提供，输入 `fsdev` 额外固定 `readonly=on`，输出只指向该 Attempt 的独立目录；不启动需要 root 或额外 capability 的宿主文件共享 daemon。控制通道使用 virtio-serial。ProfileFixture 明确传入 `-nic none`；Fetch 使用直接 QEMU user networking；Build 根据配置使用 `-nic none` 或直接 QEMU user networking。
 
 Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，删除 overlay 与控制 Socket 后，才把日志和输出原子移动到 completed 区。超时、QEMU 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
 

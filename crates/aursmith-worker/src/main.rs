@@ -21,7 +21,6 @@ use sqlx::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -68,8 +67,6 @@ struct Cli {
     profiles_dir: String,
     #[arg(long, env = "AURSMITH_JOBS_DIR", default_value = "/jobs")]
     jobs_dir: String,
-    #[arg(long, env = "AURSMITH_FETCH_PROXY")]
-    fetch_proxy: Option<SocketAddr>,
     #[arg(long, env = "AURSMITH_BUILD_NETWORK", default_value_t = false)]
     build_network: bool,
     #[arg(long, env = "AURSMITH_TRANSFER_ENDPOINTS_JSON", default_value = "{}")]
@@ -304,12 +301,8 @@ async fn main() -> anyhow::Result<()> {
         pacoloco_metrics_url: cli.pacoloco_metrics_url,
         builder: if matches!(cli.role, RoleArg::Builder) {
             Some(
-                builder::BuilderRuntime::new(
-                    cli.profiles_dir.into(),
-                    jobs_dir.clone(),
-                    cli.fetch_proxy,
-                )
-                .with_build_network(cli.build_network),
+                builder::BuilderRuntime::new(cli.profiles_dir.into(), jobs_dir.clone())
+                    .with_build_network(cli.build_network),
             )
         } else {
             None

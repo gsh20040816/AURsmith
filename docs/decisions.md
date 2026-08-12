@@ -61,6 +61,7 @@
 - ADR-057：每个 Release 固定包含 Signer 派生的 `aursmith-keyring`，而不是由 Publisher 手工写入 hot 目录。Controller 只授权生成行为，私钥仍不离开断网 Signer；Publisher 使用自己固定的公钥指纹复验包内 keyring。首次信任仍要求人工核对指纹，后续安装和轮换使用标准 `pacman-key --populate aursmith`。
 - ADR-058：真实单用户拓扑将 Controller、Agent、Publisher、Signer 和第一版 Archiver 放在公网 `netcup`，Builder 留在具有 KVM 的家庭桌面机。Builder 不开放公网入站端口，Controller 不再主动 SSH 调度它；Builder 以持久 Ed25519 身份通过 HTTPS 长轮询领取 Controller 签名 JobSpec、上报 Journal 状态，并使用 Controller 签名 TransferCapability 主动 rsync 推送产物到 Publisher。拒绝端口映射、反向隧道和让公网 Publisher 回连家庭 Builder；Publisher 与 Archiver 同机只是第一版部署选择，不取消 ArchiveCopy 的独立状态和未来迁移边界。
 - ADR-059：替换 ADR-002、ADR-022、ADR-028、ADR-029 和 ADR-058 中“第一版必须部署独立 Archiver”的部分。单用户、少量客户端不需要永久保存每个完整 Release；第一版由 Publisher 根据 GPG 签名的 Release Manifest 自动保留当前 Release、最近 30 天全部 Release，以及每个 `pkgname` 最近 3 个不同版本所需的 Release。任何清单、签名或当前指针异常都会停止清理。外部 Archiver 协议代码作为未来可选能力保留，但默认不调度、不进入 Doctor 必选项，也不部署 Archiver Stack。Controller 每日签名备份继续保存在自身持久卷，密钥材料仍要求离线备份。
+- ADR-060：替换 ADR-014、ADR-034、ADR-046 和 ADR-053 中 Fetch VM 必须经 Publisher source proxy 的部分。第一版以实用部署为主，Fetch VM 使用 QEMU user networking 直接访问公网，不再部署 Squid、guestfwd 或 Builder TCP relay；Build VM 仍由 `AURSMITH_BUILD_NETWORK` 独立决定是否联网。Controller、GPG、SSH 和 Agent 密钥均不进入 Guest，下载摘要和 provenance 仍完整记录。
 
 ## 已拒绝
 

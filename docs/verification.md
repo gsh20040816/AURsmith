@@ -333,3 +333,8 @@
 - Publisher 每次发布后和每天启动定时任务时，从 GPG 签名 Release Manifest 计算保留集合：当前 Release、最近 30 天全部 Release、每个包最近 3 个不同版本。删除 Release 后同步把 Publisher Journal 标记为 `expired`；任何签名、Manifest、目录 ID 或当前链接异常都会使整轮失败关闭。
 - 单元测试覆盖 30 天窗口、按包三个版本和当前 Release 永不删除。Controller 47 项、Worker 29 项、Journal 2 项测试全部通过；前端生产构建、Compose 安全检查和 `git diff --check` 通过。
 - netcup Compose dry run 只包含 Controller 与 Publisher 的内部 backbone；公网只需要控制台 HTTPS、仓库 HTTPS、Builder 推送 SSH 和 Fetch 代理。尚未实际迁移数据、修改 DNS 或启动远端容器，不能声称真实部署完成。
+
+## 2026-08-12：Fetch VM 直接公网
+
+- 为简化单用户真实部署，移除 Publisher Squid、Builder `AURSMITH_FETCH_PROXY`、QEMU guestfwd 和 `aursmithctl tcp-relay`。Fetch VM 改用标准 QEMU user networking 直接访问公网；Build VM 是否联网仍由原配置独立控制，ProfileFixture 仍无网。
+- Worker 29 项、Guest Agent 10 项、Journal 2 项和 aursmithctl 1 项测试通过；新增回归测试确认 Fetch 使用直接 user network、没有 guestfwd，Build 的无网和直连两种模式保持原语义。Compose 安全检查与 `git diff --check` 通过。

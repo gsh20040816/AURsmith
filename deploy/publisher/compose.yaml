@@ -17,7 +17,6 @@ services:
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
       AURSMITH_AUR_BASE_URL: ${AURSMITH_AUR_BASE_URL:-https://aur.archlinux.org/}
-      AURSMITH_SOURCE_PROXY_URL: http://source-proxy:3128
       AURSMITH_PACOLOCO_METRICS_URL: http://pacoloco:9129/metrics
       AURSMITH_TRANSFER_ENDPOINTS_JSON: ${AURSMITH_TRANSFER_ENDPOINTS_JSON:?必须配置 Builder ID 到 SSH 端点的静态映射}
       AURSMITH_TRANSFER_SSH_IDENTITY_FILE: /run/secrets/builder_pull_key
@@ -157,24 +156,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    restart: unless-stopped
-
-  source-proxy:
-    build:
-      context: ../..
-      dockerfile: deploy/images/source-proxy.Dockerfile
-      args:
-        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    tmpfs:
-      - /run/squid:uid=15,gid=15,mode=0750,size=4m
-      - /var/log/squid:uid=15,gid=15,mode=0750,size=16m
-      - /tmp:uid=15,gid=15,mode=0700,size=32m
-    ports:
-      - ${AURSMITH_SOURCE_PROXY_BIND:-127.0.0.1:3128}:3128
-    networks: [egress]
     restart: unless-stopped
 
 secrets:

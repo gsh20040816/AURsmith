@@ -16,7 +16,6 @@ Controller 使用 `publisher-ssh:2222` 访问同机 Worker。该网络不替代�
 
 - 80/443：由现有宿主 Caddy 提供控制台和仓库 HTTPS；
 - 12223/tcp：Builder 使用 forced-command SSH 推送 Artifact；
-- 13128/tcp：Fetch VM 的 Squid 入口，只允许 Builder 当前公网地址访问。
 
 控制台容器绑定 `127.0.0.1:18443`，仓库绑定 `127.0.0.1:18081`。宿主 Caddy 追加 `Caddyfile.snippet`；其中内层 TLS 只用于回环链路，因此宿主反代明确忽略内层自签证书，客户端看到的仍是宿主 Caddy 的公开证书。
 
@@ -33,3 +32,5 @@ docker compose --env-file runtime/deployment/publisher.env \
 不得把 `aursmith-backbone` 配成非 internal 网络。Publisher 的 12223/tcp 只用于家庭 Builder 持 Capability 主动推送产物。
 
 Publisher 默认保留最近 30 天全部 Release，并为每个包至少保留最近 3 个不同版本。可通过 `AURSMITH_RELEASE_RETENTION_DAYS` 和 `AURSMITH_RELEASE_RETENTION_MIN_VERSIONS` 调整；两个值都必须大于零。
+
+Fetch VM 使用 QEMU user networking 直接访问公网，不部署或暴露 HTTP 代理。Builder 只通过 `netcup.shgao.top:12223` 主动推送 Artifact。
