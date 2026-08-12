@@ -443,7 +443,7 @@ async fn reverse_poll_once(
         .context("Builder 状态缺少 instance_id")?
         .parse::<uuid::Uuid>()?;
     let rows = sqlx::query(
-        "SELECT job_id FROM attempts WHERE reported_at IS NULL ORDER BY received_at LIMIT 4",
+        "SELECT job_id FROM attempts WHERE reported_at IS NULL ORDER BY received_at DESC LIMIT 1",
     )
     .fetch_all(&worker.database)
     .await?;
