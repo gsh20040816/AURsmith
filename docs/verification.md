@@ -272,7 +272,7 @@
 
 ## 2026-08-11：完整 Release 大文件证据与恢复
 
-- Builder 对每个成功 Build 生成 `profile.tar.zst`、`source.tar.zst` 和 `build-records.tar.zst`。单元测试实际生成包含 1 MiB 文件的 zstd tar，再由 bsdtar 列出并验证固定三文件 Manifest；最终 Arch Worker 镜像也以 UID 10001 实际完成压缩和读取。
+- 2026-08-12 起，Builder 不再为每个成功 Build 重复生成完整 Profile、source 和 build-records 压缩归档；回归测试确认成功任务返回空的大文件证据清单，必要日志、BuildResult 和 digest 引用仍通过控制面保存。该变更用于避免一个 330 MiB 软件包额外传输约 1 GiB 重复证据。
 - Controller migration `0026_release_evidence_files.sql` 保存固定 Attempt 路径、完整大小和 SHA-256。缺少任一归档时 ReleaseBatch 不能进入 Artifact 传输；证据与包共用 Controller 签名的 TransferCapability，Publisher 只接受摘要完全匹配的已验证导入。
 - 断网、只读根文件系统、`cap_drop: ALL` 的实际 Signer 容器处理了含嵌套证据的测试 Release。输入和输出证据 SHA-256 一致，GPG 签名的 Release Manifest 列出同一清单；Publisher Worker 随后实际验签、提交并通过 `release-files` 返回该嵌套路径。
 - Archiver 恢复测试调用生产 rsync `--link-dest` 快照路径，签名 ArchiveReceipt 的递归文件集合包含 `evidence/attempt/source.tar.zst`，并从不可变 Release 目录逐字节恢复 `complete source bytes`。

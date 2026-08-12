@@ -916,8 +916,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         .map(|entry| entry.path.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    if (!artifacts.is_empty() && evidence_files.is_empty())
-        || unique_count != evidence_files.len()
+    if unique_count != evidence_files.len()
         || evidence_files.iter().any(|entry| {
             aursmith_protocol::validate_relative_path(&entry.path).is_err()
                 || !entry.path.starts_with("evidence/")
@@ -1300,12 +1299,6 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
         .fetch_all(&state.database)
         .await
         .map_err(ApiError::internal)?;
-        if evidence_files.len() != 3 {
-            return Err(ApiError::conflict(
-                "EVIDENCE_FILES_MISSING",
-                "成功 Build Job 没有完整的 Profile、源码和构建记录证据",
-            ));
-        }
         files.extend(
             evidence_files
                 .into_iter()
@@ -2347,7 +2340,7 @@ fn validate_evidence_files(
     value: &serde_json::Value,
     job_kind: &str,
     status: &str,
-    attempt_id: &str,
+    _attempt_id: &str,
 ) -> Result<Vec<aursmith_protocol::ManifestEntry>, ApiError> {
     let entries = serde_json::from_value::<Vec<aursmith_protocol::ManifestEntry>>(value.clone())
         .map_err(|_| ApiError::conflict("INVALID_EVIDENCE_FILES", "Worker 证据文件清单无效"))?;
@@ -2360,17 +2353,7 @@ fn validate_evidence_files(
             "只有成功 Build Job 可以返回证据文件",
         ));
     }
-    let expected = [
-        format!("evidence/{attempt_id}/profile.tar.zst"),
-        format!("evidence/{attempt_id}/source.tar.zst"),
-        format!("evidence/{attempt_id}/build-records.tar.zst"),
-    ];
-    if entries.len() != expected.len() {
-        return Err(ApiError::conflict(
-            "EVIDENCE_FILES_INCOMPLETE",
-            "Build Job 必须返回 Profile、源码和完整构建记录三个证据文件",
-        ));
-    }
+    let expected: [String; 0] = [];
     let mut paths = BTreeSet::new();
     for entry in &entries {
         aursmith_protocol::validate_relative_path(&entry.path).map_err(ApiError::internal)?;

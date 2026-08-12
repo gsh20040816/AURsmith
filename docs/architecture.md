@@ -99,7 +99,7 @@ Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.P
 
 Controller 在 Attempt 对账事务中保存完整 GuestResult 和有界诊断日志，而不是只保留最终 Artifact 行。Builder 对 QEMU stdout/stderr、fetch、build、namcap 和 Guest 错误文件记录完整大小与 SHA-256；每个普通日志最多内嵌前 128 KiB UTF-8/Base64 内容，超过 64 MiB 的异常日志明确记录省略原因，不能让不可信输出撑爆控制消息。创建 ReleaseAuthorization 时，系统收集 ReleaseBatch、参与 Revision、AuditBundle、成功 Agent 报告、Controller 签名 Profile Envelope 和 Job 证据，形成版本化 `ReleaseEvidence`；每条记录都有基于规范 JSON 的 SHA-256。结构化证据最多 10000 条、序列化后最多 16 MiB，超限时阻止发布并要求人工拆分，不能静默截断。
 
-成功 Build 还会在退出 KVM 后生成三个独立的只读证据归档。`profile.tar.zst` 保存 `root.qcow2`、内核、initramfs、已安装包清单和 Controller 签名的 Profile Envelope；`source.tar.zst` 保存对应 Fetch Attempt 的完整 `prepared` source tree、Source Manifest、Fetch 日志和 QEMU 记录，因而同时保留上游源码及其中的许可证文件；`build-records.tar.zst` 保存未截断的 Build/QEMU/namcap 日志、GuestResult 和签名 JobSpec。逻辑路径固定为 `evidence/<attempt-id>/...`，Controller 只接受这三个文件并记录完整大小和 SHA-256。它们与软件包共用一次性 `TransferCapability` 直接从 Builder 传到 Publisher，不经过 Controller。
+成功 Build 不再为每个包重复归档完整 Profile 和 source tree。Controller 保存限长的 Build/QEMU/namcap 纯文本日志、结构化 BuildResult、签名 JobSpec 摘要、Profile digest、Source Manifest digest 和 AUR/VCS commit；Publisher 传输和保留二进制包、签名、仓库数据库、Release Manifest 与这些小型结构化引用。相同 digest 的 Profile 和 source 可在 Builder 缓存中复用，但不作为每个 Release 的大体积附件上传。
 
 Publisher 和断网 Signer 不解包证据归档，只验证授权路径、普通文件类型、大小和摘要。Signer 将证据复制到不可变 Release，并把清单写入 GPG 签名的 Release Manifest；Publisher 逐项复验后才原子提交。`release-files` 递归返回证据文件，Archiver 再以完整目录 Manifest、rsync 快照和签名 ArchiveReceipt 绑定实际字节。管理员可以从 Job 页面查看有界在线日志，从 Release 或归档恢复完整原始证据。
 

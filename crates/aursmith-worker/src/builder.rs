@@ -70,31 +70,7 @@ impl BuilderRuntime {
         if uuid::Uuid::parse_str(attempt_id).is_err() {
             bail!("INVALID_ATTEMPT_ID");
         }
-        let relative_root = PathBuf::from("evidence").join(attempt_id);
-        let root = self
-            .jobs_dir
-            .join("completed")
-            .join(attempt_id)
-            .join("output")
-            .join(&relative_root);
-        if !root.is_dir() {
-            return Ok(Vec::new());
-        }
-        let mut entries = Vec::new();
-        for name in ["profile.tar.zst", "source.tar.zst", "build-records.tar.zst"] {
-            let path = root.join(name);
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("EVIDENCE_FILE_MISSING:{name}"))?;
-            if !metadata.file_type().is_file() || metadata.len() == 0 {
-                bail!("EVIDENCE_FILE_INVALID:{name}");
-            }
-            entries.push(ManifestEntry {
-                path: relative_root.join(name).to_string_lossy().into_owned(),
-                sha256: digest_file(&path)?,
-                size: metadata.len(),
-            });
-        }
-        Ok(entries)
+        Ok(Vec::new())
     }
 
     pub fn attempt_logs(
@@ -487,9 +463,6 @@ async fn execute_attempt(
     let guest_result: GuestResult =
         serde_json::from_slice(&result).context("GUEST_RESULT_INVALID")?;
     validate_guest_result(&guest_result, &spec, &work.join("output"))?;
-    if spec.kind == JobKind::Build {
-        create_build_evidence_archives(runtime, &spec, &work, &staging).await?;
-    }
     let digest = hex::encode(Sha256::digest(&result));
     fs::remove_file(work.join("overlay.qcow2")).context("OVERLAY_CLEANUP_FAILED")?;
     if work.join("control.sock").exists() {
@@ -499,88 +472,6 @@ async fn execute_attempt(
     fs::create_dir_all(runtime.jobs_dir.join("completed"))?;
     fs::rename(&work, &completed)?;
     Ok(digest)
-}
-
-async fn create_build_evidence_archives(
-    runtime: &BuilderRuntime,
-    spec: &JobSpec,
-    work: &Path,
-    staging: &Path,
-) -> anyhow::Result<()> {
-    let source_attempt = spec.source_attempt_id.context("SOURCE_ATTEMPT_MISSING")?;
-    let profile_sha = spec.profile_sha256.as_deref().context("PROFILE_MISSING")?;
-    let destination = work
-        .join("output/evidence")
-        .join(spec.attempt.attempt_id.to_string());
-    fs::create_dir_all(&destination)?;
-
-    create_archive(
-        &destination.join("profile.tar.zst"),
-        &runtime.profiles_dir.join(profile_sha),
-        &["."],
-    )
-    .await
-    .context("PROFILE_EVIDENCE_ARCHIVE_FAILED")?;
-    create_archive(
-        &destination.join("source.tar.zst"),
-        &runtime
-            .jobs_dir
-            .join("completed")
-            .join(source_attempt.to_string()),
-        &["."],
-    )
-    .await
-    .context("SOURCE_EVIDENCE_ARCHIVE_FAILED")?;
-
-    let records = work.join("evidence-records");
-    fs::create_dir(&records)?;
-    for (source, name) in [
-        (work.join("qemu.stdout.log"), "qemu.stdout.log"),
-        (work.join("qemu.stderr.log"), "qemu.stderr.log"),
-        (work.join("output/build.log"), "build.log"),
-        (work.join("output/namcap.log"), "namcap.log"),
-        (work.join("output/build-result.json"), "build-result.json"),
-        (
-            staging.join("input/.aursmith/job-envelope.json"),
-            "job-envelope.json",
-        ),
-    ] {
-        if source.is_file() {
-            fs::copy(source, records.join(name))?;
-        }
-    }
-    create_archive(&destination.join("build-records.tar.zst"), &records, &["."])
-        .await
-        .context("BUILD_RECORDS_ARCHIVE_FAILED")?;
-    fs::remove_dir_all(records)?;
-    Ok(())
-}
-
-async fn create_archive(destination: &Path, root: &Path, entries: &[&str]) -> anyhow::Result<()> {
-    if !root.is_dir() || destination.exists() {
-        bail!("EVIDENCE_ARCHIVE_PATH_INVALID");
-    }
-    let temporary = destination.with_extension("tar.zst.partial");
-    let mut arguments = vec![
-        "-caf".into(),
-        temporary.as_os_str().into(),
-        "--format=pax".into(),
-        "-C".into(),
-        root.as_os_str().into(),
-    ];
-    arguments.extend(entries.iter().map(OsString::from));
-    run_checked(
-        "/usr/bin/bsdtar",
-        &arguments,
-        std::time::Duration::from_secs(30 * 60),
-    )
-    .await?;
-    let metadata = fs::symlink_metadata(&temporary)?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 {
-        bail!("EVIDENCE_ARCHIVE_EMPTY");
-    }
-    fs::rename(temporary, destination)?;
-    Ok(())
 }
 
 fn validate_guest_result(
@@ -1375,39 +1266,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn evidence_archives_are_complete_regular_files_with_stable_manifests() {
+    #[test]
+    fn completed_builds_do_not_duplicate_profile_or_source_archives() {
         let root = tempfile::tempdir().unwrap();
         let attempt = uuid::Uuid::new_v4().to_string();
-        let source = root.path().join("source");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("large.log"), vec![b'x'; 1024 * 1024]).unwrap();
-        let output = root
-            .path()
-            .join("jobs/completed")
-            .join(&attempt)
-            .join("output/evidence")
-            .join(&attempt);
-        fs::create_dir_all(&output).unwrap();
-        for name in ["profile.tar.zst", "source.tar.zst", "build-records.tar.zst"] {
-            create_archive(&output.join(name), &source, &["."])
-                .await
-                .unwrap();
-        }
         let runtime = BuilderRuntime::new(root.path().join("profiles"), root.path().join("jobs"));
         let entries = runtime.completed_evidence_files(&attempt).unwrap();
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|entry| {
-            entry.path.starts_with(&format!("evidence/{attempt}/"))
-                && entry.size > 0
-                && entry.sha256.len() == 64
-        }));
-        let listing = std::process::Command::new("/usr/bin/bsdtar")
-            .args(["-tf"])
-            .arg(output.join("source.tar.zst"))
-            .output()
-            .unwrap();
-        assert!(listing.status.success());
-        assert!(String::from_utf8_lossy(&listing.stdout).contains("large.log"));
+        assert!(entries.is_empty());
     }
 }

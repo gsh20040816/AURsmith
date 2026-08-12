@@ -1821,10 +1821,8 @@ fn validate_release_authorization_for_publisher(
     if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
         bail!("aursmith-keyring 是 Signer 生成的保留包名");
     }
-    if (!authorization.artifacts.is_empty() && authorization.evidence_files.is_empty())
-        || authorization.evidence_files.len() > 4096
-    {
-        bail!("Release 缺少证据文件或数量超过上限");
+    if authorization.evidence_files.len() > 4096 {
+        bail!("Release 证据文件数量超过上限");
     }
     for entry in &authorization.evidence_files {
         aursmith_protocol::validate_relative_path(&entry.path)?;
