@@ -382,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn spawn_repository_http(worker: Arc<Worker>, bind: SocketAddr) {
-    let root = worker.repository_dir.join(&worker.repository_arch);
+    let root = worker.repository_dir.clone();
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(listener) => listener,
