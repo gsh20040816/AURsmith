@@ -33,7 +33,7 @@ ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当�
 
 清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。其他包保持不变。非空结果继续由 repo-add 从完整包集合重建。清除最后一个包时，Signer 使用 bsdtar 创建标准空 gzip tar 数据库和 files 数据库后照常签名，Publisher 原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。
 
-Release 提交并原子切换后，Publisher 从全部 GPG 签名 Manifest 计算保留集合：当前数据库指向的 Release 永久进入集合；提交时间在最近 30 天内的 Release 全部进入；再按时间倒序为每个 `pkgname` 保留至少 3 个不同 `package_version` 所在的 Release。证据文件随对应 Release 一起保留。任一 Manifest、签名、目录 ID 或当前数据库链接异常时，本轮清理整体停止，不能按文件名猜测后删除。
+Release 提交并原子切换后，Publisher 从全部 GPG 签名 Manifest 计算保留集合：当前数据库指向的 Release 永久进入集合；其他 Release 只有同时满足“提交时间在最近 30 天内”和“包含对应 `pkgname` 最新 3 个不同 `package_version` 之一”才保留。超过 30 天的历史版本即使不足 3 个也删除，30 天内超过最新 3 个的更旧版本同样删除。证据文件随对应 Release 一起保留。任一 Manifest、签名、目录 ID 或当前数据库链接异常时，本轮清理整体停止，不能按文件名猜测后删除。
 
 服务端回滚使用短期 ReleaseRollbackAuthorization，只允许当前 writer epoch 的 Publisher 激活已经存在的不可变 Release。Publisher 在切换前重新验证 Manifest、包、db/files 数据库和全部 GPG 签名，不重新构建、运行 repo-add 或调用 Signer。Controller 单独保存当前 Release 指针，并从目标 Release Artifact 清单生成客户端 `pacman -U` 命令；服务端操作不会被描述成客户端自动降级。
 

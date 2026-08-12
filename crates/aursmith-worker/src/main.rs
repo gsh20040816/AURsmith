@@ -2647,13 +2647,12 @@ fn select_retained_releases(
     let mut retained = BTreeSet::from([current_release]);
     let mut newest = releases.iter().collect::<Vec<_>>();
     newest.sort_by_key(|release| std::cmp::Reverse(release.committed_at));
-    for release in &newest {
-        if release.committed_at >= cutoff {
-            retained.insert(release.id);
-        }
-    }
     let mut versions = BTreeMap::<String, BTreeSet<String>>::new();
     for release in newest {
+        if release.committed_at < cutoff {
+            continue;
+        }
+        let mut contains_retained_version = false;
         for artifact in &release.artifacts {
             let (Some(package_name), Some(package_version)) =
                 (&artifact.package_name, &artifact.package_version)
@@ -2662,8 +2661,11 @@ fn select_retained_releases(
             };
             let seen = versions.entry(package_name.clone()).or_default();
             if seen.len() < minimum_versions && seen.insert(package_version.clone()) {
-                retained.insert(release.id);
+                contains_retained_version = true;
             }
+        }
+        if contains_retained_version {
+            retained.insert(release.id);
         }
     }
     retained
@@ -3773,12 +3775,42 @@ mod transfer_tests {
     }
 
     #[test]
-    fn publisher_retention_keeps_recent_releases_and_three_versions_per_package() {
+    fn publisher_retention_requires_recent_and_latest_three_versions() {
         let now = Utc::now();
         let releases = (0..5)
             .map(|index| RetentionRelease {
                 id: uuid::Uuid::new_v4(),
                 committed_at: now - chrono::Duration::days(index * 20),
+                artifacts: vec![ArtifactRecord {
+                    path: format!("fixture-{}-1-any.pkg.tar.zst", 5 - index),
+                    sha256: "a".repeat(64),
+                    size: 1,
+                    package_name: Some("fixture".into()),
+                    package_version: Some(format!("{}-1", 5 - index)),
+                    architecture: Some("any".into()),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let retained = select_retained_releases(
+            &releases,
+            releases[0].id,
+            now - chrono::Duration::days(30),
+            3,
+        );
+        assert_eq!(retained.len(), 2);
+        assert!(retained.contains(&releases[0].id));
+        assert!(retained.contains(&releases[1].id));
+        assert!(!retained.contains(&releases[2].id));
+        assert!(!retained.contains(&releases[3].id));
+    }
+
+    #[test]
+    fn publisher_retention_limits_frequent_updates_to_three_versions() {
+        let now = Utc::now();
+        let releases = (0..5)
+            .map(|index| RetentionRelease {
+                id: uuid::Uuid::new_v4(),
+                committed_at: now - chrono::Duration::days(index),
                 artifacts: vec![ArtifactRecord {
                     path: format!("fixture-{}-1-any.pkg.tar.zst", 5 - index),
                     sha256: "a".repeat(64),
