@@ -41,7 +41,8 @@ services:
       - publisher-staging:/jobs
       - publisher-hot:/repository
       - signer-inbox:/signer-inbox
-      - signer-output:/signer-output:ro
+      # Publisher 在验证并原子提交 Release 后负责删除 Signer 的短生命周期输出。
+      - signer-output:/signer-output
     secrets:
       - builder_pull_key
       - builder_known_hosts

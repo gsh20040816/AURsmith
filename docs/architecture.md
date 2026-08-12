@@ -25,6 +25,8 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 `TransferCapability` 继续绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限。反向 Builder 把清单中逐个复验的文件复制到只读 export 目录，通过 Publisher 的 OpenSSH forced command 主动上传到 Capability 专属 partial 目录。服务端直接复用 rsync 官方 `rrsync -wo /landing` 限制写入根目录和危险参数，AURsmith 不复制 rsync 的命令行协议解析；Capability 专属目录由传输前的准备操作创建，Publisher 在传输后复验完整清单与摘要，才 rename 为 landing。Controller 不代理或落盘包字节。公网可达源节点仍可沿用目标主动拉取模式，两种方向共用同一 Capability 数据模型和摘要门禁。
 
+Publisher 的稳态存储以公开 hot store 为唯一包内容存储。Release 目录中的包名是同一文件系统内指向 hot store 内容的硬链接，只额外保存仓库数据库、Manifest、签名和纯文本检查记录。landing、Signer inbox 和 Signer output 都是短生命周期工作区；Release 完成原子提交并经 Publisher 复验后立即删除，若进程在提交与清理之间重启，则由 Journal 中的 `published` 状态幂等补做清理。这样正常稳态空间接近保留包集合本身，而不是发布阶段副本数量的倍数。
+
 ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
 
 清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。其他包保持不变。非空结果继续由 repo-add 从完整包集合重建。清除最后一个包时，Signer 使用 bsdtar 创建标准空 gzip tar 数据库和 files 数据库后照常签名，Publisher 原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。

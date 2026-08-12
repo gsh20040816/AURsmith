@@ -2155,6 +2155,16 @@ fn publish_repository_public_key(worker: &Worker, public_key: &Path) -> anyhow::
 }
 
 fn spawn_publisher(worker: Arc<Worker>) {
+    let cleanup_worker = worker.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = reconcile_publisher_workspaces(&cleanup_worker).await {
+                tracing::warn!(%error, "Publisher 发布工作区清理失败，稍后重试");
+            }
+        }
+    });
     let retention_worker = worker.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
@@ -2224,7 +2234,12 @@ async fn reconcile_publisher_one(worker: &Worker) -> anyhow::Result<()> {
     match verify_and_publish_release(worker, &authorization, &envelope, &signed) {
         Ok(manifest_sha256) => {
             sqlx::query("UPDATE publisher_releases SET state = 'published', manifest_sha256 = ?, last_error = NULL, updated_at = ? WHERE release_id = ?")
-                .bind(manifest_sha256).bind(Utc::now()).bind(release_id).execute(&worker.database).await?;
+                .bind(manifest_sha256).bind(Utc::now()).bind(&release_id).execute(&worker.database).await?;
+            if let Err(error) =
+                cleanup_published_release_workspace(worker, &release_id, &authorization).await
+            {
+                tracing::warn!(%error, %release_id, "Release 已发布，但暂存数据清理失败，稍后重试");
+            }
             if let Err(error) = reconcile_publisher_retention(worker).await {
                 tracing::warn!(%error, "Publisher Release 保留策略执行失败，未影响当前仓库");
             }
@@ -2235,6 +2250,159 @@ async fn reconcile_publisher_one(worker: &Worker) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn reconcile_publisher_workspaces(worker: &Worker) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT release_id, authorization_json FROM publisher_releases WHERE state = 'published' ORDER BY updated_at",
+    )
+    .fetch_all(&worker.database)
+    .await?;
+    for row in rows {
+        let release_id: String = row.get("release_id");
+        let envelope: SignedEnvelope = serde_json::from_str(row.get("authorization_json"))?;
+        let authorization: ReleaseAuthorization =
+            envelope.verify("aursmith.release_authorization")?;
+        cleanup_published_release_workspace(worker, &release_id, &authorization).await?;
+    }
+    Ok(())
+}
+
+async fn cleanup_published_release_workspace(
+    worker: &Worker,
+    release_id: &str,
+    authorization: &ReleaseAuthorization,
+) -> anyhow::Result<()> {
+    let committed_manifest = worker
+        .repository_dir
+        .join(&worker.repository_arch)
+        .join("releases")
+        .join(release_id)
+        .join("release-manifest.json");
+    let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(&committed_manifest)?)?;
+    if manifest.release_id.to_string() != release_id
+        || manifest.artifacts != authorization.artifacts
+        || manifest.evidence_files != authorization.evidence_files
+    {
+        bail!("拒绝清理尚未完整提交的 Release 工作区：{release_id}");
+    }
+
+    consolidate_release_artifact_links(worker, &manifest, &committed_manifest)?;
+
+    for directory in [
+        worker.signer_inbox.join(release_id),
+        worker.signer_output.join(release_id),
+    ] {
+        if directory.exists() {
+            std::fs::remove_dir_all(directory)?;
+        }
+    }
+
+    let imports = sqlx::query(
+        "SELECT capability_id, directory, manifest_json FROM transfer_imports WHERE state = 'verified'",
+    )
+    .fetch_all(&worker.database)
+    .await?;
+    for row in imports {
+        let entries: Vec<aursmith_protocol::ManifestEntry> =
+            serde_json::from_str(row.get("manifest_json"))?;
+        if !transfer_manifest_is_consumed(&entries, authorization) {
+            continue;
+        }
+        let directory = PathBuf::from(row.get::<String, _>("directory"));
+        if directory.exists() {
+            std::fs::remove_dir_all(&directory)?;
+        }
+        sqlx::query(
+            "UPDATE transfer_imports SET state = 'consumed', directory = '' WHERE capability_id = ? AND state = 'verified'",
+        )
+        .bind(row.get::<String, _>("capability_id"))
+        .execute(&worker.database)
+        .await?;
+    }
+    Ok(())
+}
+
+fn consolidate_release_artifact_links(
+    worker: &Worker,
+    manifest: &ReleaseManifest,
+    manifest_path: &Path,
+) -> anyhow::Result<()> {
+    let release = manifest_path
+        .parent()
+        .context("Release Manifest 缺少目录")?;
+    let hot = worker.repository_dir.join(&worker.repository_arch);
+    for artifact in manifest
+        .artifacts
+        .iter()
+        .chain(manifest.repository_keyring.iter())
+    {
+        atomic_link_identical_file(
+            &release.join(&artifact.path),
+            &hot.join(&artifact.path),
+            &artifact.sha256,
+        )?;
+        let signature = format!("{}.sig", artifact.path);
+        let release_signature = release.join(&signature);
+        let hot_signature = hot.join(&signature);
+        if release_signature.is_file() && hot_signature.is_file() {
+            let signature_sha256 = file_sha256(&release_signature)?;
+            atomic_link_identical_file(&release_signature, &hot_signature, &signature_sha256)?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_link_identical_file(
+    source: &Path,
+    target: &Path,
+    expected_sha256: &str,
+) -> anyhow::Result<()> {
+    if !source.is_file()
+        || !target.is_file()
+        || file_sha256(source)? != expected_sha256
+        || file_sha256(target)? != expected_sha256
+    {
+        bail!("拒绝合并内容不一致的仓库文件：{}", target.display());
+    }
+    let source_metadata = std::fs::metadata(source)?;
+    let target_metadata = std::fs::metadata(target)?;
+    use std::os::unix::fs::MetadataExt;
+    if source_metadata.dev() == target_metadata.dev()
+        && source_metadata.ino() == target_metadata.ino()
+    {
+        return Ok(());
+    }
+    let temporary = target.with_file_name(format!(
+        ".{}.link",
+        target
+            .file_name()
+            .context("仓库文件缺少文件名")?
+            .to_string_lossy()
+    ));
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)?;
+    }
+    std::fs::hard_link(source, &temporary)?;
+    std::fs::rename(&temporary, target)?;
+    sync_directory(target.parent().context("仓库文件缺少父目录")?)
+}
+
+fn transfer_manifest_is_consumed(
+    entries: &[aursmith_protocol::ManifestEntry],
+    authorization: &ReleaseAuthorization,
+) -> bool {
+    !entries.is_empty()
+        && entries.iter().all(|entry| {
+            authorization.artifacts.iter().any(|artifact| {
+                artifact.path == entry.path
+                    && artifact.sha256 == entry.sha256
+                    && artifact.size == entry.size
+            }) || authorization
+                .evidence_files
+                .iter()
+                .any(|evidence| evidence == entry)
+        })
 }
 
 async fn reconcile_publisher_retention(worker: &Worker) -> anyhow::Result<()> {
@@ -2840,7 +3008,9 @@ fn copy_new_or_verify(source: &Path, target: &Path) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    copy_regular_synced(source, target)
+    link_or_copy_regular(source, target)?;
+    std::fs::File::open(target)?.sync_all()?;
+    Ok(())
 }
 
 fn atomic_release_link(root: &Path, name: &str, target: &str) -> anyhow::Result<()> {
@@ -3611,6 +3781,74 @@ mod transfer_tests {
             3,
         );
         assert_eq!(retained, BTreeSet::from([current.id]));
+    }
+
+    #[test]
+    fn published_release_consumes_only_fully_committed_transfers() {
+        let artifact = ArtifactRecord {
+            path: "fixture-1-1-any.pkg.tar.zst".into(),
+            sha256: "a".repeat(64),
+            size: 7,
+            package_name: Some("fixture".into()),
+            package_version: Some("1-1".into()),
+            architecture: Some("any".into()),
+        };
+        let evidence = aursmith_protocol::ManifestEntry {
+            path: "evidence/build.log".into(),
+            sha256: "b".repeat(64),
+            size: 11,
+        };
+        let authorization = ReleaseAuthorization {
+            release_id: uuid::Uuid::new_v4(),
+            batch_id: uuid::Uuid::new_v4(),
+            writer_epoch: 1,
+            repository_name: "aursmith".into(),
+            source_git_commit: "c".repeat(40),
+            revision_sha256s: vec![],
+            audit_report_sha256s: vec![],
+            artifacts: vec![artifact.clone()],
+            evidence_files: vec![evidence.clone()],
+            removed_package_names: vec![],
+            include_repository_keyring: false,
+            evidence: Default::default(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+        };
+        let package = aursmith_protocol::ManifestEntry {
+            path: artifact.path,
+            sha256: artifact.sha256,
+            size: artifact.size,
+        };
+        assert!(transfer_manifest_is_consumed(
+            &[package.clone(), evidence],
+            &authorization
+        ));
+        let mut unrelated = package;
+        unrelated.sha256 = "d".repeat(64);
+        assert!(!transfer_manifest_is_consumed(&[unrelated], &authorization));
+        assert!(!transfer_manifest_is_consumed(&[], &authorization));
+    }
+
+    #[test]
+    fn identical_repository_files_are_atomically_consolidated() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("release.pkg.tar.zst");
+        let target = root.path().join("hot.pkg.tar.zst");
+        std::fs::write(&source, b"same package").unwrap();
+        std::fs::write(&target, b"same package").unwrap();
+        let digest = hex::encode(Sha256::digest(b"same package"));
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&target).unwrap().ino()
+        );
+        atomic_link_identical_file(&source, &target, &digest).unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&target).unwrap().ino()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"same package");
     }
 
     #[test]
