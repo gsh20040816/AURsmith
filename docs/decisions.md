@@ -64,6 +64,7 @@
 - ADR-060：替换 ADR-014、ADR-034、ADR-046 和 ADR-053 中 Fetch VM 必须经 Publisher source proxy 的部分。第一版以实用部署为主，Fetch VM 使用 QEMU user networking 直接访问公网，不再部署 Squid、guestfwd 或 Builder TCP relay；Build VM 仍由 `AURSMITH_BUILD_NETWORK` 独立决定是否联网。Controller、GPG、SSH 和 Agent 密钥均不进入 Guest，下载摘要和 provenance 仍完整记录。
 - ADR-061：替换 ADR-037、ADR-049 和 ADR-051 中 Stack 内必须运行 Web/仓库 Caddy 和内部 CA 的部分。Controller 直接提供 API 与 React 静态页面，Publisher Worker 直接提供仓库文件，二者只映射宿主回环端口；已有的宿主 Caddy 统一负责公网 TLS、`/arch-cache/` 路由和缓存头。删除两层无独立业务价值的 Caddy 可减少镜像、卷、证书和故障点，TLS 私钥仍不进入 AURsmith 容器。
 - ADR-062：Codex Runner 保留原生 `workspace-write` 内层沙箱。Docker 默认 seccomp 及 Debian 的 `docker-default` AppArmor 都会阻止 bubblewrap 建立非特权 mount namespace，因此仅对无 capability、只读根文件系统且不挂载业务秘密的 Agent Runner 设置 `seccomp:unconfined` 与 `apparmor:unconfined`；不得用 privileged、`SYS_ADMIN` 或禁用 Codex sandbox 代替。Arch 宿主未启用 AppArmor，故此前本机验证未暴露后一项部署差异。
+- ADR-063：Fetch Guest 使用官方 `makepkg --printsrcinfo` 对 AUR commit 中的 `.SRCINFO` 做规范化一致性检查，不自行解析 PKGBUILD Shell 语义。真实 `subtitleedit` commit 同时包含 `PKGBUILD pkgrel=2` 与 `.SRCINFO pkgrel=1`，AUR RPC 因此也报告旧版本；该状态必须在下载源码、Agent 审计和 Build 之前确定性阻断，不能通过改写 JobSpec 或忽略差异制造成功。
 
 ## 已拒绝
 

@@ -218,6 +218,7 @@ fn apply_published_pkgrel(
 
 fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     let log = Path::new(OUTPUT).join("fetch.log");
+    verify_committed_srcinfo(Path::new(BUILD))?;
     import_declared_pgp_keys(Path::new(BUILD))?;
     run_as_builder(
         &["/usr/bin/makepkg", "--verifysource", "--noconfirm"],
@@ -250,6 +251,42 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
         log_sha256: file_digest(&log)?,
         finished_at: Utc::now(),
     })
+}
+
+fn verify_committed_srcinfo(build: &Path) -> anyhow::Result<()> {
+    let committed = fs::read_to_string(build.join(".SRCINFO")).context("AUR 快照缺少 .SRCINFO")?;
+    let output = Command::new("/usr/bin/runuser")
+        .args(builder_command_arguments(&[
+            "/usr/bin/makepkg",
+            "--printsrcinfo",
+        ]))
+        .current_dir(build)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
+        .env("HOME", "/home/builder")
+        .env("LANG", "C.UTF-8")
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "makepkg 无法从 PKGBUILD 生成 .SRCINFO：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let generated =
+        String::from_utf8(output.stdout).context("makepkg 输出的 .SRCINFO 不是 UTF-8")?;
+    if normalize_srcinfo(&committed) != normalize_srcinfo(&generated) {
+        bail!("AUR 提交的 .SRCINFO 与 makepkg 从 PKGBUILD 生成的元数据不一致");
+    }
+    Ok(())
+}
+
+fn normalize_srcinfo(srcinfo: &str) -> Vec<(String, String)> {
+    srcinfo
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect()
 }
 
 fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
@@ -1050,6 +1087,17 @@ mod tests {
         assert_eq!(declared_pgp_fingerprints(&srcinfo).unwrap(), [fingerprint]);
         assert!(declared_pgp_fingerprints("validpgpkeys = 93298290").is_err());
         assert!(declared_pgp_fingerprints("validpgpkeys = not-a-key").is_err());
+    }
+
+    #[test]
+    fn srcinfo_normalization_ignores_only_formatting() {
+        let committed = "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 2\n\npkgname = demo\n";
+        let generated = "pkgbase=demo\n  pkgver=1\n  pkgrel=2\npkgname=demo\n";
+        assert_eq!(normalize_srcinfo(committed), normalize_srcinfo(generated));
+        assert_ne!(
+            normalize_srcinfo(committed),
+            normalize_srcinfo("pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\npkgname = demo\n")
+        );
     }
 
     #[test]
