@@ -1499,17 +1499,21 @@ async fn evaluate_worker_health(
         let backpressure = available_percent.is_some_and(|percent| percent < 10);
         sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('publication_backpressure', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
             .bind(json!(backpressure).to_string()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
-        let unarchived_bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(artifacts.size), 0) FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 JOIN releases ON releases.id = release_artifacts.release_id WHERE releases.state = 'committed' AND NOT EXISTS (SELECT 1 FROM archive_copies WHERE archive_copies.release_id = releases.id AND archive_copies.state = 'verified')")
-            .fetch_one(&state.database).await.map_err(ApiError::internal)?;
-        if unarchived_bytes > 20 * 1024 * 1024 * 1024_i64 {
-            upsert_operational_alert(
-                state,
-                "publisher-unarchived-bytes",
-                "warning",
-                "Publisher 未归档数据超过 20 GiB",
-                json!({"unarchived_bytes": unarchived_bytes}),
-            )
-            .await?;
+        if state.config.external_archiver_enabled {
+            let unarchived_bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(artifacts.size), 0) FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 JOIN releases ON releases.id = release_artifacts.release_id WHERE releases.state = 'committed' AND NOT EXISTS (SELECT 1 FROM archive_copies WHERE archive_copies.release_id = releases.id AND archive_copies.state = 'verified')")
+                .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+            if unarchived_bytes > 20 * 1024 * 1024 * 1024_i64 {
+                upsert_operational_alert(
+                    state,
+                    "publisher-unarchived-bytes",
+                    "warning",
+                    "Publisher 未归档数据超过 20 GiB",
+                    json!({"unarchived_bytes": unarchived_bytes}),
+                )
+                .await?;
+            } else {
+                resolve_alert(state, "publisher-unarchived-bytes").await?;
+            }
         } else {
             resolve_alert(state, "publisher-unarchived-bytes").await?;
         }
