@@ -1274,11 +1274,15 @@ async fn reverse_worker_poll(
             "Builder 轮询 nonce 已使用",
         ));
     }
+    let mut acknowledged_attempts = Vec::new();
     for report in poll.attempts {
-        sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) SELECT ?, id, ?, ? FROM jobs WHERE id = ? ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
+        let result = sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) SELECT ?, id, ?, ? FROM jobs WHERE id = ? AND worker_id = ? ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
             .bind(poll.worker_id.to_string()).bind(report.response.to_string())
-            .bind(Utc::now()).bind(report.job_id.to_string())
+            .bind(Utc::now()).bind(report.job_id.to_string()).bind(poll.worker_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
+        if result.rows_affected() > 0 {
+            acknowledged_attempts.push(report.job_id);
+        }
     }
     for capability_id in poll.completed_transfers {
         sqlx::query("UPDATE transfer_capabilities SET state = 'verified', last_error = NULL, export_cleaned_at = COALESCE(export_cleaned_at, ?), updated_at = ? WHERE id = ? AND source_worker_id = ? AND state IN ('export_ready', 'verified')")
@@ -1307,6 +1311,7 @@ async fn reverse_worker_poll(
     let transfer = crate::scheduler::lease_reverse_transfer(&state, poll.worker_id).await?;
     Ok(Json(ReverseWorkerLease {
         worker_id: poll.worker_id,
+        acknowledged_attempts,
         job,
         transfer,
         issued_at: Utc::now(),
@@ -2049,6 +2054,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let lease: ReverseWorkerLease = serde_json::from_slice(&body).unwrap();
+        assert!(lease.acknowledged_attempts.is_empty());
     }
 
     #[tokio::test]

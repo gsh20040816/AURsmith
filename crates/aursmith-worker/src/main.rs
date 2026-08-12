@@ -495,10 +495,10 @@ async fn reverse_poll_once(
     if lease.worker_id != worker_id {
         bail!("Controller 返回了其他 Worker 的租约");
     }
-    for report in &attempts {
+    for job_id in &lease.acknowledged_attempts {
         sqlx::query("UPDATE attempts SET reported_at = ? WHERE job_id = ?")
             .bind(Utc::now())
-            .bind(report.job_id.to_string())
+            .bind(job_id.to_string())
             .execute(&worker.database)
             .await?;
     }
