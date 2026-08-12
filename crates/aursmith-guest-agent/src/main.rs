@@ -440,10 +440,11 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
 fn makepkg_arguments(allow_check: bool) -> Vec<&'static str> {
     let mut arguments = vec![
         "/usr/bin/makepkg",
+        "--config",
+        "/etc/aursmith/makepkg.conf",
         "--noconfirm",
         "--cleanbuild",
         "--force",
-        "--nodebug",
     ];
     if !allow_check {
         arguments.push("--nocheck");
@@ -977,7 +978,11 @@ mod tests {
 
     #[test]
     fn check_policy_is_explicit_and_split_outputs_must_match() {
-        assert!(makepkg_arguments(true).contains(&"--nodebug"));
+        assert!(
+            makepkg_arguments(true)
+                .windows(2)
+                .any(|pair| pair == ["--config", "/etc/aursmith/makepkg.conf"])
+        );
         assert!(!makepkg_arguments(true).contains(&"--nocheck"));
         assert!(makepkg_arguments(false).contains(&"--nocheck"));
         let artifact = ArtifactRecord {
