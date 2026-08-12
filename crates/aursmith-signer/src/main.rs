@@ -236,7 +236,7 @@ fn reusable_repository_keyring(
         if !package.is_file()
             || !signature.is_file()
             || digest_file(&package)? != artifact.sha256
-            || repository_keyring_fingerprint(&package)?.as_deref() != Some(fingerprint.as_str())
+            || !repository_keyring_matches(cli, &package, &fingerprint)?
         {
             continue;
         }
@@ -247,31 +247,43 @@ fn reusable_repository_keyring(
     Ok(None)
 }
 
-fn repository_keyring_fingerprint(package: &Path) -> anyhow::Result<Option<String>> {
-    let output = Command::new("/usr/bin/bsdtar")
-        .args(["-xOf"])
-        .arg(package)
-        .arg("usr/share/pacman/keyrings/aursmith.gpg")
+fn repository_keyring_matches(
+    cli: &Cli,
+    package: &Path,
+    fingerprint: &str,
+) -> anyhow::Result<bool> {
+    let public_key = Command::new("/usr/bin/gpg")
+        .args(["--homedir"])
+        .arg(&cli.gpg_home)
+        .args(["--batch", "--export", fingerprint])
         .stdin(Stdio::null())
         .output()?;
-    if !output.status.success() || output.stdout.is_empty() || output.stdout.len() > 1024 * 1024 {
-        return Ok(None);
+    if !public_key.status.success() || public_key.stdout.is_empty() {
+        bail!("无法导出仓库 GPG 公钥");
     }
-    let key = tempfile::NamedTempFile::new()?;
-    fs::write(key.path(), output.stdout)?;
-    let listing = Command::new("/usr/bin/gpg")
-        .args(["--batch", "--with-colons", "--show-keys", "--fingerprint"])
-        .arg(key.path())
-        .stdin(Stdio::null())
-        .output()?;
-    if !listing.status.success() {
-        return Ok(None);
+    let expected = [
+        ("usr/share/pacman/keyrings/aursmith.gpg", public_key.stdout),
+        (
+            "usr/share/pacman/keyrings/aursmith-trusted",
+            format!("{fingerprint}:4:\n").into_bytes(),
+        ),
+        ("usr/share/pacman/keyrings/aursmith-revoked", Vec::new()),
+    ];
+    for (path, expected_content) in expected {
+        let actual = Command::new("/usr/bin/bsdtar")
+            .args(["-xOf"])
+            .arg(package)
+            .arg(path)
+            .stdin(Stdio::null())
+            .output()?;
+        if !actual.status.success()
+            || actual.stdout.len() > 1024 * 1024
+            || actual.stdout != expected_content
+        {
+            return Ok(false);
+        }
     }
-    Ok(String::from_utf8(listing.stdout)?
-        .lines()
-        .filter_map(|line| line.split(':').nth(9))
-        .find(|value| value.len() == 40 && value.chars().all(|value| value.is_ascii_hexdigit()))
-        .map(str::to_owned))
+    Ok(true)
 }
 
 fn find_reusable_package(cli: &Cli, artifact: &ArtifactRecord) -> anyhow::Result<PathBuf> {
@@ -828,6 +840,8 @@ mod tests {
         assert_eq!(artifact.architecture.as_deref(), Some("any"));
         let package = staging.join(&artifact.path);
         validate_package_metadata(&package, &artifact).unwrap();
+        let fingerprint = repository_fingerprint(&cli).unwrap();
+        assert!(repository_keyring_matches(&cli, &package, &fingerprint).unwrap());
         let entries = Command::new("/usr/bin/bsdtar")
             .args(["-tf"])
             .arg(package)
