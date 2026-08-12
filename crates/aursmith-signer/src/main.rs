@@ -22,6 +22,12 @@ struct Cli {
     inbox: PathBuf,
     #[arg(long, env = "AURSMITH_SIGNER_OUTPUT", default_value = "/signed")]
     output: PathBuf,
+    #[arg(
+        long,
+        env = "AURSMITH_SIGNER_REPOSITORY",
+        default_value = "/repository"
+    )]
+    repository: PathBuf,
     #[arg(long, env = "AURSMITH_CONTROLLER_VERIFYING_KEY_HEX")]
     controller_key_hex: String,
     #[arg(long, env = "AURSMITH_GPG_PRIVATE_KEY_FILE")]
@@ -98,7 +104,7 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         bail!("ReleaseAuthorization 不是由当前 Controller 签发");
     }
     let authorization: ReleaseAuthorization = envelope.verify("aursmith.release_authorization")?;
-    validate_authorization(&authorization, &entry.path())?;
+    validate_authorization(cli, &authorization, &entry.path())?;
     let release_id = authorization.release_id.to_string();
     if entry.file_name().to_string_lossy() != release_id {
         bail!("inbox 目录与 Release ID 不匹配");
@@ -113,16 +119,23 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     }
     fs::create_dir_all(&staging)?;
     let mut package_paths = Vec::new();
+    let mut reused_package_paths = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         let source = entry.path().join(&artifact.path);
-        let destination = staging.join(
-            Path::new(&artifact.path)
-                .file_name()
-                .context("Artifact 缺少文件名")?,
-        );
-        fs::copy(source, &destination)?;
-        gpg_sign(cli, &destination)?;
-        package_paths.push(destination);
+        if source.is_file() {
+            let destination = staging.join(
+                Path::new(&artifact.path)
+                    .file_name()
+                    .context("Artifact 缺少文件名")?,
+            );
+            fs::copy(source, &destination)?;
+            gpg_sign(cli, &destination)?;
+            package_paths.push(destination);
+        } else {
+            let reusable = find_reusable_package(cli, artifact)?;
+            reused_package_paths.insert(reusable.clone());
+            package_paths.push(reusable);
+        }
     }
     let repository_keyring = if authorization.include_repository_keyring {
         let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
@@ -184,6 +197,16 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         release_authorization: Some(file_entry(&authorization_destination)?),
         committed_at: Utc::now(),
     };
+    for artifact in &manifest.artifacts {
+        let source = cli.repository.join("x86_64").join(&artifact.path);
+        if reused_package_paths.contains(&source) {
+            fs::copy(&source, staging.join(&artifact.path))?;
+            fs::copy(
+                source.with_file_name(format!("{}.sig", artifact.path)),
+                staging.join(format!("{}.sig", artifact.path)),
+            )?;
+        }
+    }
     fs::write(
         staging.join("release-manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -191,6 +214,33 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     gpg_sign(cli, &staging.join("release-manifest.json"))?;
     fs::rename(staging, committed)?;
     Ok(())
+}
+
+fn find_reusable_package(cli: &Cli, artifact: &ArtifactRecord) -> anyhow::Result<PathBuf> {
+    let hot = cli.repository.join("x86_64").join(&artifact.path);
+    if !hot.is_file()
+        || !hot
+            .with_file_name(format!("{}.sig", artifact.path))
+            .is_file()
+    {
+        bail!("复用 Artifact 不存在于已提交 hot set：{}", artifact.path);
+    }
+    let releases = cli.repository.join("x86_64/releases");
+    for entry in fs::read_dir(releases)?.filter_map(Result::ok) {
+        let manifest_path = entry.path().join("release-manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let manifest: ReleaseManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        if manifest
+            .artifacts
+            .iter()
+            .any(|previous| previous == artifact)
+        {
+            return Ok(hot);
+        }
+    }
+    bail!("复用 Artifact 没有已提交 Release 记录：{}", artifact.path)
 }
 
 fn create_repository_keyring_package(
@@ -325,7 +375,11 @@ fn repository_fingerprint(cli: &Cli) -> anyhow::Result<String> {
         .context("仓库私钥没有有效主指纹")
 }
 
-fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> anyhow::Result<()> {
+fn validate_authorization(
+    cli: &Cli,
+    authorization: &ReleaseAuthorization,
+    root: &Path,
+) -> anyhow::Result<()> {
     if authorization.expires_at < Utc::now() {
         bail!("ReleaseAuthorization 已过期");
     }
@@ -355,6 +409,11 @@ fn validate_authorization(authorization: &ReleaseAuthorization, root: &Path) -> 
             bail!("Artifact 不是 Arch 软件包");
         }
         let path = root.join(&artifact.path);
+        let path = if path.is_file() {
+            path
+        } else {
+            find_reusable_package(cli, artifact)?
+        };
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file()
             || metadata.len() != artifact.size
@@ -506,6 +565,17 @@ mod tests {
     use chrono::Duration;
     use uuid::Uuid;
 
+    fn test_cli(root: &Path) -> Cli {
+        Cli {
+            inbox: root.join("inbox"),
+            output: root.join("output"),
+            repository: root.join("repository"),
+            controller_key_hex: "00".repeat(32),
+            gpg_private_key: root.join("unused"),
+            gpg_home: root.join("gnupg"),
+        }
+    }
+
     #[test]
     fn bad_release_does_not_abort_the_inbox_scan() {
         let root = tempfile::tempdir().unwrap();
@@ -521,6 +591,7 @@ mod tests {
         let cli = Cli {
             inbox,
             output,
+            repository: root.path().join("repository"),
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home: root.path().join("gnupg"),
@@ -546,6 +617,7 @@ mod tests {
         let cli = Cli {
             inbox,
             output,
+            repository: root.path().join("repository"),
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home: root.path().join("gnupg"),
@@ -596,7 +668,9 @@ mod tests {
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };
-        assert!(validate_authorization(&authorization, root.path()).is_ok());
+        assert!(
+            validate_authorization(&test_cli(root.path()), &authorization, root.path()).is_ok()
+        );
     }
 
     #[test]
@@ -625,7 +699,9 @@ mod tests {
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };
-        assert!(validate_authorization(&authorization, root.path()).is_err());
+        assert!(
+            validate_authorization(&test_cli(root.path()), &authorization, root.path()).is_err()
+        );
     }
 
     #[test]
@@ -668,6 +744,7 @@ mod tests {
         let cli = Cli {
             inbox: root.path().join("inbox"),
             output: root.path().join("output"),
+            repository: root.path().join("repository"),
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home,

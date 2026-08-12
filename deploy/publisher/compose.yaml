@@ -75,11 +75,13 @@ services:
       AURSMITH_GPG_HOME: /run/aursmith-gnupg
       AURSMITH_SIGNER_INBOX: /inbox
       AURSMITH_SIGNER_OUTPUT: /signed
+      AURSMITH_SIGNER_REPOSITORY: /repository
     secrets:
       - repository_gpg_private_key
     volumes:
       - signer-inbox:/inbox:ro
       - signer-output:/signed
+      - publisher-hot:/repository:ro
     tmpfs:
       - /run/aursmith-gnupg:uid=10001,gid=10001,mode=0700,size=16m
       - /tmp:uid=10001,gid=10001,mode=0700,size=64m

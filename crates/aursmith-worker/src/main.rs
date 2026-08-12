@@ -1843,6 +1843,15 @@ async fn materialize_release_inbox(
         if !used_paths.insert(artifact.path.clone()) {
             bail!("Release 包含重复 Artifact 路径：{}", artifact.path);
         }
+        let hot = worker
+            .repository_dir
+            .join(&worker.repository_arch)
+            .join(&artifact.path);
+        if reusable_committed_artifact(worker, artifact, &hot)? {
+            let inspection = load_committed_artifact_inspection(worker, artifact)?;
+            inspections.push(inspection);
+            continue;
+        }
         let mut source = None;
         for row in &imports {
             let manifest: Vec<aursmith_protocol::ManifestEntry> =
@@ -1854,15 +1863,6 @@ async fn materialize_release_inbox(
             }) {
                 source = Some(PathBuf::from(row.get::<String, _>("directory")).join(&entry.path));
                 break;
-            }
-        }
-        if source.is_none() {
-            let hot = worker
-                .repository_dir
-                .join(&worker.repository_arch)
-                .join(&artifact.path);
-            if hot.is_file() {
-                source = Some(hot);
             }
         }
         let source = source.context("Release Artifact 没有已验证的 TransferCapability")?;
@@ -1932,6 +1932,79 @@ async fn materialize_release_inbox(
         serde_json::to_vec(envelope)?,
     )?;
     Ok(())
+}
+
+fn reusable_committed_artifact(
+    worker: &Worker,
+    artifact: &ArtifactRecord,
+    hot: &Path,
+) -> anyhow::Result<bool> {
+    if !hot.is_file()
+        || !hot
+            .with_file_name(format!("{}.sig", artifact.path))
+            .is_file()
+        || std::fs::metadata(hot)?.len() != artifact.size
+    {
+        return Ok(false);
+    }
+    let releases = worker
+        .repository_dir
+        .join(&worker.repository_arch)
+        .join("releases");
+    for entry in std::fs::read_dir(releases)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+    {
+        let manifest_path = entry.path().join("release-manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        if manifest
+            .artifacts
+            .iter()
+            .any(|previous| previous == artifact)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn load_committed_artifact_inspection(
+    worker: &Worker,
+    artifact: &ArtifactRecord,
+) -> anyhow::Result<package_inspection::PackageInspection> {
+    let releases = worker
+        .repository_dir
+        .join(&worker.repository_arch)
+        .join("releases");
+    for entry in std::fs::read_dir(releases)?.filter_map(Result::ok) {
+        let manifest_path = entry.path().join("release-manifest.json");
+        let inspections_path = entry.path().join("artifact-inspections.json");
+        if !manifest_path.is_file() || !inspections_path.is_file() {
+            continue;
+        }
+        let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        if !manifest
+            .artifacts
+            .iter()
+            .any(|previous| previous == artifact)
+        {
+            continue;
+        }
+        let inspections: Vec<package_inspection::PackageInspection> =
+            serde_json::from_slice(&std::fs::read(inspections_path)?)?;
+        if let Some(inspection) = inspections
+            .into_iter()
+            .find(|inspection| inspection.artifact_sha256 == artifact.sha256)
+        {
+            return Ok(inspection);
+        }
+    }
+    bail!("已提交 Artifact 缺少检查记录：{}", artifact.path)
 }
 
 async fn query_release(worker: &Worker, release_id: &str) -> WorkerResponse {

@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use aursmith_protocol::ArtifactRecord;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -10,7 +10,7 @@ use std::{
 
 const MAXIMUM_ARCHIVE_ENTRIES: usize = 500_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageInspection {
     pub artifact_sha256: String,
     pub entry_count: usize,
