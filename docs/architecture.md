@@ -89,6 +89,8 @@ Controller 每六小时读取当前 Release 中 Artifact 构建时记录的官�
 
 ## 发布安全
 
+`authorize-release` 只验证 Controller 签名、writer epoch 和 Release 元数据，将不可变授权写入 Publisher 的 SQLite Journal 后立即返回。包内容检查、Signer inbox 物化、签名结果校验和原子提交由 Publisher 单实例后台对账循环异步执行；Controller 通过 `query-release` 查询 `queued → awaiting_signer → published/failed`。因此大包检查不会占用 SSH 控制请求，也不需要为控制通道设置分钟级超时或引入额外队列。
+
 受影响的依赖闭包组成一个 `ReleaseBatch`。系统完整暂存该批次，根据完整 Manifest 签名并验证，然后最后切换仓库数据库。失败批次不能修改当前 Release。
 
 Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publisher 只能向只写 inbox 投递软件包和 Controller 签名的 `ReleaseAuthorization`，不能访问 Signer 的 GPG home；Signer 只能只读 inbox 并写独立 signed volume。Signer 再次验证 Controller Ed25519 公钥、授权期限、writer epoch 对应的授权内容、每个包的相对路径、大小、SHA-256 和 `.PKGINFO`，随后用固定 argv 调用 GPG 与官方 `repo-add`。包、仓库数据库和 Release Manifest 均生成 GPG 分离签名，完整 staging 最后通过目录 rename 提交。Publisher 仍须在公开前复验签名并执行 hot set/数据库切换；Signer 自身不拥有公开仓库卷。
@@ -101,7 +103,7 @@ Controller 在 Attempt 对账事务中保存完整 GuestResult 和有界诊断�
 
 成功 Build 不再为每个包重复归档完整 Profile 和 source tree。Controller 保存限长的 Build/QEMU/namcap 纯文本日志、结构化 BuildResult、签名 JobSpec 摘要、Profile digest、Source Manifest digest 和 AUR/VCS commit；Publisher 传输和保留二进制包、签名、仓库数据库、Release Manifest 与这些小型结构化引用。相同 digest 的 Profile 和 source 可在 Builder 缓存中复用，但不作为每个 Release 的大体积附件上传。
 
-Publisher 和断网 Signer 不解包证据归档，只验证授权路径、普通文件类型、大小和摘要。Signer 将证据复制到不可变 Release，并把清单写入 GPG 签名的 Release Manifest；Publisher 逐项复验后才原子提交。`release-files` 递归返回证据文件，Archiver 再以完整目录 Manifest、rsync 快照和签名 ArchiveReceipt 绑定实际字节。管理员可以从 Job 页面查看有界在线日志，从 Release 或归档恢复完整原始证据。
+Publisher 和断网 Signer 不接收每包重复的 Profile/source 归档。Release 保存包、签名、数据库、Manifest、检查报告及小型结构化 digest 引用；管理员从 Job 页面查看有界在线日志。
 
 ## Builder KVM 执行内核
 

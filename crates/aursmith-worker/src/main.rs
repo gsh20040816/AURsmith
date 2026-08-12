@@ -1752,43 +1752,8 @@ async fn authorize_release(worker: &Worker, envelope: SignedEnvelope) -> WorkerR
         Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
         Ok(None) => {}
     }
-    let staging = worker.signer_inbox.join(format!(".{release_id}.staging"));
-    let committed = worker.signer_inbox.join(&release_id);
-    if staging.exists() {
-        let _ = std::fs::remove_dir_all(&staging);
-    }
-    if committed.exists() {
-        let recovered: Result<SignedEnvelope, _> =
-            std::fs::read(committed.join("authorization.json"))
-                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(std::io::Error::other));
-        if !matches!(recovered.as_ref(), Ok(value) if value.payload_sha256 == envelope.payload_sha256)
-        {
-            return WorkerResponse::error("RELEASE_CONFLICT", "Signer inbox 已存在其他授权");
-        }
-        let now = Utc::now();
-        let inserted = sqlx::query("INSERT INTO publisher_releases(release_id, writer_epoch, envelope_sha256, authorization_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'awaiting_signer', ?, ?)")
-            .bind(&release_id).bind(i64::try_from(authorization.writer_epoch).unwrap_or(i64::MAX))
-            .bind(&envelope.payload_sha256).bind(serde_json::to_string(&envelope).unwrap_or_default())
-            .bind(now).bind(now).execute(&worker.database).await;
-        return match inserted {
-            Ok(_) => WorkerResponse::ok(
-                "RELEASE_RECOVERED",
-                serde_json::json!({"release_id": release_id}),
-            ),
-            Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
-        };
-    }
-    if let Err(error) = materialize_release_inbox(worker, &authorization, &envelope, &staging).await
-    {
-        let _ = std::fs::remove_dir_all(&staging);
-        return WorkerResponse::error("RELEASE_INPUT_INVALID", error.to_string());
-    }
-    if let Err(error) = std::fs::rename(&staging, &committed) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return WorkerResponse::error("SIGNER_INBOX_ERROR", error.to_string());
-    }
     let now = Utc::now();
-    let inserted = sqlx::query("INSERT INTO publisher_releases(release_id, writer_epoch, envelope_sha256, authorization_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'awaiting_signer', ?, ?)")
+    let inserted = sqlx::query("INSERT INTO publisher_releases(release_id, writer_epoch, envelope_sha256, authorization_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?)")
         .bind(&release_id).bind(i64::try_from(authorization.writer_epoch).unwrap_or(i64::MAX))
         .bind(&envelope.payload_sha256).bind(serde_json::to_string(&envelope).unwrap_or_default())
         .bind(now).bind(now).execute(&worker.database).await;
@@ -2139,6 +2104,38 @@ fn spawn_publisher(worker: Arc<Worker>) {
 }
 
 async fn reconcile_publisher_one(worker: &Worker) -> anyhow::Result<()> {
+    let queued = sqlx::query("SELECT release_id, authorization_json FROM publisher_releases WHERE state = 'queued' ORDER BY created_at LIMIT 1")
+        .fetch_optional(&worker.database).await?;
+    if let Some(row) = queued {
+        let release_id: String = row.get("release_id");
+        let envelope: SignedEnvelope = serde_json::from_str(row.get("authorization_json"))?;
+        let authorization: ReleaseAuthorization =
+            envelope.verify("aursmith.release_authorization")?;
+        let staging = worker.signer_inbox.join(format!(".{release_id}.staging"));
+        let committed = worker.signer_inbox.join(&release_id);
+        let result = if committed.is_dir() {
+            Ok(())
+        } else {
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging)?;
+            }
+            materialize_release_inbox(worker, &authorization, &envelope, &staging)
+                .await
+                .and_then(|_| std::fs::rename(&staging, &committed).map_err(Into::into))
+        };
+        match result {
+            Ok(()) => {
+                sqlx::query("UPDATE publisher_releases SET state = 'awaiting_signer', last_error = NULL, updated_at = ? WHERE release_id = ? AND state = 'queued'")
+                    .bind(Utc::now()).bind(&release_id).execute(&worker.database).await?;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                sqlx::query("UPDATE publisher_releases SET state = 'failed', last_error = ?, updated_at = ? WHERE release_id = ?")
+                    .bind(error.to_string()).bind(Utc::now()).bind(&release_id).execute(&worker.database).await?;
+            }
+        }
+        return Ok(());
+    }
     let row = sqlx::query("SELECT release_id, authorization_json FROM publisher_releases WHERE state = 'awaiting_signer' ORDER BY created_at LIMIT 1")
         .fetch_optional(&worker.database).await?;
     let Some(row) = row else {
