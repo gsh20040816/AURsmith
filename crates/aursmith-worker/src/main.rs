@@ -442,9 +442,11 @@ async fn reverse_poll_once(
         .as_str()
         .context("Builder 状态缺少 instance_id")?
         .parse::<uuid::Uuid>()?;
-    let rows = sqlx::query("SELECT job_id FROM attempts ORDER BY received_at DESC LIMIT 32")
-        .fetch_all(&worker.database)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT job_id FROM attempts WHERE reported_at IS NULL ORDER BY received_at LIMIT 4",
+    )
+    .fetch_all(&worker.database)
+    .await?;
     let mut attempts = Vec::with_capacity(rows.len());
     for row in rows {
         let job_id: String = row.get("job_id");
@@ -466,7 +468,7 @@ async fn reverse_poll_once(
         worker_id,
         nonce: uuid::Uuid::new_v4(),
         status: status_response.data,
-        attempts,
+        attempts: attempts.clone(),
         completed_transfers: completed_transfers.clone(),
         sent_at: Utc::now(),
     };
@@ -492,6 +494,13 @@ async fn reverse_poll_once(
     let lease: ReverseWorkerLease = response.json().await?;
     if lease.worker_id != worker_id {
         bail!("Controller 返回了其他 Worker 的租约");
+    }
+    for report in &attempts {
+        sqlx::query("UPDATE attempts SET reported_at = ? WHERE job_id = ?")
+            .bind(Utc::now())
+            .bind(report.job_id.to_string())
+            .execute(&worker.database)
+            .await?;
     }
     if let Some(job) = lease.job {
         let accepted = submit(worker, job).await;
@@ -695,13 +704,14 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         "CREATE TABLE IF NOT EXISTS attempts(\
          job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
          envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
-         result_sha256 TEXT, spec_json TEXT, failure_code TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
+         result_sha256 TEXT, spec_json TEXT, failure_code TEXT, reported_at TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
     )
     .execute(&pool)
     .await?;
     for statement in [
         "ALTER TABLE attempts ADD COLUMN spec_json TEXT",
         "ALTER TABLE attempts ADD COLUMN failure_code TEXT",
+        "ALTER TABLE attempts ADD COLUMN reported_at TEXT",
     ] {
         if let Err(error) = sqlx::query(statement).execute(&pool).await
             && !error.to_string().contains("duplicate column name")
