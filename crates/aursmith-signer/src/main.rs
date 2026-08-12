@@ -42,8 +42,8 @@ fn main() -> anyhow::Result<()> {
     }
     initialize_gpg(&cli)?;
     loop {
-        if let Err(error) = process_one(&cli, &controller_key) {
-            tracing::warn!(%error, "Signer 处理 Release 失败");
+        if let Err(error) = process_pending(&cli, &controller_key) {
+            tracing::warn!(%error, "Signer 扫描 Release inbox 失败");
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -67,16 +67,26 @@ fn initialize_gpg(cli: &Cli) -> anyhow::Result<()> {
     )
 }
 
-fn process_one(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
-    let Some(entry) = fs::read_dir(&cli.inbox)?
+fn process_pending(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
+    for entry in fs::read_dir(&cli.inbox)?
         .filter_map(Result::ok)
-        .find(|entry| {
+        .filter(|entry| {
             entry.file_type().is_ok_and(|kind| kind.is_dir())
                 && !entry.file_name().to_string_lossy().starts_with('.')
         })
-    else {
-        return Ok(());
-    };
+    {
+        if let Err(error) = process_release(cli, controller_key, &entry) {
+            tracing::warn!(
+                %error,
+                release_directory = %entry.file_name().to_string_lossy(),
+                "Signer 处理 Release 失败"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> anyhow::Result<()> {
     let authorization_path = entry.path().join("authorization.json");
     let envelope: SignedEnvelope = serde_json::from_slice(&fs::read(&authorization_path)?)?;
     if envelope.verifying_key != controller_key {
@@ -490,6 +500,29 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn bad_release_does_not_abort_the_inbox_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let output = root.path().join("output");
+        fs::create_dir_all(inbox.join("bad-release")).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(
+            inbox.join("bad-release/authorization.json"),
+            b"not valid json",
+        )
+        .unwrap();
+        let cli = Cli {
+            inbox,
+            output,
+            controller_key_hex: "00".repeat(32),
+            gpg_private_key: root.path().join("unused"),
+            gpg_home: root.path().join("gnupg"),
+        };
+
+        assert!(process_pending(&cli, &[0; 32]).is_ok());
+    }
 
     #[test]
     fn authorization_accepts_package_without_transferred_evidence() {
