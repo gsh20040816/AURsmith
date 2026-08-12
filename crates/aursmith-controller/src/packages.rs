@@ -815,10 +815,9 @@ pub(crate) async fn complete_fetch(
     let findings: Value =
         serde_json::from_str(row.get("deterministic_findings_json")).map_err(ApiError::internal)?;
     let reusable_audit = sqlx::query(
-        "SELECT audit_bundles.sha256, audit_decisions.decision, audit_decisions.report_sha256, previous.id AS revision_id FROM revisions AS current JOIN revisions AS previous ON previous.package_base = current.package_base AND previous.id != current.id AND previous.aur_commit = current.aur_commit AND COALESCE(previous.vcs_commit, '') = COALESCE(current.vcs_commit, '') AND previous.audit_policy_version = current.audit_policy_version AND previous.provider_selection_sha256 = current.provider_selection_sha256 JOIN audit_bundles ON audit_bundles.revision_id = previous.id AND audit_bundles.state = 'approved' JOIN audit_decisions ON audit_decisions.audit_bundle_sha256 = audit_bundles.sha256 AND audit_decisions.decision IN ('approved_by_low_cost', 'approved_by_high_cost') WHERE current.id = ? AND previous.source_manifest_sha256 = ? ORDER BY audit_decisions.created_at DESC LIMIT 1",
+        "SELECT audit_bundles.sha256, audit_decisions.decision, audit_decisions.report_sha256, previous.id AS revision_id FROM revisions AS current JOIN revisions AS previous ON previous.package_base = current.package_base AND previous.id != current.id AND previous.aur_commit = current.aur_commit AND COALESCE(previous.vcs_commit, '') = COALESCE(current.vcs_commit, '') AND previous.audit_policy_version = current.audit_policy_version AND previous.provider_selection_sha256 = current.provider_selection_sha256 JOIN audit_bundles ON audit_bundles.revision_id = previous.id AND audit_bundles.state = 'approved' JOIN audit_decisions ON audit_decisions.audit_bundle_sha256 = audit_bundles.sha256 AND audit_decisions.decision IN ('approved_by_low_cost', 'approved_by_high_cost') WHERE current.id = ? ORDER BY audit_decisions.created_at DESC LIMIT 1",
     )
     .bind(revision_id)
-    .bind(&result.source_manifest_sha256)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
@@ -826,7 +825,7 @@ pub(crate) async fn complete_fetch(
         payload["audit_reuse"] = json!({
             "source_bundle_sha256": reused.get::<String, _>("sha256"),
             "source_revision_id": reused.get::<String, _>("revision_id"),
-            "reason": "AUR commit、VCS commit、源码清单、Provider 选择和审计策略均未变化"
+            "reason": "AUR commit、VCS commit、Provider 选择和审计策略均未变化；构建 Profile、依赖快照和内部 Fetch 元数据不属于 AUR 包装脚本审计身份"
         });
         coverage["audit_reuse"] = json!({
             "mode": "content_addressed_automatic_decision",
@@ -2951,7 +2950,7 @@ mod tests {
                     generation: 0,
                 },
                 revision_sha256: "1".repeat(64),
-                source_manifest_sha256,
+                source_manifest_sha256: "9".repeat(64),
                 sources: vec![],
                 audit_files: vec![],
                 resolved_dependencies: vec![],

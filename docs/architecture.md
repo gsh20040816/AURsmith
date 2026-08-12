@@ -81,6 +81,8 @@ AUR 依赖以 `subscription_references` 保存有向边，隐式订阅的引用�
 
 普通包的 AUR commit 变化就产生新 Revision。`-git` 包还从 `.SRCINFO` 的 `git+https` source 查询上游 commit；查询前拒绝私网、回环、链路本地和保留地址，并禁用 Git 重定向及 file/ext 协议。AUR commit、VCS commit 或固定 Provider 变化都会产生新 Revision，未开始发布的旧 Revision 标记为 `superseded`。split outputs 始终整体固定和构建，用户选择只表示客户端关注项。
 
+Agent 审计身份只由 `pkgbase`、AUR Git commit（即完整 AUR 包装仓库文件）、固定 VCS commit、Provider 选择和审计策略版本组成。以上内容不变且已有自动批准结果时，后续手工重建直接复用该审计；Build Profile、官方依赖快照、下载缓存、内部 GPG 公钥包和其他 Fetch 实现元数据变化不触发重新审计。它们仍进入构建 provenance 和确定性校验，但不属于“AUR 打包脚本是否变化”的判定。
+
 Git VCS commit 变化时，Controller 把上一 Revision 的 commit 交给 Publisher。Publisher 先用固定 IP 的 smart HTTP 广告取得当前 ref，再以 `protocol.file/ext=never`、禁重定向、`GIT_TERMINAL_PROMPT=0` 和 `http.curloptResolve` 固定同一公共地址，仅获取该 ref 的无 blob 历史并执行 `merge-base --is-ancestor`。正常快进自动继续；上一 commit 不存在或不是祖先时，不创建新 Revision，而是写入 `vcs_history_rewrite_detected` 事件、critical 告警和待处理人工动作。管理员在包详情中批准或拒绝精确的 previous/current commit 对；批准不能永久信任包，下一次不同重写仍重新阻断。
 
 Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包同名会被拒绝；周期检查发现已有订阅进入官方仓库时，会暂停后续 AUR 更新、保留当前私有版本，并生成迁移告警和独立事件。
@@ -101,7 +103,7 @@ Controller 每六小时读取当前 Release 中 Artifact 构建时记录的官�
 
 Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publisher 只能向只写 inbox 投递软件包和 Controller 签名的 `ReleaseAuthorization`，不能访问 Signer 的 GPG home；Signer 只能只读 inbox 并写独立 signed volume。Signer 再次验证 Controller Ed25519 公钥、授权期限、writer epoch 对应的授权内容、每个包的相对路径、大小、SHA-256 和 `.PKGINFO`，随后用固定 argv 调用 GPG 与官方 `repo-add`。包、仓库数据库和 Release Manifest 均生成 GPG 分离签名，完整 staging 最后通过目录 rename 提交。Publisher 仍须在公开前复验签名并执行 hot set/数据库切换；Signer 自身不拥有公开仓库卷。
 
-每个新 Release 明确授权 Signer 生成一个 `aursmith-keyring` 系统包。Signer 从当前仓库私钥导出公钥，把 `aursmith.gpg`、`aursmith-trusted` 和空的 `aursmith-revoked` 安装到 `/usr/share/pacman/keyrings/`；`.INSTALL` 在安装和升级时调用 `pacman-key --populate aursmith`。包版本由 Release 签发 UTC 时间、源码 commit 和 Release ID 组成，避免不同 Release 出现同版本不同摘要。Publisher 不盲信该派生产物：它从包内重新读取 `.PKGINFO`、公钥主指纹、ownertrust、revoked 清单和安装脚本，并要求主指纹与启动时固定的仓库公钥一致，之后才复制到公开 hot set。`aursmith-keyring` 是保留包名，AUR Artifact 不能覆盖。首次客户端引导仍必须人工核对一次指纹；keyring 包负责之后的持久安装和密钥轮换，不能替代信任根引导。
+Release 明确授权 Signer 保证仓库中存在 `aursmith-keyring` 系统包。Signer 从当前仓库私钥导出公钥，把 `aursmith.gpg`、`aursmith-trusted` 和空的 `aursmith-revoked` 安装到 `/usr/share/pacman/keyrings/`；`.INSTALL` 在安装和升级时调用 `pacman-key --populate aursmith`。若当前 hot store 中已有包内公钥指纹与仓库私钥一致的有效 keyring，后续 Release 直接复用原包及签名，不改变版本；只有首次发布或仓库公钥、信任内容实际变化时才生成新版本。定期检查只核对内容，内容不变不发布空更新。Publisher 不盲信该派生产物：它从包内重新读取 `.PKGINFO`、公钥主指纹、ownertrust、revoked 清单和安装脚本，并要求主指纹与启动时固定的仓库公钥一致，之后才复制到公开 hot set。`aursmith-keyring` 是保留包名，AUR Artifact 不能覆盖。首次客户端引导仍必须人工核对一次指纹；keyring 包负责之后的持久安装和密钥轮换，不能替代信任根引导。
 
 Publisher 在把 Artifact 交给 Signer 前还会独立读取归档清单和 `.PKGINFO`：路径逃逸、重复条目、设备文件、FIFO、Socket，以及缺失或重复的 `.PKGINFO`、`.BUILDINFO`、`.MTREE` 会失败关闭；包名、版本和架构必须与 BuildResult 一致。INSTALL 脚本、pacman hook、systemd 单元、setuid/setgid 文件和内核模块作为风险事实记录，不因类别本身宣称恶意。对可执行文件和共享库候选，Publisher 通过 bsdtar 按单文件安全提取到临时文件，再以固定 argv 运行 readelf 并记录每个 ELF 的 `DT_NEEDED`。file capability 不通过需要特权的实际解包恢复，而是从归档的 pax `LIBARCHIVE.xattr.security.capability` 头识别并绑定路径。结构化 `artifact-inspections.json` 随 Signer 输入进入断网边界，Signer核对报告数量和大小，并把其摘要写入 GPG 签名的 Release Manifest；因此 Archiver 会与 Release 一起保存这份发布前检查证据。
 

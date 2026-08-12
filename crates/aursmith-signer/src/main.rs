@@ -136,9 +136,14 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         }
     }
     let repository_keyring = if authorization.include_repository_keyring {
-        let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
+        let artifact = if let Some(artifact) = reusable_repository_keyring(cli, &staging)? {
+            artifact
+        } else {
+            let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
+            gpg_sign(cli, &staging.join(&artifact.path))?;
+            artifact
+        };
         let path = staging.join(&artifact.path);
-        gpg_sign(cli, &path)?;
         package_paths.push(path);
         Some(artifact)
     } else {
@@ -202,6 +207,71 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     gpg_sign(cli, &staging.join("release-manifest.json"))?;
     fs::rename(staging, committed)?;
     Ok(())
+}
+
+fn reusable_repository_keyring(
+    cli: &Cli,
+    staging: &Path,
+) -> anyhow::Result<Option<ArtifactRecord>> {
+    let fingerprint = repository_fingerprint(cli)?;
+    let releases = cli.repository.join("x86_64/releases");
+    let mut candidates = fs::read_dir(releases)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let manifest: ReleaseManifest =
+                serde_json::from_slice(&fs::read(entry.path().join("release-manifest.json")).ok()?)
+                    .ok()?;
+            manifest
+                .repository_keyring
+                .map(|artifact| (manifest.committed_at, artifact))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(committed_at, _)| std::cmp::Reverse(*committed_at));
+    for (_, artifact) in candidates {
+        let package = cli.repository.join("x86_64").join(&artifact.path);
+        let signature = package.with_file_name(format!("{}.sig", artifact.path));
+        if !package.is_file()
+            || !signature.is_file()
+            || digest_file(&package)? != artifact.sha256
+            || repository_keyring_fingerprint(&package)?.as_deref() != Some(fingerprint.as_str())
+        {
+            continue;
+        }
+        fs::copy(&package, staging.join(&artifact.path))?;
+        fs::copy(&signature, staging.join(format!("{}.sig", artifact.path)))?;
+        return Ok(Some(artifact));
+    }
+    Ok(None)
+}
+
+fn repository_keyring_fingerprint(package: &Path) -> anyhow::Result<Option<String>> {
+    let output = Command::new("/usr/bin/bsdtar")
+        .args(["-xOf"])
+        .arg(package)
+        .arg("usr/share/pacman/keyrings/aursmith.gpg")
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() || output.stdout.is_empty() || output.stdout.len() > 1024 * 1024 {
+        return Ok(None);
+    }
+    let key = tempfile::NamedTempFile::new()?;
+    fs::write(key.path(), output.stdout)?;
+    let listing = Command::new("/usr/bin/gpg")
+        .args(["--batch", "--with-colons", "--show-keys", "--fingerprint"])
+        .arg(key.path())
+        .stdin(Stdio::null())
+        .output()?;
+    if !listing.status.success() {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(listing.stdout)?
+        .lines()
+        .filter_map(|line| line.split(':').nth(9))
+        .find(|value| value.len() == 40 && value.chars().all(|value| value.is_ascii_hexdigit()))
+        .map(str::to_owned))
 }
 
 fn find_reusable_package(cli: &Cli, artifact: &ArtifactRecord) -> anyhow::Result<PathBuf> {
