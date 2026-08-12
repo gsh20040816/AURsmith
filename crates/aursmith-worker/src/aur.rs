@@ -40,6 +40,8 @@ pub struct OfficialPackage {
     pub epoch: u64,
     pub repo: String,
     pub arch: String,
+    #[serde(default)]
+    pub provides: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,7 +147,7 @@ impl AurClient {
     pub async fn official(&self, name: &str) -> anyhow::Result<Vec<OfficialPackage>> {
         let name = validate_package_base(name)?;
         let mut url = Url::parse("https://archlinux.org/packages/search/json/")?;
-        url.query_pairs_mut().append_pair("name", name);
+        url.query_pairs_mut().append_pair("q", name);
         let payload: OfficialSearchResponse = self
             .http
             .get(url)
@@ -158,7 +160,7 @@ impl AurClient {
         Ok(payload
             .results
             .into_iter()
-            .filter(|package| package.pkgname == name)
+            .filter(|package| official_package_matches(package, name))
             .collect())
     }
 
@@ -202,6 +204,15 @@ impl AurClient {
         }
         Ok(snapshot)
     }
+}
+
+fn official_package_matches(package: &OfficialPackage, name: &str) -> bool {
+    package.pkgname == name
+        || package
+            .provides
+            .iter()
+            .filter_map(|provided| provided.split(['=', '<', '>']).next())
+            .any(|provided| provided == name)
 }
 
 async fn collect_snapshot_files(directory: &Path) -> anyhow::Result<Vec<SnapshotFile>> {
@@ -716,6 +727,26 @@ fn validate_query(value: &str) -> anyhow::Result<&str> {
         bail!("AUR 搜索词长度必须为 2 至 100 个字符且不能包含控制字符");
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod official_tests {
+    use super::OfficialPackage;
+
+    #[test]
+    fn official_provider_names_ignore_version_constraints() {
+        let package = OfficialPackage {
+            pkgname: "pkgconf".into(),
+            pkgver: "2.5.1".into(),
+            pkgrel: "1".into(),
+            epoch: 0,
+            repo: "core".into(),
+            arch: "x86_64".into(),
+            provides: vec!["libpkgconf.so=8-64".into(), "pkg-config".into()],
+        };
+        assert!(super::official_package_matches(&package, "pkg-config"));
+        assert!(!super::official_package_matches(&package, "pkg-config-git"));
+    }
 }
 
 fn validate_package_base(value: &str) -> anyhow::Result<&str> {
