@@ -2342,13 +2342,6 @@ fn consolidate_release_artifact_links(
             &hot.join(&artifact.path),
             &artifact.sha256,
         )?;
-        let signature = format!("{}.sig", artifact.path);
-        let release_signature = release.join(&signature);
-        let hot_signature = hot.join(&signature);
-        if release_signature.is_file() && hot_signature.is_file() {
-            let signature_sha256 = file_sha256(&release_signature)?;
-            atomic_link_identical_file(&release_signature, &hot_signature, &signature_sha256)?;
-        }
     }
     Ok(())
 }
