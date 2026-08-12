@@ -226,6 +226,7 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     let prepared = Path::new(OUTPUT).join("prepared");
     fs::create_dir_all(&prepared)?;
     copy_tree(Path::new(BUILD), &prepared, false)?;
+    export_declared_pgp_keys(Path::new(BUILD), &prepared)?;
     let dependency_download_started = std::time::Instant::now();
     let resolved_dependencies = download_official_dependencies(spec, &prepared)?;
     let dependency_download_milliseconds =
@@ -268,6 +269,10 @@ fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
     let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     run_as_builder(&argument_refs, None)?;
 
+    verify_declared_pgp_keys(build, &fingerprints)
+}
+
+fn verify_declared_pgp_keys(build: &Path, fingerprints: &[String]) -> anyhow::Result<()> {
     for fingerprint in fingerprints {
         let output = Command::new("/usr/bin/runuser")
             .args(builder_command_arguments(&[
@@ -275,9 +280,9 @@ fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
                 "--batch",
                 "--with-colons",
                 "--fingerprint",
-                &fingerprint,
+                fingerprint,
             ]))
-            .current_dir(BUILD)
+            .current_dir(build)
             .stdin(Stdio::null())
             .env_clear()
             .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
@@ -288,11 +293,50 @@ fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
             .lines()
             .filter_map(|line| line.strip_prefix("fpr:::::::::"))
             .filter_map(|line| line.strip_suffix(':'))
-            .any(|received| received.eq_ignore_ascii_case(&fingerprint));
+            .any(|received| received.eq_ignore_ascii_case(fingerprint));
         if !output.status.success() || !exact_match {
             bail!("导入的 OpenPGP 密钥与 .SRCINFO 声明的指纹不一致：{fingerprint}");
         }
     }
+    Ok(())
+}
+
+const PREPARED_PGP_KEYS: &str = ".aursmith-validpgpkeys.gpg";
+
+fn export_declared_pgp_keys(build: &Path, prepared: &Path) -> anyhow::Result<()> {
+    let srcinfo = fs::read_to_string(build.join(".SRCINFO"))?;
+    let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
+    if fingerprints.is_empty() {
+        return Ok(());
+    }
+    let mut arguments = vec!["/usr/bin/gpg", "--batch", "--output"];
+    let destination = prepared.join(PREPARED_PGP_KEYS);
+    let destination_text = destination.to_string_lossy().into_owned();
+    arguments.push(&destination_text);
+    arguments.push("--export");
+    arguments.extend(fingerprints.iter().map(String::as_str));
+    run_as_builder(&arguments, None)?;
+    let metadata = fs::symlink_metadata(&destination)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 16 * 1024 * 1024 {
+        bail!("Fetch VM 导出的 OpenPGP 公钥包无效");
+    }
+    Ok(())
+}
+
+fn import_prepared_pgp_keys(build: &Path) -> anyhow::Result<()> {
+    let bundle = build.join(PREPARED_PGP_KEYS);
+    if !bundle.exists() {
+        return Ok(());
+    }
+    let srcinfo = fs::read_to_string(build.join(".SRCINFO"))?;
+    let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
+    if fingerprints.is_empty() {
+        bail!("构建输入包含未声明的 OpenPGP 公钥包");
+    }
+    let bundle_text = bundle.to_string_lossy().into_owned();
+    run_as_builder(&["/usr/bin/gpg", "--batch", "--import", &bundle_text], None)?;
+    verify_declared_pgp_keys(build, &fingerprints)?;
+    fs::remove_file(bundle)?;
     Ok(())
 }
 
@@ -424,6 +468,7 @@ fn parse_pkginfo_identity(pkginfo: &str) -> anyhow::Result<(String, String)> {
 
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     let log = Path::new(OUTPUT).join("build.log");
+    import_prepared_pgp_keys(Path::new(BUILD))?;
     let makepkg_arguments = makepkg_arguments(spec.allow_check);
     let network = build_network_enabled()?;
     run_as_builder(&makepkg_arguments, Some(&log))?;
