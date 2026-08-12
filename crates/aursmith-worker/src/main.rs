@@ -23,6 +23,7 @@ use sqlx::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -574,12 +575,15 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
         .join("transfers")
         .join(capability.id.to_string());
     let destination = format!("{remote}:/landing/.{}.partial/", capability.id);
+    let private_key = tempfile::NamedTempFile::new()?;
+    std::fs::copy(identity, private_key.path()).context("复制 Publisher 推送私钥失败")?;
+    std::fs::set_permissions(private_key.path(), std::fs::Permissions::from_mode(0o600))?;
     let output = tokio::process::Command::new("/usr/bin/rsync")
         .args(["-a", "--numeric-ids", "--partial", "--delay-updates", "-e"])
         .arg(format!(
             "/usr/bin/ssh -T -p {} -i {} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={}",
             endpoint.port().unwrap_or(22),
-            identity.display(),
+            private_key.path().display(),
             known_hosts.display()
         ))
         .arg(format!("{}/", source.display()))
@@ -606,7 +610,7 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
     std::fs::write(envelope_file.path(), serde_json::to_vec(&envelope)?)?;
     let finalize = tokio::process::Command::new("/usr/bin/ssh")
         .args(["-T", "-p", &endpoint.port().unwrap_or(22).to_string(), "-i"])
-        .arg(identity)
+        .arg(private_key.path())
         .args([
             "-o",
             "BatchMode=yes",
