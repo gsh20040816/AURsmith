@@ -17,7 +17,7 @@ Controller 使用 `publisher-ssh:2222` 访问同机 Worker。该网络不替代�
 - 80/443：由现有宿主 Caddy 提供控制台和仓库 HTTPS；
 - 12223/tcp：Builder 使用 forced-command SSH 推送 Artifact；
 
-控制台容器绑定 `127.0.0.1:18443`，仓库绑定 `127.0.0.1:18081`。宿主 Caddy 追加 `Caddyfile.snippet`；其中内层 TLS 只用于回环链路，因此宿主反代明确忽略内层自签证书，客户端看到的仍是宿主 Caddy 的公开证书。
+Controller 自己提供 Web/API 并绑定 `127.0.0.1:18443`，Publisher Worker 自己提供仓库并绑定 `127.0.0.1:18081`，pacoloco 绑定 `127.0.0.1:19129`。宿主 Caddy 追加 `Caddyfile.snippet` 后统一处理公网 TLS 和缓存头；AURsmith Stack 内没有第二层 Caddy 或 TLS。部署过程只准备并验证片段，不修改或 reload 宿主 Caddy。
 
 ## Compose override
 

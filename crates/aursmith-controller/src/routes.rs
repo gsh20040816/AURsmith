@@ -12,7 +12,7 @@ use axum::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
@@ -31,6 +31,7 @@ use std::{
 };
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use uuid::Uuid;
@@ -172,6 +173,10 @@ pub fn router(state: AppState) -> Router {
             post(crate::packages::rollback_release),
         )
         .route("/api/v1/archives", get(crate::packages::list_archives))
+        .route("/api/{*path}", any(api_not_found))
+        .fallback_service(
+            ServeDir::new("/srv").not_found_service(ServeFile::new("/srv/index.html")),
+        )
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -179,6 +184,10 @@ pub fn router(state: AppState) -> Router {
             MakeRequestUuid,
         ))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 async fn health() -> Json<Value> {

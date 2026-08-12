@@ -28,7 +28,7 @@ services:
       AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
       AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
       AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
-      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: ${AURSMITH_CLIENT_CA_CERTIFICATE_FILE-/run/aursmith-caddy-data/caddy/pki/authorities/local/root.crt}
+      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: ${AURSMITH_CLIENT_CA_CERTIFICATE_FILE:-}
       AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
       AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
       AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
@@ -45,11 +45,12 @@ services:
     volumes:
       - controller-data:/var/lib/aursmith
       - controller-run:/run/aursmith
-      - caddy-data:/run/aursmith-caddy-data:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
-    networks: [control, agent, egress]
+    ports:
+      - ${AURSMITH_WEB_BIND:-127.0.0.1:18443}:8080
+    networks: [control, agent, egress, edge]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]
       interval: 30s
@@ -85,30 +86,6 @@ services:
       - /run/private:uid=0,gid=0,mode=0755,size=2m
     ports:
       - ${AURSMITH_BACKUP_SSH_BIND:-127.0.0.1:2221}:2222
-    networks: [control, edge]
-    depends_on:
-      controller:
-        condition: service_healthy
-    restart: unless-stopped
-
-  web:
-    build:
-      context: ../..
-      dockerfile: deploy/images/web.Dockerfile
-      args:
-        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    environment:
-      AURSMITH_WEB_HOST: ${AURSMITH_WEB_HOST:-aursmith.lan}
-    volumes:
-      - caddy-data:/data
-    tmpfs:
-      - /config:uid=10001,gid=10001,size=16m,mode=0700
-      - /tmp:size=16m,mode=1777
-    ports:
-      - ${AURSMITH_WEB_BIND:-0.0.0.0:8443}:8443
     networks: [control, edge]
     depends_on:
       controller:
@@ -227,7 +204,6 @@ secrets:
 volumes:
   controller-data:
   controller-run:
-  caddy-data:
 
 networks:
   control:

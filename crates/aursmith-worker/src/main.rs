@@ -10,6 +10,7 @@ use aursmith_protocol::{
     ReverseAttemptReport, ReverseWorkerLease, ReverseWorkerPoll, SignedEnvelope,
     TransferCapability,
 };
+use axum::Router;
 use chrono::Utc;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
@@ -21,6 +22,7 @@ use sqlx::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -87,6 +89,8 @@ struct Cli {
     repository_dir: PathBuf,
     #[arg(long, env = "AURSMITH_REPOSITORY_ARCH", default_value = "x86_64")]
     repository_arch: String,
+    #[arg(long, env = "AURSMITH_REPOSITORY_HTTP_BIND")]
+    repository_http_bind: Option<SocketAddr>,
     #[arg(long, env = "AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE")]
     repository_gpg_public_key_file: Option<PathBuf>,
     #[arg(
@@ -342,6 +346,9 @@ async fn main() -> anyhow::Result<()> {
                 .context("Publisher 必须配置仓库 GPG 公钥")?,
         )?;
         spawn_publisher(worker.clone());
+        if let Some(bind) = cli.repository_http_bind {
+            spawn_repository_http(worker.clone(), bind);
+        }
     }
     if let Some(poll_url) = cli.controller_poll_url {
         if worker.role != WorkerRole::Builder {
@@ -371,6 +378,24 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+}
+
+fn spawn_repository_http(worker: Arc<Worker>, bind: SocketAddr) {
+    let root = worker.repository_dir.join(&worker.repository_arch);
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(bind).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!(%error, %bind, "无法监听仓库 HTTP 入口");
+                return;
+            }
+        };
+        let app = Router::new().fallback_service(tower_http::services::ServeDir::new(root));
+        tracing::info!(%bind, "Publisher 仓库 HTTP 服务已启动");
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(%error, "Publisher 仓库 HTTP 服务异常退出");
+        }
+    });
 }
 
 fn spawn_reverse_poll(worker: Arc<Worker>, poll_url: url::Url) {

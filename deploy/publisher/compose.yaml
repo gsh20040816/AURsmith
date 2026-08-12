@@ -26,6 +26,7 @@ services:
       AURSMITH_SIGNER_OUTPUT: /signer-output
       AURSMITH_REPOSITORY_DIR: /repository
       AURSMITH_REPOSITORY_ARCH: ${AURSMITH_REPOSITORY_ARCH:-x86_64}
+      AURSMITH_REPOSITORY_HTTP_BIND: 0.0.0.0:8080
       AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE: /run/secrets/repository_gpg_public_key
       AURSMITH_PUBLISHER_GPG_HOME: /run/aursmith-gpg
       AURSMITH_RELEASE_RETENTION_DAYS: ${AURSMITH_RELEASE_RETENTION_DAYS:-30}
@@ -48,6 +49,8 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /run/aursmith-gpg:uid=10001,gid=10001,mode=0700,size=16m
+    ports:
+      - ${AURSMITH_REPOSITORY_BIND:-127.0.0.1:18081}:8080
     networks: [control, egress]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, worker, --socket, /run/aursmith/worker.sock, status]
@@ -114,27 +117,6 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  repository:
-    build:
-      context: ../..
-      dockerfile: deploy/images/repository.Dockerfile
-      args:
-        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    volumes:
-      - publisher-hot:/srv:ro
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    tmpfs:
-      - /config:uid=10001,gid=10001,size=16m,mode=0700
-      - /data:uid=10001,gid=10001,size=16m,mode=0700
-      - /tmp:size=16m,mode=1777
-    ports:
-      - ${AURSMITH_REPOSITORY_BIND:-127.0.0.1:8081}:8080
-    networks: [control]
-    restart: unless-stopped
-
   pacoloco:
     build:
       context: ../..
@@ -150,6 +132,8 @@ services:
       - pacoloco-cache:/var/cache/pacoloco
     tmpfs:
       - /tmp:uid=65532,gid=65532,mode=0700,size=16m
+    ports:
+      - ${AURSMITH_PACOLOCO_BIND:-127.0.0.1:19129}:9129
     networks: [control, egress]
     healthcheck:
       test: [CMD, /usr/bin/wget, --quiet, --spider, http://127.0.0.1:9129/metrics]

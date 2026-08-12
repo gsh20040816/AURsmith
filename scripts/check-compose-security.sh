@@ -55,12 +55,10 @@ if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_push_ke
 fi
 
 publisher_json="$(docker compose -f deploy/publisher/compose.yaml config --format json)"
-if [[ "$(jq -r '.services.repository.build.dockerfile // ""' <<<"${publisher_json}")" != "deploy/images/repository.Dockerfile" ]]; then
-  echo "仓库 Caddy 必须使用移除文件 capability 的派生镜像" >&2
-  exit 1
-fi
-if [[ "$(jq '[.services.repository.tmpfs[]? | select(test("^/(config|data):.*uid=10001,.*gid=10001"))] | length' <<<"${publisher_json}")" != "2" ]]; then
-  echo "仓库 Caddy 的可写 tmpfs 必须属于无特权用户" >&2
+if jq -e '.services | has("repository")' <<<"${publisher_json}" >/dev/null \
+  || [[ "$(jq -r '.services.worker.environment.AURSMITH_REPOSITORY_HTTP_BIND // ""' <<<"${publisher_json}")" != "0.0.0.0:8080" ]] \
+  || [[ "$(jq '[.services.worker.ports[]? | select(.target == 8080 and .host_ip == "127.0.0.1")] | length' <<<"${publisher_json}")" != "1" ]]; then
+  echo "Publisher 必须自行提供只绑定宿主回环地址的仓库 HTTP 服务" >&2
   exit 1
 fi
 if [[ "$(jq '[.services.signer | select(.network_mode == "none")] | length' <<<"${publisher_json}")" != "1" ]]; then
@@ -98,17 +96,9 @@ if [[ "$(jq '[.services.pacoloco.volumes[]? | select(.target == "/var/cache/paco
 fi
 
 controller_json="$(docker compose -f deploy/controller/compose.yaml config --format json)"
-if [[ "$(jq -r '.services.web.build.dockerfile // ""' <<<"${controller_json}")" != "deploy/images/web.Dockerfile" ]]; then
-  echo "Web Caddy 必须使用无特权派生镜像" >&2
-  exit 1
-fi
-if [[ "$(jq '[.services.web.tmpfs[]? | select(test("^/config:.*uid=10001,.*gid=10001"))] | length' <<<"${controller_json}")" != "1" ]]; then
-  echo "Web Caddy 的配置 tmpfs 必须属于无特权用户" >&2
-  exit 1
-fi
-if [[ "$(jq '[.services.web.volumes[]? | select(.target == "/data" and .type == "volume")] | length' <<<"${controller_json}")" != "1" ]] \
-  || [[ "$(jq '[.services.controller.volumes[]? | select(.target == "/run/aursmith-caddy-data" and .read_only == true)] | length' <<<"${controller_json}")" != "1" ]]; then
-  echo "内部 CA 数据必须由 Caddy 持久写入，并只读共享给 Controller" >&2
+if jq -e '.services | has("web")' <<<"${controller_json}" >/dev/null \
+  || [[ "$(jq '[.services.controller.ports[]? | select(.target == 8080 and .host_ip == "127.0.0.1")] | length' <<<"${controller_json}")" != "1" ]]; then
+  echo "Controller 必须自行提供 Web/API，并只绑定宿主回环地址" >&2
   exit 1
 fi
 if [[ "$(jq '[.services["agent-low-1"].environment.AURSMITH_AGENT_BASE_URL, .services["agent-low-2"].environment.AURSMITH_AGENT_BASE_URL, .services["agent-low-3"].environment.AURSMITH_AGENT_BASE_URL] | unique | length' <<<"${controller_json}")" != "3" ]]; then
@@ -119,9 +109,9 @@ if [[ "$(jq '[.services["agent-credential-gateway"].secrets[]? | select(.source 
   echo "三个低成本 Agent 必须各自使用独立 API key secret" >&2
   exit 1
 fi
-if [[ "$(jq '(.services.web.networks | has("edge")) and (.services | has("backup-ssh") | not)' <<<"${controller_json}")" != "true" ]] \
+if [[ "$(jq '(.services.controller.networks | has("edge")) and (.services | has("backup-ssh") | not)' <<<"${controller_json}")" != "true" ]] \
   || [[ "$(jq -r '.networks.edge.internal // false' <<<"${controller_json}")" != "false" ]]; then
-  echo "默认 Controller 只能由 Web 通过非 internal 的 edge 网络发布宿主端口" >&2
+  echo "默认 Controller 只能通过非 internal 的 edge 网络发布回环端口" >&2
   exit 1
 fi
 controller_archive_json="$(docker compose --profile external-archiver -f deploy/controller/compose.yaml config --format json)"
@@ -129,17 +119,6 @@ if [[ "$(jq '(.services["backup-ssh"].networks | has("edge"))' <<<"${controller_
   echo "可选 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2
   exit 1
 fi
-external_tls_json="$(
-  AURSMITH_WEB_TLS_FULLCHAIN_FILE=/dev/null \
-  AURSMITH_WEB_TLS_PRIVATE_KEY_FILE=/dev/null \
-    docker compose -f deploy/controller/compose.yaml -f deploy/controller/compose.external-tls.yaml config --format json
-)"
-if [[ "$(jq '[.services.web.secrets[]? | select(.source == "web_tls_fullchain" or .source == "web_tls_private_key")] | length' <<<"${external_tls_json}")" != "2" ]] \
-  || jq -e '.services.controller.secrets[]? | select(.source == "web_tls_private_key")' <<<"${external_tls_json}" >/dev/null; then
-  echo "公网 TLS 私钥只能挂载到 Web 容器" >&2
-  exit 1
-fi
-
 archiver_json="$(docker compose -f deploy/archiver/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_pull_key" or .source == "publisher_known_hosts")] | length' <<<"${archiver_json}")" != "2" ]]; then
   echo "Archiver 必须使用独立的 Publisher 只读拉取凭据" >&2

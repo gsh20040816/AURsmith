@@ -53,7 +53,7 @@ Codex 的自定义 provider 走 Responses API 兼容接口；Claude Code 的自�
 
 ## 启动顺序
 
-Controller Web 默认使用内部 CA。已有公网证书时，额外加载 `deploy/controller/compose.external-tls.yaml`，并通过 `AURSMITH_WEB_TLS_FULLCHAIN_FILE` 和 `AURSMITH_WEB_TLS_PRIVATE_KEY_FILE` 指向宿主证书副本。外部证书只作为 Web 容器的只读 secret，Controller 不挂载私钥；同时将 `AURSMITH_CLIENT_CA_CERTIFICATE_FILE` 设为空，客户端引导不再错误提示导入内部 CA。证书续期后必须替换 secret 副本并重建 Web 容器。
+Controller 自行提供 Web/API，Publisher 自行提供仓库 HTTP；两者默认只映射到宿主回环地址。公网部署应使用宿主现有反向代理统一提供 TLS，不复制证书到容器，也不在 Stack 内重复运行 Web 代理。
 
 1. 启动 Publisher Stack。
 2. 启动至少一个 Builder Stack。真实公网拓扑下 Builder 不启动 SSH sidecar，也不映射入站端口；它通过 `AURSMITH_CONTROLLER_POLL_URL` 主动领取任务。
@@ -68,13 +68,11 @@ Controller Web 默认使用内部 CA。已有公网证书时，额外加载 `dep
 
 ## Builder KVM 配置
 
-Publisher Stack 自带最小 `source-proxy` 服务。跨设备部署时设置 `AURSMITH_SOURCE_PROXY_BIND=<Publisher 管理网 IP>:3128`，并在宿主防火墙上只允许 Builder 地址访问；默认 `127.0.0.1:3128` 只适合角色同机。代理只允许 80/443，拒绝 loopback、私网、link-local、运营商 NAT、文档网段、组播和其他保留地址，不提供磁盘缓存。
+Fetch VM 通过 QEMU user networking 直接访问公网，不依赖 Publisher HTTP 代理。下载来源、摘要和实际网络模式继续写入 Source Manifest 与 provenance。
 
-Publisher Stack 还自带独立 pacoloco。它只缓存 Arch 官方仓库，缓存卷为 `pacoloco-cache`，不应与 Publisher staging 或公开仓库卷合并。外部 Arch 上游由 Publisher Compose 的 `AURSMITH_ARCH_MIRROR` 构建参数配置，必须是无凭据和参数的 HTTPS Base URL。公开仓库 Caddy 把 `https://<稳定仓库域名>/arch-cache/` 转发为 pacoloco 的 `archlinux` 仓库；首次部署可连续请求同一 `core.db`，再在 Doctor 中确认 requests、misses 和 hits 递增。
+Publisher Stack 还自带独立 pacoloco。它只缓存 Arch 官方仓库，缓存卷为 `pacoloco-cache`，不应与 Publisher staging 或公开仓库卷合并。外部 Arch 上游由 Publisher Compose 的 `AURSMITH_ARCH_MIRROR` 构建参数配置，必须是无凭据和参数的 HTTPS Base URL。宿主反向代理把 `https://<稳定仓库域名>/arch-cache/` 转发到 pacoloco；首次部署可连续请求同一 `core.db`，再在 Doctor 中确认 requests、misses 和 hits 递增。
 
-Publisher Worker 在 Compose 内固定使用 `AURSMITH_SOURCE_PROXY_URL=http://source-proxy:3128` 执行 Doctor。该地址只用于 Publisher 自检，不替代 Builder 的 `AURSMITH_FETCH_PROXY=<Publisher 管理网 IP>:3128`；跨设备时仍需显式配置 Builder 看到的地址并由宿主防火墙限制来源。
-
-Builder Stack 必须设置 `KVM_GID`、`AURSMITH_CONTROLLER_POLL_URL`、`AURSMITH_REVERSE_PUBLISHER_ENDPOINT` 和 `AURSMITH_FETCH_PROXY`。轮询地址必须是公网 Controller 的无凭据 HTTPS URL；Publisher 端点是只允许 Capability 接收与完成命令的 SSH forced-command 账户。Builder 容器挂载独立推送私钥和固定 `known_hosts`，宿主不开放 AURsmith 端口。`AURSMITH_FETCH_PROXY` 填写 Publisher 代理的固定 `IP:端口`；不能填写 URL 或候选列表。容器只映射 `/dev/kvm`，不需要 privileged、TUN、Docker Socket 或 libvirt Socket。
+Builder Stack 必须设置 `KVM_GID`、`AURSMITH_CONTROLLER_POLL_URL` 和 `AURSMITH_REVERSE_PUBLISHER_ENDPOINT`。轮询地址必须是公网 Controller 的无凭据 HTTPS URL；Publisher 端点是只允许 Capability 接收与完成命令的 SSH forced-command 账户。Builder 容器挂载独立推送私钥和固定 `known_hosts`，宿主不开放 AURsmith 端口。容器只映射 `/dev/kvm`，不需要 privileged、TUN、Docker Socket 或 libvirt Socket。
 
 反向 Builder 首次注册时，在本地执行 `aursmithctl worker status` 取得持久实例 UUID 与 `identity_signing_key_hex`，由管理员在 Web UI 选择 `reverse` 模式录入。私钥只存在 Builder Journal 中，Controller 只保存公钥。注册完成后 Builder 每次轮询都签署 UUID、nonce、时间、状态和 Attempt Journal；Controller 不尝试连接家庭网络。Publisher 的推送 SSH 入口只接受固定 rsync receiver 路径 `/landing/.<Capability ID>.partial/` 与 `finalize-push-import`，不允许 Shell、PTY、转发或任意目标路径。
 

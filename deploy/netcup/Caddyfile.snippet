@@ -1,11 +1,24 @@
 aursmith.shgao.top {
-	reverse_proxy https://127.0.0.1:18443 {
-		transport http {
-			tls_insecure_skip_verify
-		}
+	reverse_proxy 127.0.0.1:18443
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Content-Security-Policy "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
 	}
 }
 
 repo.shgao.top {
-	reverse_proxy 127.0.0.1:18081
+	handle_path /arch-cache/* {
+		rewrite * /repo/archlinux{path}
+		reverse_proxy 127.0.0.1:19129
+	}
+	handle {
+		reverse_proxy 127.0.0.1:18081
+	}
+	@database path *.db *.db.* *.files *.files.* *.sig
+	header @database Cache-Control "no-cache, must-revalidate"
+	@package path *.pkg.tar.*
+	header @package Cache-Control "public, max-age=31536000, immutable"
+	header X-Content-Type-Options nosniff
 }
