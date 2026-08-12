@@ -574,7 +574,7 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
         .jobs_dir
         .join("transfers")
         .join(capability.id.to_string());
-    let destination = format!("{remote}:/landing/.{}.partial/", capability.id);
+    let destination = format!("{remote}:.{}.partial/", capability.id);
     let private_key = tempfile::NamedTempFile::new()?;
     std::fs::copy(identity, private_key.path()).context("复制 Publisher 推送私钥失败")?;
     std::fs::set_permissions(private_key.path(), std::fs::Permissions::from_mode(0o600))?;
