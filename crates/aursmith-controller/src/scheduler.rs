@@ -1927,7 +1927,7 @@ async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, A
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.profile_sha256, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.profile_sha256, jobs.upstream_pkgrel, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
     )
     .bind(Utc::now() - Duration::minutes(30))
     .fetch_optional(&state.database)
@@ -2162,18 +2162,13 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             })
             .zip(row.get::<Option<String>, _>("published_pkgrel"))
             .map(|(pkgver, pkgrel)| format!("{pkgver}-{pkgrel}"));
-        if expected_version.as_ref().is_none_or(|expected| {
-            build_result.artifacts.is_empty()
-                || build_result
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.package_version.as_deref() != Some(expected.as_str()))
-        }) {
-            return Err(ApiError::conflict(
-                "PUBLISHED_VERSION_MISMATCH",
-                "构建产物版本与 Controller 授权的发布版本不一致",
-            ));
-        }
+        let passthrough_version = row.get::<Option<String>, _>("upstream_pkgrel")
+            == row.get::<Option<String>, _>("published_pkgrel");
+        let actual_version = accepted_build_version(
+            &build_result.artifacts,
+            expected_version.as_deref(),
+            passthrough_version,
+        )?;
         let resolved_dependencies = if let Some(revision_id) =
             row.get::<Option<String>, _>("revision_id")
         {
@@ -2205,8 +2200,10 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             }
         }
         if let Some(revision_id) = row.get::<Option<String>, _>("revision_id") {
-            sqlx::query("UPDATE revisions SET state = 'built', published_version = ? WHERE id = ?")
-                .bind(expected_version)
+            sqlx::query("UPDATE revisions SET state = 'built', upstream_version = CASE WHEN ? THEN ? ELSE upstream_version END, published_version = ? WHERE id = ?")
+                .bind(passthrough_version)
+                .bind(&actual_version)
+                .bind(&actual_version)
                 .bind(revision_id)
                 .execute(&mut *transaction)
                 .await
@@ -2226,6 +2223,38 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         crate::packages::schedule_ready_builds(&state.database).await?;
     }
     Ok(())
+}
+
+fn accepted_build_version(
+    artifacts: &[aursmith_protocol::ArtifactRecord],
+    expected_version: Option<&str>,
+    passthrough_version: bool,
+) -> Result<String, ApiError> {
+    let Some(actual_version) = artifacts
+        .first()
+        .and_then(|artifact| artifact.package_version.as_deref())
+    else {
+        return Err(ApiError::conflict(
+            "PUBLISHED_VERSION_MISSING",
+            "makepkg 未返回可发布的软件包版本",
+        ));
+    };
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.package_version.as_deref() != Some(actual_version))
+    {
+        return Err(ApiError::conflict(
+            "PUBLISHED_VERSION_INCONSISTENT",
+            "同一次 makepkg 构建返回了不一致的软件包版本",
+        ));
+    }
+    if !passthrough_version && expected_version != Some(actual_version) {
+        return Err(ApiError::conflict(
+            "PUBLISHED_VERSION_MISMATCH",
+            "构建产物版本与 Controller 分配的本地重建版本不一致",
+        ));
+    }
+    Ok(actual_version.to_owned())
 }
 
 fn infrastructure_failure(code: &str) -> bool {
@@ -2771,6 +2800,22 @@ mod release_tests {
         assert!(!infrastructure_failure("AUDIT_REJECTED"));
         assert!(!infrastructure_failure("GUEST_BUILD_FAILED"));
         assert!(!infrastructure_failure("NETWORK_DURING_BUILD"));
+    }
+
+    #[test]
+    fn passthrough_build_uses_the_version_reported_by_makepkg() {
+        let artifacts = vec![artifact("subtitleedit", "5.1.0-2")];
+        assert_eq!(
+            accepted_build_version(&artifacts, Some("5.1.0-1"), true).unwrap(),
+            "5.1.0-2"
+        );
+    }
+
+    #[test]
+    fn locally_derived_rebuild_version_must_still_match() {
+        let artifacts = vec![artifact("demo", "1.0-1")];
+        let error = accepted_build_version(&artifacts, Some("1.0-1.1"), false).unwrap_err();
+        assert_eq!(error.code, "PUBLISHED_VERSION_MISMATCH");
     }
 
     #[test]
