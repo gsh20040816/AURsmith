@@ -1991,6 +1991,24 @@ async fn append_event(
 async fn recalculate_reference_counts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), ApiError> {
+    sqlx::query(
+        "WITH RECURSIVE reachable(package_base) AS (\
+             SELECT package_base FROM subscriptions WHERE kind = 'direct' AND state IN ('active', 'paused') \
+             UNION \
+             SELECT references_table.dependency_package_base \
+             FROM subscription_references AS references_table \
+             JOIN reachable ON reachable.package_base = references_table.owner_package_base\
+         ) \
+         DELETE FROM subscription_references \
+         WHERE owner_package_base IN (\
+             SELECT subscriptions.package_base FROM subscriptions \
+             WHERE subscriptions.kind = 'implicit' \
+               AND subscriptions.package_base NOT IN (SELECT package_base FROM reachable)\
+         )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(ApiError::internal)?;
     sqlx::query("UPDATE subscriptions SET reference_count = (SELECT COUNT(*) FROM subscription_references WHERE dependency_package_base = subscriptions.package_base), state = CASE WHEN kind = 'implicit' AND (SELECT COUNT(*) FROM subscription_references WHERE dependency_package_base = subscriptions.package_base) = 0 THEN 'retained_without_references' WHEN kind = 'implicit' THEN 'active' ELSE state END, updated_at = ? WHERE kind = 'implicit'")
         .bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
     Ok(())
@@ -2684,6 +2702,61 @@ mod tests {
                 .unwrap();
         assert_eq!(implicit_count, 1);
         assert_eq!(revision_count, 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_direct_root_releases_its_transitive_implicit_dependencies() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        for (package_base, kind, references) in [
+            ("root", "direct", 0_i64),
+            ("middle", "implicit", 1),
+            ("leaf", "implicit", 1),
+        ] {
+            sqlx::query("INSERT INTO subscriptions(id, package_base, kind, state, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, '[]', '{}', ?, ?)")
+                .bind(Uuid::new_v4().to_string())
+                .bind(package_base)
+                .bind(kind)
+                .bind(references)
+                .bind(now)
+                .bind(now)
+                .execute(&database)
+                .await
+                .unwrap();
+        }
+        for (owner, dependency) in [("root", "middle"), ("middle", "leaf")] {
+            sqlx::query("INSERT INTO subscription_references(owner_package_base, dependency_package_base, created_at) VALUES (?, ?, ?)")
+                .bind(owner)
+                .bind(dependency)
+                .bind(now)
+                .execute(&database)
+                .await
+                .unwrap();
+        }
+        let mut transaction = database.begin().await.unwrap();
+        sqlx::query("DELETE FROM subscriptions WHERE package_base = 'root' AND kind = 'direct'")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM subscription_references WHERE owner_package_base = 'root'")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        recalculate_reference_counts(&mut transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let retained: Vec<(String, i64)> = sqlx::query_as("SELECT package_base, reference_count FROM subscriptions WHERE state = 'retained_without_references' ORDER BY package_base")
+            .fetch_all(&database)
+            .await
+            .unwrap();
+        assert_eq!(retained, vec![("leaf".into(), 0), ("middle".into(), 0)]);
+        let references: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_references")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(references, 0);
     }
 
     #[tokio::test]

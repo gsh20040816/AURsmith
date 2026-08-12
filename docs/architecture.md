@@ -71,6 +71,8 @@ Controller 不直接访问 AUR。浏览器请求由 Controller 认证后，经�
 
 Controller 在写数据库前遍历最多 64 个 AUR pkgbase 的依赖闭包。精确同名 AUR 依赖成为隐式订阅；虚拟依赖查询 `provides`，唯一候选可以解析，多个候选进入 `awaiting_provider_selection`。全部上游输入获取成功后，直接订阅、隐式引用、不可变 Revision、依赖边和 ReleaseBatch 才进入同一个控制面事务。循环依赖进入 `blocked_cycle`，不会猜测顺序。
 
+AUR 依赖以 `subscription_references` 保存有向边，隐式订阅的引用数由这些边计算。退订直接订阅时，Controller 从全部仍处于 active/paused 的直接订阅重新计算可达闭包；不可达隐式节点的下游边一并移除，整个不可达闭包进入 `retained_without_references` 保留期。共享依赖只要仍可从任一直接订阅到达，就继续保持 active，不能因删除其中一个引用方而误删。
+
 单用户 Web UI 第一版直接注册 Builder 和 Publisher：提交名称、连接模式、SSH 端点、已人工核对的 host key 指纹和标签后，Controller 核对 Worker 持久化 UUID、角色、协议和身份签名公钥。依赖存在多个 Provider 时，包详情页展示候选并允许固定其中一个；选择会写入直接订阅并重新生成绑定 Provider 摘要的 Revision。
 
 普通包的 AUR commit 变化就产生新 Revision。`-git` 包还从 `.SRCINFO` 的 `git+https` source 查询上游 commit；查询前拒绝私网、回环、链路本地和保留地址，并禁用 Git 重定向及 file/ext 协议。AUR commit、VCS commit 或固定 Provider 变化都会产生新 Revision，未开始发布的旧 Revision 标记为 `superseded`。split outputs 始终整体固定和构建，用户选择只表示客户端关注项。
