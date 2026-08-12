@@ -2265,6 +2265,49 @@ async fn reconcile_publisher_workspaces(worker: &Worker) -> anyhow::Result<()> {
             envelope.verify("aursmith.release_authorization")?;
         cleanup_published_release_workspace(worker, &release_id, &authorization).await?;
     }
+    prune_expired_transfer_imports(worker).await?;
+    Ok(())
+}
+
+async fn prune_expired_transfer_imports(worker: &Worker) -> anyhow::Result<()> {
+    let active_rows = sqlx::query(
+        "SELECT authorization_json FROM publisher_releases WHERE state IN ('queued', 'awaiting_signer')",
+    )
+    .fetch_all(&worker.database)
+    .await?;
+    let mut active_authorizations = Vec::with_capacity(active_rows.len());
+    for row in active_rows {
+        let envelope: SignedEnvelope = serde_json::from_str(row.get("authorization_json"))?;
+        active_authorizations
+            .push(envelope.verify::<ReleaseAuthorization>("aursmith.release_authorization")?);
+    }
+
+    let expired = sqlx::query(
+        "SELECT capability_id, directory, manifest_json FROM transfer_imports WHERE state IN ('receiving', 'verified') AND expires_at < ?",
+    )
+    .bind(Utc::now())
+    .fetch_all(&worker.database)
+    .await?;
+    for row in expired {
+        let entries: Vec<aursmith_protocol::ManifestEntry> =
+            serde_json::from_str(row.get("manifest_json"))?;
+        if active_authorizations
+            .iter()
+            .any(|authorization| transfer_manifest_is_consumed(&entries, authorization))
+        {
+            continue;
+        }
+        let directory = PathBuf::from(row.get::<String, _>("directory"));
+        if directory.exists() {
+            std::fs::remove_dir_all(&directory)?;
+        }
+        sqlx::query(
+            "UPDATE transfer_imports SET state = 'expired', directory = '' WHERE capability_id = ? AND state IN ('receiving', 'verified')",
+        )
+        .bind(row.get::<String, _>("capability_id"))
+        .execute(&worker.database)
+        .await?;
+    }
     Ok(())
 }
 

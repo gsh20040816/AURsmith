@@ -27,6 +27,8 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 Publisher 的稳态存储以公开 hot store 为唯一包内容存储。Release 目录中的包名是同一文件系统内指向 hot store 内容的硬链接，只额外保存仓库数据库、Manifest、签名和纯文本检查记录。landing、Signer inbox 和 Signer output 都是短生命周期工作区；Release 完成原子提交并经 Publisher 复验后立即删除，若进程在提交与清理之间重启，则由 Journal 中的 `published` 状态幂等补做清理。这样正常稳态空间接近保留包集合本身，而不是发布阶段副本数量的倍数。
 
+没有进入 Release 的 TransferCapability 在过期后自动回收。Publisher 清理前会读取所有 `queued` 和 `awaiting_signer` 授权，仍被活动 Release 完整引用的 transfer 即使已到期也暂不删除；其余 `receiving` 或 `verified` 工作区删除后在 Journal 标记为 `expired`，避免失败、被替代版本或早期部署遗留的传输永久占用磁盘。
+
 ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
 
 清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。其他包保持不变。非空结果继续由 repo-add 从完整包集合重建。清除最后一个包时，Signer 使用 bsdtar 创建标准空 gzip tar 数据库和 files 数据库后照常签名，Publisher 原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。
