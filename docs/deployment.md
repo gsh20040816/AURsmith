@@ -22,6 +22,8 @@ Controller 使用严格的 `known_hosts`，不能配置 `StrictHostKeyChecking=n
 
 Worker 账户的 `/bin/sh` 只用于 OpenSSH 按其协议执行服务端 forced command；客户端提交的原始命令不会直接交给该 shell。控制命令由 `aursmithctl ssh-gateway` 按固定语法解析；Publisher 的 rsync 收件命令则直接交给 rsync 官方随包提供的 `rrsync -wo /landing`，不由 AURsmith 解析 rsync 的内部参数。PTY、转发、密码登录和交互会话均被禁用。
 
+同机部署 Controller 与 Publisher 时，两套 Compose 通过外部 Docker 网络 `aursmith-backbone` 连接；部署前仅需执行一次 `docker network create --internal aursmith-backbone`。Controller 和 Publisher SSH 服务在 Compose 中显式加入该网络，容器重建后仍保留 `publisher-ssh` 服务发现，不依赖部署后的手工 `docker network connect`。
+
 Publisher 的 `AURSMITH_AUR_BASE_URL` 默认固定为 `https://aur.archlinux.org/`。AUR 搜索、info、Provider 查询和 Git 快照均从 Publisher 发起；Controller Stack 不需要 AUR 外网出口。第一版单次订阅最多展开 64 个 AUR pkgbase，超过上限会明确失败并保持数据库不变。
 
 开发机具备外网时，可以运行 `scripts/smoke-upstream.sh` 验证真实 AUR 搜索、普通包快照、Git VCS commit 固定和 Arch 官方包查询。该脚本使用临时 SQLite、Unix Socket 和 Publisher 进程，结束时清理全部临时状态，不接触生产配置。

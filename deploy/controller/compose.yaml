@@ -50,7 +50,7 @@ services:
       - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
     ports:
       - ${AURSMITH_WEB_BIND:-127.0.0.1:18443}:8080
-    networks: [control, agent, egress, edge]
+    networks: [control, agent, egress, edge, backbone]
     healthcheck:
       test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]
       interval: 30s
@@ -207,6 +207,9 @@ volumes:
   controller-run:
 
 networks:
+  backbone:
+    external: true
+    name: aursmith-backbone
   control:
     internal: true
   agent:
