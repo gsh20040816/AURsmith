@@ -190,7 +190,10 @@ fn inspect_regular_files(
         if !elf_candidate {
             continue;
         }
-        let extracted = tempfile::NamedTempFile::new()?;
+        // 大型二进制（例如浏览器主程序）可能超过容器的小型 /tmp tmpfs。
+        // 临时文件放在软件包所在的受控 staging 文件系统，关闭后仍由 tempfile 删除。
+        let extracted =
+            tempfile::NamedTempFile::new_in(package.parent().context("软件包路径缺少父目录")?)?;
         let output_file = extracted.reopen()?;
         let status = Command::new("/usr/bin/bsdtar")
             .args(["-xOf"])
@@ -292,6 +295,43 @@ mod tests {
         let inspection = inspect_package(&package, &artifact).unwrap();
         assert_eq!(inspection.entry_count, 4);
         assert!(inspection.elf_needed.contains_key("usr/bin/demo"));
+    }
+
+    #[test]
+    fn inspection_extracts_elf_next_to_the_package() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".PKGINFO"),
+            "pkgname = demo\npkgver = 1-1\narch = any\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join(".BUILDINFO"), "format = 2\n").unwrap();
+        std::fs::write(root.path().join(".MTREE"), "#mtree\n").unwrap();
+        std::fs::create_dir_all(root.path().join("opt/demo")).unwrap();
+        std::fs::copy("/usr/bin/true", root.path().join("opt/demo/demo")).unwrap();
+        let package = root.path().join("demo-1-1-any.pkg.tar");
+        let status = Command::new("/usr/bin/bsdtar")
+            .current_dir(root.path())
+            .args(["-cf"])
+            .arg(&package)
+            .args([".PKGINFO", ".BUILDINFO", ".MTREE", "opt/demo/demo"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let artifact = ArtifactRecord {
+            path: "demo-1-1-any.pkg.tar".into(),
+            sha256: "a".repeat(64),
+            size: std::fs::metadata(&package).unwrap().len(),
+            package_name: Some("demo".into()),
+            package_version: Some("1-1".into()),
+            architecture: Some("any".into()),
+        };
+        inspect_package(&package, &artifact).unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            5,
+            "临时 ELF 必须在检查后删除"
+        );
     }
 
     #[test]

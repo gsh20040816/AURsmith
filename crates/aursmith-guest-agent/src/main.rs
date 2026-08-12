@@ -540,7 +540,7 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         .map(|artifact| format!("{OUTPUT}/{}", artifact.path))
         .collect::<Vec<_>>();
     namcap_arguments.extend(artifact_paths.iter().map(String::as_str));
-    run_as_builder(&namcap_arguments, Some(&namcap_log))?;
+    let namcap_status = run_as_builder_status(&namcap_arguments, Some(&namcap_log))?;
     Ok(BuildResult {
         job_id: spec.job_id,
         attempt: spec.attempt.clone(),
@@ -574,6 +574,13 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
                 .into(),
             ),
             ("namcap_sha256".into(), file_digest(&namcap_log)?),
+            (
+                "namcap_exit_code".into(),
+                namcap_status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+            ),
             (
                 "published_pkgrel".into(),
                 spec.published_pkgrel
@@ -658,6 +665,17 @@ fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)
 }
 
 fn run_as_builder(arguments: &[&str], log: Option<&Path>) -> anyhow::Result<()> {
+    let status = run_as_builder_status(arguments, log)?;
+    if !status.success() {
+        bail!("Guest 命令失败，状态 {status}");
+    }
+    Ok(())
+}
+
+fn run_as_builder_status(
+    arguments: &[&str],
+    log: Option<&Path>,
+) -> anyhow::Result<std::process::ExitStatus> {
     let mut command = Command::new("/usr/bin/runuser");
     command.args(builder_command_arguments(arguments));
     command.current_dir(BUILD).stdin(Stdio::null());
@@ -698,10 +716,7 @@ fn run_as_builder(arguments: &[&str], log: Option<&Path>) -> anyhow::Result<()> 
             last_progress = Instant::now();
         }
     };
-    if !status.success() {
-        bail!("Guest 命令失败，状态 {status}");
-    }
-    Ok(())
+    Ok(status)
 }
 
 fn process_snapshot() -> String {

@@ -65,6 +65,7 @@
 - ADR-061：替换 ADR-037、ADR-049 和 ADR-051 中 Stack 内必须运行 Web/仓库 Caddy 和内部 CA 的部分。Controller 直接提供 API 与 React 静态页面，Publisher Worker 直接提供仓库文件，二者只映射宿主回环端口；已有的宿主 Caddy 统一负责公网 TLS、`/arch-cache/` 路由和缓存头。删除两层无独立业务价值的 Caddy 可减少镜像、卷、证书和故障点，TLS 私钥仍不进入 AURsmith 容器。
 - ADR-062：Codex Runner 保留原生 `workspace-write` 内层沙箱。Docker 默认 seccomp 及 Debian 的 `docker-default` AppArmor 都会阻止 bubblewrap 建立非特权 mount namespace，因此仅对无 capability、只读根文件系统且不挂载业务秘密的 Agent Runner 设置 `seccomp:unconfined` 与 `apparmor:unconfined`；不得用 privileged、`SYS_ADMIN` 或禁用 Codex sandbox 代替。Arch 宿主未启用 AppArmor，故此前本机验证未暴露后一项部署差异。
 - ADR-063：Fetch Guest 使用官方 `makepkg --printsrcinfo` 对 AUR commit 中的 `.SRCINFO` 做规范化一致性检查，不自行解析 PKGBUILD Shell 语义。真实 `subtitleedit` commit 同时包含 `PKGBUILD pkgrel=2` 与 `.SRCINFO pkgrel=1`，AUR RPC 因此也报告旧版本；该状态必须在下载源码、Agent 审计和 Build 之前确定性阻断，不能通过改写 JobSpec 或忽略差异制造成功。
+- ADR-064：namcap 是产生告警报告的检查器，不把其非零退出状态等同于 makepkg 失败；Guest 保存完整输出、摘要和退出码，由 Publisher 的结构化 Artifact 检查决定是否阻断。Publisher 检查 Chrome 等大型 ELF 时把 bsdtar 输出流式写到 Artifact 所在 staging 文件系统，避免 256 MiB `/tmp` tmpfs 导致正常大文件被误报，同时继续执行 1 GiB 单文件上限和 readelf 校验。
 
 ## 已拒绝
 
