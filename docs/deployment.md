@@ -20,7 +20,7 @@ AURsmith 不安装裸机 daemon。文档中的所有管理命令都通过构建�
 
 Controller 使用严格的 `known_hosts`，不能配置 `StrictHostKeyChecking=no`。Worker 的 `authorized_keys` 只允许 Controller 公钥，实际命令仍由 `sshd_config` 中的 forced command 二次限制。
 
-Worker 账户的 `/bin/sh` 只用于 OpenSSH 按其协议执行服务端 forced command；客户端提交的原始命令不会交给该 shell。`ForceCommand` 会无条件替换请求，`aursmithctl ssh-gateway` 再按固定语法白名单解析，且 PTY、转发、密码登录和交互会话均被禁用。
+Worker 账户的 `/bin/sh` 只用于 OpenSSH 按其协议执行服务端 forced command；客户端提交的原始命令不会直接交给该 shell。控制命令由 `aursmithctl ssh-gateway` 按固定语法解析；Publisher 的 rsync 收件命令则直接交给 rsync 官方随包提供的 `rrsync -wo /landing`，不由 AURsmith 解析 rsync 的内部参数。PTY、转发、密码登录和交互会话均被禁用。
 
 Publisher 的 `AURSMITH_AUR_BASE_URL` 默认固定为 `https://aur.archlinux.org/`。AUR 搜索、info、Provider 查询和 Git 快照均从 Publisher 发起；Controller Stack 不需要 AUR 外网出口。第一版单次订阅最多展开 64 个 AUR pkgbase，超过上限会明确失败并保持数据库不变。
 

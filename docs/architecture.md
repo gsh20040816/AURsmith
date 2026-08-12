@@ -23,7 +23,7 @@ Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docke
 
 每个 Worker 首次启动时在 SQLite Journal 中生成持久化实例 UUID 和 Ed25519 身份。公网可达 Worker 注册时由 Controller 通过固定 host key 探测；反向 Builder 则由管理员在 UI 中录入容器本地显示的 UUID、身份公钥、标签和 Profile，并完成一次挑战签名后启用。名称、角色、协议或后续身份不一致时标记为 incompatible。反向请求绑定 Worker UUID、随机 nonce、请求类型和短有效期；Controller 持久化 nonce，重复请求不能再次领取任务或推进状态。
 
-`TransferCapability` 继续绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限。反向 Builder 把清单中逐个复验的文件复制到只读 export 目录，通过 Publisher 的 forced command rsync receiver 主动上传到 Capability 专属 partial 目录；远端命令不能选择 Capability 以外的路径。Publisher 全部复验后才 rename 为 landing，并返回绑定 Capability 和文件集合的完成状态。Controller 不代理或落盘包字节。公网可达源节点仍可沿用目标主动拉取模式，两种方向共用同一 Capability 数据模型和摘要门禁。
+`TransferCapability` 继续绑定源/目标 UUID、Attempt generation、writer epoch、完整文件清单和期限。反向 Builder 把清单中逐个复验的文件复制到只读 export 目录，通过 Publisher 的 OpenSSH forced command 主动上传到 Capability 专属 partial 目录。服务端直接复用 rsync 官方 `rrsync -wo /landing` 限制写入根目录和危险参数，AURsmith 不复制 rsync 的命令行协议解析；Capability 专属目录由传输前的准备操作创建，Publisher 在传输后复验完整清单与摘要，才 rename 为 landing。Controller 不代理或落盘包字节。公网可达源节点仍可沿用目标主动拉取模式，两种方向共用同一 Capability 数据模型和摘要门禁。
 
 ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
 

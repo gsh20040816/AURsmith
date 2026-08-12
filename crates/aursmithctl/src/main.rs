@@ -702,7 +702,10 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
 
 async fn rsync_gateway(socket: &PathBuf, parts: &[&str]) -> anyhow::Result<()> {
     if !parts.contains(&"--sender") {
-        return rsync_receiver_gateway(socket, parts).await;
+        let error = ProcessCommand::new("/usr/sbin/rrsync")
+            .args(["-wo", "/landing"])
+            .exec();
+        return Err(error).context("无法启动官方 rrsync 收件器");
     }
     let valid_shape = matches!(
         parts,
@@ -762,55 +765,6 @@ async fn rsync_gateway(socket: &PathBuf, parts: &[&str]) -> anyhow::Result<()> {
         .args(&parts[1..])
         .exec();
     Err(error).context("无法启动受限 rsync sender")
-}
-
-async fn rsync_receiver_gateway(socket: &PathBuf, parts: &[&str]) -> anyhow::Result<()> {
-    let valid_shape = matches!(
-        parts,
-        ["rsync", "--server", "-logDtpre.iLsfxCIvu", ".", _]
-            | ["rsync", "--server", "-logDtpre.LsfxCIvu", ".", _]
-            | [
-                "rsync",
-                "--server",
-                "-logDtpre.iLsfxCIvu",
-                "--numeric-ids",
-                ".",
-                _
-            ]
-            | [
-                "rsync",
-                "--server",
-                "-logDtpre.LsfxCIvu",
-                "--numeric-ids",
-                ".",
-                _
-            ]
-    );
-    if !valid_shape {
-        bail!("rsync receiver 参数未被允许");
-    }
-    let requested = parts.last().context("rsync 缺少接收路径")?;
-    let normalized = requested.trim_end_matches('/');
-    let capability_id = normalized
-        .strip_prefix("/landing/")
-        .and_then(|value| value.strip_prefix('.'))
-        .and_then(|value| value.strip_suffix(".partial"))
-        .filter(|value| uuid_like(value))
-        .context("rsync 接收路径未绑定 Capability")?;
-    let response = worker_request(
-        socket,
-        json!({"command": "resolve_import", "capability_id": capability_id}),
-    )
-    .await?;
-    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false)
-        || response["data"]["directory"].as_str() != Some(normalized)
-    {
-        bail!("Publisher 未授权该 rsync 接收路径");
-    }
-    let error = ProcessCommand::new("/usr/bin/rsync")
-        .args(&parts[1..])
-        .exec();
-    Err(error).context("无法启动受限 rsync receiver")
 }
 
 async fn read_limited_json_command(command: &str) -> anyhow::Result<Value> {

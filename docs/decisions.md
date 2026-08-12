@@ -21,7 +21,7 @@
 - ADR-017：首个可运行的 Fetch/Build 接力以 ReleaseBatch 为单位固定 Builder 亲和性。Build Job 引用已验证的 Fetch Attempt 和 Source Manifest，不允许重新下载。跨 Builder 接力必须等待受签名 `TransferCapability` 约束的 rsync 路径完成，不能用共享可写卷或临时联网代替。
 - ADR-018：官方依赖只允许 Fetch Guest 通过 pacman 和固定代理下载，并进入 Source Manifest；批次内 AUR 依赖只允许来自较早的成功 Build Attempt。Build Guest 在无网状态使用 pacman 安装两类包，禁止把 AUR 依赖固化进 Profile 或在构建失败后临时放开网络。
 - ADR-019：Signer 使用独立断网容器和私有 tmpfs GPG home。Publisher 只能写入 inbox、只读 signed 输出，Signer 不挂载公开仓库；它必须自行验证 ReleaseAuthorization、Artifact Manifest 和 `.PKGINFO`，并用官方 repo-add 从完整包集合创建数据库。
-- ADR-020：Worker UUID 由本地 Journal 首次生成并持久化，Controller 注册必须以远端报告值为准，不能在两端各自生成不相关 ID。Artifact 传输采用源端最小 export 目录、固定 rsync sender forced command 和目标端 partial+摘要复验；Publisher 的 Builder 端点来自静态 UUID 映射，不增加服务发现或自研传输协议。
+- ADR-020：Worker UUID 由本地 Journal 首次生成并持久化，Controller 注册必须以远端报告值为准，不能在两端各自生成不相关 ID。Artifact 传输采用源端最小 export 目录、OpenSSH forced command、rsync 官方 `rrsync` 写入限制和目标端 partial+摘要复验；AURsmith 不解析 rsync 内部参数。Publisher 的 Builder 端点来自静态 UUID 映射，不增加服务发现或自研传输协议。
 - ADR-021：ReleaseAuthorization 始终描述完整仓库集合。新批次按 `pkgname` 覆盖上一稳定 Release 的对应 Artifact，未变化包从已签名 hot set 按摘要复用；Signer 每次重新生成完整 db/files 数据库。Publisher 只持仓库公钥，公开顺序固定为不可变 Release、包 hot set、数据库签名、files 链接和最后的 db 链接。
 - ADR-022：ArchiveCopy 复用 TransferCapability 与 forced-command rsync，但使用 `release_id` 而不是 Build Attempt 绑定聚合。Archiver 主动拉取并用 `--link-dest` 建立快照；Receipt 由 Archiver Journal 中持久化的 Ed25519 身份密钥签署，Controller 在 Worker 注册和每次心跳时固定并核对身份公钥。源端 export 只在目标导入或 ArchiveReceipt 验证后由 Controller 触发幂等清理。
 - ADR-023：服务端回滚只激活既有签名 Release，不复制数据库、不重新签名且不改变历史 Release。Controller 将服务端当前指针和客户端降级分开建模，后者始终以显式 `pacman -U` 命令交给用户执行。

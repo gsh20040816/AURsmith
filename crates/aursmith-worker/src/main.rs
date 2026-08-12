@@ -574,14 +574,14 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
         .join("transfers")
         .join(capability.id.to_string());
     let destination = format!("{remote}:/landing/.{}.partial/", capability.id);
-    let control_tool = std::env::current_exe()?
-        .parent()
-        .map(|parent| parent.join("aursmithctl"))
-        .filter(|path| path.is_file())
-        .context("Worker 同目录缺少 aursmithctl")?;
     let output = tokio::process::Command::new("/usr/bin/rsync")
         .args(["-a", "--numeric-ids", "--partial", "--delay-updates", "-e"])
-        .arg(format!("{} rsync-ssh", control_tool.display()))
+        .arg(format!(
+            "/usr/bin/ssh -T -p {} -i {} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={}",
+            endpoint.port().unwrap_or(22),
+            identity.display(),
+            known_hosts.display()
+        ))
         .arg(format!("{}/", source.display()))
         .arg(destination)
         .env("AURSMITH_RSYNC_SSH_IDENTITY_FILE", identity)
