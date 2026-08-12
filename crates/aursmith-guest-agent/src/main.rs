@@ -223,10 +223,10 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
         &["/usr/bin/makepkg", "--verifysource", "--noconfirm"],
         Some(&log),
     )?;
+    export_declared_pgp_keys(Path::new(BUILD))?;
     let prepared = Path::new(OUTPUT).join("prepared");
     fs::create_dir_all(&prepared)?;
     copy_tree(Path::new(BUILD), &prepared, false)?;
-    export_declared_pgp_keys(Path::new(BUILD), &prepared)?;
     let dependency_download_started = std::time::Instant::now();
     let resolved_dependencies = download_official_dependencies(spec, &prepared)?;
     let dependency_download_milliseconds =
@@ -303,14 +303,14 @@ fn verify_declared_pgp_keys(build: &Path, fingerprints: &[String]) -> anyhow::Re
 
 const PREPARED_PGP_KEYS: &str = ".aursmith-validpgpkeys.gpg";
 
-fn export_declared_pgp_keys(build: &Path, prepared: &Path) -> anyhow::Result<()> {
+fn export_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
     let srcinfo = fs::read_to_string(build.join(".SRCINFO"))?;
     let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
     if fingerprints.is_empty() {
         return Ok(());
     }
     let mut arguments = vec!["/usr/bin/gpg", "--batch", "--output"];
-    let destination = prepared.join(PREPARED_PGP_KEYS);
+    let destination = build.join(PREPARED_PGP_KEYS);
     let destination_text = destination.to_string_lossy().into_owned();
     arguments.push(&destination_text);
     arguments.push("--export");
