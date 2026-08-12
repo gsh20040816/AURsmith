@@ -87,6 +87,11 @@ fn process_pending(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
 }
 
 fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> anyhow::Result<()> {
+    let directory_name = entry.file_name();
+    let directory_name = directory_name.to_string_lossy();
+    if cli.output.join(directory_name.as_ref()).is_dir() {
+        return Ok(());
+    }
     let authorization_path = entry.path().join("authorization.json");
     let envelope: SignedEnvelope = serde_json::from_slice(&fs::read(&authorization_path)?)?;
     if envelope.verifying_key != controller_key {
@@ -522,6 +527,31 @@ mod tests {
         };
 
         assert!(process_pending(&cli, &[0; 32]).is_ok());
+    }
+
+    #[test]
+    fn committed_release_is_skipped_before_reading_stale_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        let release_id = Uuid::new_v4().to_string();
+        let inbox = root.path().join("inbox");
+        let output = root.path().join("output");
+        fs::create_dir_all(inbox.join(&release_id)).unwrap();
+        fs::create_dir_all(output.join(&release_id)).unwrap();
+        fs::write(
+            inbox.join(&release_id).join("authorization.json"),
+            b"stale invalid authorization",
+        )
+        .unwrap();
+        let entry = fs::read_dir(&inbox).unwrap().next().unwrap().unwrap();
+        let cli = Cli {
+            inbox,
+            output,
+            controller_key_hex: "00".repeat(32),
+            gpg_private_key: root.path().join("unused"),
+            gpg_home: root.path().join("gnupg"),
+        };
+
+        assert!(process_release(&cli, &[0; 32], &entry).is_ok());
     }
 
     #[test]
