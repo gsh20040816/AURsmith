@@ -109,6 +109,10 @@ if [[ "$(jq '[.services["agent-credential-gateway"].secrets[]? | select(.source 
   echo "三个低成本 Agent 必须各自使用独立 API key secret" >&2
   exit 1
 fi
+if [[ "$(jq '[.services["agent-low-1"].security_opt[]? | select(. == "seccomp:unconfined" or . == "apparmor:unconfined")] | length' <<<"${controller_json}")" != "2" ]]; then
+  echo "Codex Runner 必须允许其非特权内层 mount namespace" >&2
+  exit 1
+fi
 if [[ "$(jq '(.services.controller.networks | has("edge")) and (.services | has("backup-ssh") | not)' <<<"${controller_json}")" != "true" ]] \
   || [[ "$(jq -r '.networks.edge.internal // false' <<<"${controller_json}")" != "false" ]]; then
   echo "默认 Controller 只能通过非 internal 的 edge 网络发布回环端口" >&2

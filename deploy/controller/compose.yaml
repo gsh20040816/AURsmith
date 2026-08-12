@@ -100,9 +100,10 @@ services:
         AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
     read_only: true
     cap_drop: [ALL]
-    # Codex 使用非特权 bubblewrap user namespace；Docker 默认 seccomp 会拦截其 unshare。
-    # Runner 仍无 capability、无特权、根文件系统只读，并由 Codex 内层沙箱限制任务。
-    security_opt: [no-new-privileges:true, seccomp:unconfined]
+    # Codex 使用非特权 bubblewrap user namespace；Docker 默认 seccomp 和 Debian 的
+    # docker-default AppArmor 都会阻止其 mount namespace。Runner 自身仍无 capability、
+    # 无特权、根文件系统只读，并由 Codex 的 workspace sandbox 限制审计工作区。
+    security_opt: [no-new-privileges:true, seccomp:unconfined, apparmor:unconfined]
     environment:
       AURSMITH_AGENT_ADAPTER: codex
       AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_1_PROVIDER:-openai}
