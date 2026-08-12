@@ -120,9 +120,14 @@ if [[ "$(jq '[.services["agent-credential-gateway"].secrets[]? | select(.source 
   echo "三个低成本 Agent 必须各自使用独立 API key secret" >&2
   exit 1
 fi
-if [[ "$(jq '(.services.web.networks | has("edge")) and (.services["backup-ssh"].networks | has("edge"))' <<<"${controller_json}")" != "true" ]] \
+if [[ "$(jq '(.services.web.networks | has("edge")) and (.services | has("backup-ssh") | not)' <<<"${controller_json}")" != "true" ]] \
   || [[ "$(jq -r '.networks.edge.internal // false' <<<"${controller_json}")" != "false" ]]; then
-  echo "Web 和 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2
+  echo "默认 Controller 只能由 Web 通过非 internal 的 edge 网络发布宿主端口" >&2
+  exit 1
+fi
+controller_archive_json="$(docker compose --profile external-archiver -f deploy/controller/compose.yaml config --format json)"
+if [[ "$(jq '(.services["backup-ssh"].networks | has("edge"))' <<<"${controller_archive_json}")" != "true" ]]; then
+  echo "可选 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2
   exit 1
 fi
 external_tls_json="$(

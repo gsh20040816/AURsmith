@@ -58,6 +58,7 @@ services:
     restart: unless-stopped
 
   backup-ssh:
+    profiles: [external-archiver]
     build:
       context: ../..
       dockerfile: deploy/images/controller.Dockerfile

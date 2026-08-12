@@ -115,6 +115,8 @@ Doctor 页面显示每个 Worker 的在线状态、数据卷可用百分比和�
 
 Controller 默认把每日一致性备份写入同一持久卷的 `/var/lib/aursmith/backups/<Backup ID>/`。不要只复制 `controller.db` 而丢失 `backup-envelope.json`；`controller_signing_key`、GPG 私钥和管理员恢复材料仍必须另行离线备份。第一版默认不启用外部 Archiver，因此这些备份与 Controller 同故障域，只用于误操作恢复，不能冒充独立灾备。
 
+旧的远端备份导出 sidecar 位于 `external-archiver` Compose profile，默认不会启动。只有显式启用外部 Archiver 协议时才同时启用该 profile 和 `AURSMITH_EXTERNAL_ARCHIVER_ENABLED=true`。
+
 恢复时先停止 Controller 服务，确认没有其他容器打开数据库卷，然后以只挂载 Controller 数据卷和必要 secret 的一次性容器执行：
 
 ```bash
