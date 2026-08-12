@@ -1254,9 +1254,9 @@ async fn reverse_worker_poll(
         ));
     }
     for report in poll.attempts {
-        sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
-            .bind(poll.worker_id.to_string()).bind(report.job_id.to_string())
-            .bind(report.response.to_string()).bind(Utc::now())
+        sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) SELECT ?, id, ?, ? FROM jobs WHERE id = ? ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
+            .bind(poll.worker_id.to_string()).bind(report.response.to_string())
+            .bind(Utc::now()).bind(report.job_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
     }
     for capability_id in poll.completed_transfers {
@@ -1949,6 +1949,85 @@ mod tests {
             .unwrap();
         let response = app.oneshot(activate).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn reverse_poll_ignores_reports_from_a_previous_control_plane() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let config = Config {
+            bind_address: "127.0.0.1:0".into(),
+            database_url: "sqlite::memory:".into(),
+            setup_token: "测试初始化令牌-至少二十个字符".into(),
+            signing_key_file: "/不存在".into(),
+            ssh_identity_source_file: "/不存在".into(),
+            ssh_identity_file: "/不存在".into(),
+            ssh_known_hosts_file: "/不存在".into(),
+            secure_cookies: false,
+            session_hours: 1,
+            low_agent_endpoints: vec![],
+            high_agent_endpoint: String::new(),
+            agent_daily_call_limit: 300,
+            agent_monthly_call_limit: 3000,
+            agent_monthly_cost_limit_microusd: 5_000_000,
+            agent_random_high_cost_review_basis_points: 0,
+            repository_name: "aursmith".into(),
+            source_git_commit: "test".into(),
+            repository_base_url: "https://repo.test".into(),
+            client_ca_certificate_file: None,
+            webhook_url: None,
+            webhook_hmac_secret_file: "/不存在".into(),
+            ntfy_url: None,
+            backup_dir: "/不存在".into(),
+            backup_export_dir: "/不存在".into(),
+            backup_export_socket: "/不存在".into(),
+            external_archiver_enabled: false,
+        };
+        let worker_key = SigningKey::from_bytes(&[17_u8; 32]);
+        let worker_id = Uuid::new_v4();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, profiles_json, identity_signing_key_hex, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'degraded', '', '', 1, '[]', '[]', ?, 'reverse', ?, ?)")
+            .bind(worker_id.to_string())
+            .bind(hex::encode(worker_key.verifying_key().as_bytes()))
+            .bind(now)
+            .bind(now)
+            .execute(&database)
+            .await
+            .unwrap();
+        let app = router(AppState::new(
+            database,
+            config,
+            SigningKey::from_bytes(&[9_u8; 32]),
+        ));
+        let poll = ReverseWorkerPoll {
+            worker_id,
+            nonce: Uuid::new_v4(),
+            status: json!({
+                "instance_id": worker_id,
+                "role": "builder",
+                "protocol_major": 1,
+                "profiles": [],
+            }),
+            attempts: vec![aursmith_protocol::ReverseAttemptReport {
+                job_id: Uuid::new_v4(),
+                response: json!({"ok": true}),
+            }],
+            completed_transfers: Vec::new(),
+            sent_at: now,
+        };
+        let envelope =
+            SignedEnvelope::sign("aursmith.reverse_worker_poll", &poll, &worker_key).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/reverse-workers/poll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
