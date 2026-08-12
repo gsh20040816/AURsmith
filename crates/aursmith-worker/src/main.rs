@@ -1,6 +1,5 @@
 mod aur;
 mod builder;
-mod package_inspection;
 
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
@@ -1831,7 +1830,6 @@ async fn materialize_release_inbox(
     staging: &Path,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(staging)?;
-    let mut inspections = Vec::new();
     let imports = sqlx::query(
         "SELECT directory, manifest_json FROM transfer_imports WHERE state = 'verified'",
     )
@@ -1848,8 +1846,6 @@ async fn materialize_release_inbox(
             .join(&worker.repository_arch)
             .join(&artifact.path);
         if reusable_committed_artifact(worker, artifact, &hot)? {
-            let inspection = load_committed_artifact_inspection(worker, artifact)?;
-            inspections.push(inspection);
             continue;
         }
         let mut source = None;
@@ -1878,7 +1874,6 @@ async fn materialize_release_inbox(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(source, &target)?;
-        inspections.push(package_inspection::inspect_package(&target, artifact)?);
     }
     for evidence in &authorization.evidence_files {
         aursmith_protocol::validate_relative_path(&evidence.path)?;
@@ -1923,10 +1918,7 @@ async fn materialize_release_inbox(
         }
         std::fs::copy(source, target)?;
     }
-    std::fs::write(
-        staging.join("artifact-inspections.json"),
-        serde_json::to_vec_pretty(&inspections)?,
-    )?;
+    std::fs::write(staging.join("artifact-inspections.json"), b"[]")?;
     std::fs::write(
         staging.join("authorization.json"),
         serde_json::to_vec(envelope)?,
@@ -1971,40 +1963,6 @@ fn reusable_committed_artifact(
         }
     }
     Ok(false)
-}
-
-fn load_committed_artifact_inspection(
-    worker: &Worker,
-    artifact: &ArtifactRecord,
-) -> anyhow::Result<package_inspection::PackageInspection> {
-    let releases = worker
-        .repository_dir
-        .join(&worker.repository_arch)
-        .join("releases");
-    for entry in std::fs::read_dir(releases)?.filter_map(Result::ok) {
-        let manifest_path = entry.path().join("release-manifest.json");
-        let inspections_path = entry.path().join("artifact-inspections.json");
-        if !manifest_path.is_file() || !inspections_path.is_file() {
-            continue;
-        }
-        let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
-        if !manifest
-            .artifacts
-            .iter()
-            .any(|previous| previous == artifact)
-        {
-            continue;
-        }
-        let inspections: Vec<package_inspection::PackageInspection> =
-            serde_json::from_slice(&std::fs::read(inspections_path)?)?;
-        if let Some(inspection) = inspections
-            .into_iter()
-            .find(|inspection| inspection.artifact_sha256 == artifact.sha256)
-        {
-            return Ok(inspection);
-        }
-    }
-    bail!("已提交 Artifact 缺少检查记录：{}", artifact.path)
 }
 
 async fn query_release(worker: &Worker, release_id: &str) -> WorkerResponse {

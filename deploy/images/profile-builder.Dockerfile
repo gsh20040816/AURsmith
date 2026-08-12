@@ -16,7 +16,7 @@ RUN case "${AURSMITH_ARCH_MIRROR}" in https://*) ;; *) echo 'AURSMITH_ARCH_MIRRO
     && pacman -Syu --noconfirm --needed e2fsprogs qemu-img mkinitcpio \
     && install -d /rootfs/var/lib/pacman /rootfs/etc /opt/aursmith-profile \
     && pacman -Sy --noconfirm --root /rootfs --dbpath /rootfs/var/lib/pacman \
-      --cachedir /var/cache/pacman/pkg base linux base-devel devtools namcap \
+      --cachedir /var/cache/pacman/pkg base linux base-devel devtools \
     && install -Dm644 /etc/pacman.d/mirrorlist /rootfs/etc/pacman.d/mirrorlist \
     && printf '%s\n' "${repository_mirror}" > /opt/aursmith-profile/repository-mirror \
     && useradd --root /rootfs --uid 1000 --create-home --shell /bin/bash builder

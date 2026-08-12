@@ -174,11 +174,8 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     gpg_sign(cli, &files_database)?;
     let inspection_source = entry.path().join("artifact-inspections.json");
     let inspection_bytes = fs::read(&inspection_source)?;
-    let inspections: Vec<serde_json::Value> = serde_json::from_slice(&inspection_bytes)?;
-    if inspection_bytes.len() > 10 * 1024 * 1024
-        || inspections.len() != authorization.artifacts.len()
-    {
-        bail!("Publisher Artifact 检查报告数量或大小无效");
+    if inspection_bytes.len() > 1024 {
+        bail!("Publisher Artifact 占位文件过大");
     }
     let inspection_destination = staging.join("artifact-inspections.json");
     fs::write(&inspection_destination, inspection_bytes)?;
@@ -491,7 +488,6 @@ fn validate_authorization(
         {
             bail!("Artifact Manifest 不匹配：{}", artifact.path);
         }
-        validate_package_metadata(&path, artifact)?;
         package_names.insert(artifact.package_name.clone().unwrap_or_default());
     }
     if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {

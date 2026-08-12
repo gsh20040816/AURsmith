@@ -34,12 +34,12 @@
 - ADR-030：AUR 包不可见时建模为含删除、重命名、合并三种可能原因的生命周期事件，不从一次空查询猜测具体原因。维护者、orphan 和 source 域名变化使用快照差异独立记录，且不伪装成普通构建失败。
 - ADR-031：官方依赖版本变化采用保守的重建建议，不宣称从包版本或 ELF 信息证明 ABI 已改变或兼容。建议默认七天合批，用户可立即执行或按包关闭；实际执行必须派生新 Revision 并重新 Fetch、审计和构建，禁止复用旧依赖快照。
 - ADR-032：本地重建版本由 Controller 根据同一上游完整版本的成功历史单调派生，并通过签名 JobSpec 固定到 Build Guest。Guest 只改写工作副本中唯一、静态的顶层 `pkgrel`；动态或歧义赋值失败关闭。Controller 以产物 `.PKGINFO` 反向核验授权版本，避免只更新数据库字段却生成客户端无法升级的同版本软件包。
-- ADR-033：Publisher 对不可信软件包执行独立归档检查。路径、文件类型和必需元数据属于确定性发布门禁；INSTALL、hook、服务、setuid 和内核模块只形成可追踪风险事实，不能脱离审计上下文直接判为恶意。检查报告由 Signer 纳入签名 Release Manifest，避免发布后只剩包文件而丢失 Publisher 的判断依据。
+- ADR-033（已替换）：早期 Publisher 独立归档检查已由 ADR-065 删除。
 - ADR-034：第一版先用独立、无缓存的 Squid 容器补齐 Fetch VM 的实际外网出口，只允许 80/443 并拒绝全部本地和保留目标。pacoloco 命中率、按 Revision 自动下发精确域名 ACL 属于后续优化；Build VM 无网边界不因此变化。
 - ADR-035：Arch 软件仓库镜像在不可变 Profile 构建时配置，而不是作为每个 Build Job 的可变参数。镜像必须是 HTTPS Base URL，同时写入 Guest mirrorlist 和签名 Profile 清单；Fetch Guest 用它下载官方依赖，Build Guest 继续使用已准备好的离线包。这样镜像选择可追溯，也不会破坏无网构建边界。
 - ADR-036：以 QEMU 内置 virtio-9p `mapped-xattr` 取代原计划的两个 virtiofsd 进程。真实容器验证确认当前 Rust virtiofsd 在非 root、`cap_drop: ALL` 条件下无法初始化共享目录，而官方文档也把 root 作为常规运行前提；给 Builder 增加 root 或 capability 与既定安全边界冲突。9p 输入固定只读，输出限于 Attempt 目录，Guest 仍处于 KVM 边界，Worker 对全部输出重新验证。以后若 virtiofsd 提供经过验证的无特权模式，可通过新 ADR 重新评估。
 - ADR-037：Controller、Web 和仓库 Caddy 镜像必须在构建时建立固定 UID/GID 10001 的非 root 用户，并预创建需要由命名卷覆盖的可写目录。官方 Caddy 二进制自带 `cap_net_bind_service` 文件 capability，在 `cap_drop: ALL` 与 `no-new-privileges` 下会于 exec 阶段失败，因此 AURsmith 的派生镜像显式移除该 capability，并只监听容器内非特权端口；不会为方便启动而恢复 capability 或 root。
-- ADR-038：split outputs 与 `check()` 策略属于每个 Build Job 的不可变授权输入。Controller 从对应 Revision 快照取完整 outputs，而不是用户关注的子集；按包策略默认启用 `check()`，只有显式操作才冻结为禁用。Guest 必须核对实际包名集合，执行 namcap，并把 check 状态与 namcap 摘要写入 provenance，避免 UI 配置、Job 和实际 makepkg 行为彼此脱节。
+- ADR-038：split outputs 与 `check()` 策略属于每个 Build Job 的不可变授权输入。Controller 从对应 Revision 快照取完整 outputs，而不是用户关注的子集；按包策略默认启用 `check()`，只有显式操作才冻结为禁用。Guest 仅核对 makepkg 实际产物名集合，check 状态写入 provenance。
 - ADR-039：清除软件包必须通过新的完整 Release 生效，禁止直接删除 hot set 或修改当前数据库。授权同时记录被移除的全部 split output 名称；当结果为空时，Signer 生成可被 pacman 读取的空 tar 数据库并正常签名。空仓库是清除最后一个包的合法状态，但没有 Artifact 且没有清除目标的授权仍失败关闭。
 - ADR-040：Agent 的调用和成本预算允许通过认证 Web API 在运行时覆盖，调度器直接读取持久化值；provider、Base URL、模型和 API key 不做热更新，继续由 Compose 环境与 Docker secret 管理。这样设置页可处理日常限额，又不会把 provider 凭据复制进 Controller 数据库或浏览器。
 - ADR-041：Publisher 的 ELF 检查使用固定路径 readelf，只对归档中经过安全路径与普通文件验证的候选逐个提取到有界临时文件。file capability 直接检查 pax 扩展头，不要求 Publisher 以 root 或获得 `CAP_SETFCAP` 来恢复 xattr。两类结果都是风险与溯源事实，不单独作为恶意判定。
@@ -64,8 +64,9 @@
 - ADR-060：替换 ADR-014、ADR-034、ADR-046 和 ADR-053 中 Fetch VM 必须经 Publisher source proxy 的部分。第一版以实用部署为主，Fetch VM 使用 QEMU user networking 直接访问公网，不再部署 Squid、guestfwd 或 Builder TCP relay；Build VM 仍由 `AURSMITH_BUILD_NETWORK` 独立决定是否联网。Controller、GPG、SSH 和 Agent 密钥均不进入 Guest，下载摘要和 provenance 仍完整记录。
 - ADR-061：替换 ADR-037、ADR-049 和 ADR-051 中 Stack 内必须运行 Web/仓库 Caddy 和内部 CA 的部分。Controller 直接提供 API 与 React 静态页面，Publisher Worker 直接提供仓库文件，二者只映射宿主回环端口；已有的宿主 Caddy 统一负责公网 TLS、`/arch-cache/` 路由和缓存头。删除两层无独立业务价值的 Caddy 可减少镜像、卷、证书和故障点，TLS 私钥仍不进入 AURsmith 容器。
 - ADR-062：Codex Runner 保留原生 `workspace-write` 内层沙箱。Docker 默认 seccomp 及 Debian 的 `docker-default` AppArmor 都会阻止 bubblewrap 建立非特权 mount namespace，因此仅对无 capability、只读根文件系统且不挂载业务秘密的 Agent Runner 设置 `seccomp:unconfined` 与 `apparmor:unconfined`；不得用 privileged、`SYS_ADMIN` 或禁用 Codex sandbox 代替。Arch 宿主未启用 AppArmor，故此前本机验证未暴露后一项部署差异。
-- ADR-063：Fetch Guest 使用官方 `makepkg --printsrcinfo` 对 AUR commit 中的 `.SRCINFO` 做规范化一致性检查，不自行解析 PKGBUILD Shell 语义。真实 `subtitleedit` commit 同时包含 `PKGBUILD pkgrel=2` 与 `.SRCINFO pkgrel=1`，AUR RPC 因此也报告旧版本；该状态必须在下载源码、Agent 审计和 Build 之前确定性阻断，不能通过改写 JobSpec 或忽略差异制造成功。
-- ADR-064：namcap 是产生告警报告的检查器，不把其非零退出状态等同于 makepkg 失败；Guest 保存完整输出、摘要和退出码，由 Publisher 的结构化 Artifact 检查决定是否阻断。Publisher 检查 Chrome 等大型 ELF 时把 bsdtar 输出流式写到 Artifact 所在 staging 文件系统，避免 256 MiB `/tmp` tmpfs 导致正常大文件被误报，同时继续执行 1 GiB 单文件上限和 readelf 校验。
+- ADR-063（已撤回）：不额外执行 `.SRCINFO` 与 `makepkg --printsrcinfo` 对账；本地 makepkg 能构建时平台按 PKGBUILD 实际行为构建。
+- ADR-064（已替换）：namcap 与 Publisher 大型 ELF 检查均由 ADR-065 删除。
+- ADR-065：第一版遵循本地 makepkg 工作流。Agent 审计通过后，Guest 运行 makepkg；成功产生预期 split outputs 后直接上传。Publisher 仅核对授权、Attempt、文件大小和 SHA-256，Signer 仅核对 ReleaseAuthorization、摘要并调用官方 repo-add/GPG，不再扫描 ELF、INSTALL、hook、systemd、setuid、capability、内核模块或执行 namcap。首次发布不根据可能过时的 `.SRCINFO` 改写 PKGBUILD pkgrel；只有同一上游版本的本地重建才改工作副本。普通 Profile 与产物目录采用常见 0755/0644，只有 GPG、SSH、API key 等秘密保持 0700/0600。
 
 ## 已拒绝
 
