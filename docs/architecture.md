@@ -29,9 +29,9 @@ Publisher 的稳态存储以公开 hot store 为唯一包内容存储。Release 
 
 没有进入 Release 的 TransferCapability 在过期后自动回收。Publisher 清理前会读取所有 `queued` 和 `awaiting_signer` 授权，仍被活动 Release 完整引用的 transfer 即使已到期也暂不删除；其余 `receiving` 或 `verified` 工作区删除后在 Journal 标记为 `expired`，避免失败、被替代版本或早期部署遗留的传输永久占用磁盘。
 
-ReleaseAuthorization 包含上一稳定 Release 中未变化的 Artifact 与当前批次新 Artifact，因此每次交给 Signer 的都是完整仓库而非增量片段。Publisher 只把经 TransferCapability 验证的新包和上一已签名 hot set 中摘要一致的旧包送入 Signer。Signer 用 GPG 私钥和官方 repo-add 生成完整不可变输出；Publisher 仅持公钥，复验包、数据库、files 数据库与 Manifest 签名后，先提交 Release 目录和包文件，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同会在 hot set 接管时失败关闭。
+ReleaseAuthorization 始终描述目标 Release 的完整最终 Artifact 清单，但 Publisher 只把经 TransferCapability 验证的变化包送入 Signer；未变化包只引用上一已提交 hot set。Signer 先验证当前仓库 db/files 的 GPG 签名并复制这两个小型数据库，再用官方 `repo-remove` 删除目标清单中已不存在的包，用官方 `repo-add` 只加入本批次变化包。首次发布才从空数据库加入全部包。Signer 最后只读取新数据库中的小型 `desc` 元数据，要求包名、版本和文件名与完整 ReleaseAuthorization 精确一致，然后重新签署 db/files 和 Manifest。Publisher 仅持公钥，复验变化包与新数据库签名后，先提交不可变 Release 目录和变化包，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同仍在 hot set 接管时失败关闭。
 
-清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。其他包保持不变。非空结果继续由 repo-add 从完整包集合重建。清除最后一个包时，Signer 使用 bsdtar 创建标准空 gzip tar 数据库和 files 数据库后照常签名，Publisher 原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。
+清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。Signer 根据当前数据库与目标完整清单的差集调用官方 `repo-remove`，其他条目保持不变。清除最后一个包时生成标准空 gzip tar 数据库和 files 数据库后照常签名并原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。
 
 Release 提交并原子切换后，Publisher 从全部 GPG 签名 Manifest 计算保留集合：当前数据库指向的 Release 永久进入集合；其他 Release 只有同时满足“提交时间在最近 30 天内”和“包含对应 `pkgname` 最新 3 个不同 `package_version` 之一”才保留。超过 30 天的历史版本即使不足 3 个也删除，30 天内超过最新 3 个的更旧版本同样删除。证据文件随对应 Release 一起保留。任一 Manifest、签名、目录 ID 或当前数据库链接异常时，本轮清理整体停止，不能按文件名猜测后删除。
 
@@ -101,11 +101,11 @@ Controller 每六小时读取当前 Release 中 Artifact 构建时记录的官�
 
 受影响的依赖闭包组成一个 `ReleaseBatch`。系统完整暂存该批次，根据完整 Manifest 签名并验证，然后最后切换仓库数据库。失败批次不能修改当前 Release。
 
-Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publisher 只能向只写 inbox 投递软件包和 Controller 签名的 `ReleaseAuthorization`，不能访问 Signer 的 GPG home；Signer 只能只读 inbox 并写独立 signed volume。Signer 再次验证 Controller Ed25519 公钥、授权期限、writer epoch 对应的授权内容、每个包的相对路径、大小、SHA-256 和 `.PKGINFO`，随后用固定 argv 调用 GPG 与官方 `repo-add`。包、仓库数据库和 Release Manifest 均生成 GPG 分离签名，完整 staging 最后通过目录 rename 提交。Publisher 仍须在公开前复验签名并执行 hot set/数据库切换；Signer 自身不拥有公开仓库卷。
+Signer 是 Publisher Stack 内独立且 `network_mode: none` 的容器。Publisher 只能向只写 inbox 投递变化软件包和 Controller 签名的 `ReleaseAuthorization`，不能访问 Signer 的 GPG home；Signer 只能只读 inbox、当前公开仓库和写独立 signed volume。Signer 再次验证 Controller Ed25519 公钥、授权期限、writer epoch、变化包的相对路径、大小、SHA-256 和 `.PKGINFO`，并验证作为增量基线的当前 db/files GPG 签名；未变化的大包不重复读取。随后以固定 argv 调用 GPG、官方 `repo-add` 和 `repo-remove`。变化包、仓库数据库和 Release Manifest 均生成 GPG 分离签名，完整 staging 最后通过目录 rename 提交。Publisher 仍须在公开前复验变化内容和数据库签名并执行 hot set/数据库切换；Signer 的公开仓库卷保持只读。
 
 Release 明确授权 Signer 保证仓库中存在 `aursmith-keyring` 系统包。Signer 从当前仓库私钥导出公钥，把 `aursmith.gpg`、`aursmith-trusted` 和空的 `aursmith-revoked` 安装到 `/usr/share/pacman/keyrings/`；`.INSTALL` 在安装和升级时调用 `pacman-key --populate aursmith`。若当前 hot store 中已有包内公钥指纹与仓库私钥一致的有效 keyring，后续 Release 直接复用原包及签名，不改变版本；只有首次发布或仓库公钥、信任内容实际变化时才生成新版本。定期检查只核对内容，内容不变不发布空更新。Publisher 不盲信该派生产物：它从包内重新读取 `.PKGINFO`、公钥主指纹、ownertrust、revoked 清单和安装脚本，并要求主指纹与启动时固定的仓库公钥一致，之后才复制到公开 hot set。`aursmith-keyring` 是保留包名，AUR Artifact 不能覆盖。首次客户端引导仍必须人工核对一次指纹；keyring 包负责之后的持久安装和密钥轮换，不能替代信任根引导。
 
-Publisher 不重复审查 `makepkg` 已生成的软件包内容。Builder 上传后只核对 Controller 授权、Attempt、普通文件、大小和 SHA-256；Signer 只核对 ReleaseAuthorization、摘要，并交给官方 `repo-add` 读取和建立仓库数据库。`repo-add` 能接受且签名成功的包即可发布，不额外扫描 ELF、INSTALL、hook、systemd、setuid、capability 或内核模块。兼容旧 ReleaseManifest 的 `artifact-inspections.json` 字段暂保留为空数组，不参与门禁。
+Publisher 不重复审查 `makepkg` 已生成的软件包内容。Builder 导出和 Publisher 接收变化包时各在信任边界核对一次 Controller 授权、Attempt、普通文件、大小和 SHA-256；接收目录原子接管后，后续 inbox、Release 和 hot set 物化只使用大小、Journal 状态及本地硬链接，不再重复顺序读取同一大文件。Signer 核对变化输入和 ReleaseAuthorization，并交给官方 `repo-add/repo-remove` 更新仓库数据库。工具能接受且签名成功的包即可发布，不额外扫描 ELF、INSTALL、hook、systemd、setuid、capability 或内核模块。兼容旧 ReleaseManifest 的 `artifact-inspections.json` 字段暂保留为空数组，不参与门禁。
 
 Controller 在 Attempt 对账事务中保存完整 GuestResult 和有界诊断日志，而不是只保留最终 Artifact 行。Builder 对 QEMU stdout/stderr、fetch、build 和 Guest 错误文件记录完整大小与 SHA-256；每个普通日志最多内嵌前 128 KiB UTF-8/Base64 内容，超过 64 MiB 的异常日志明确记录省略原因，不能让不可信输出撑爆控制消息。创建 ReleaseAuthorization 时，系统收集 ReleaseBatch、参与 Revision、AuditBundle、成功 Agent 报告、Controller 签名 Profile Envelope 和 Job 证据，形成版本化 `ReleaseEvidence`；每条记录都有基于规范 JSON 的 SHA-256。结构化证据最多 10000 条、序列化后最多 16 MiB，超限时阻止发布并要求人工拆分，不能静默截断。
 
@@ -121,11 +121,11 @@ Profile 目录名是内容摘要，固定包含 `root.qcow2`、`vmlinuz-linux`�
 
 每个 Attempt 使用独立 runtime 目录和 qcow2 overlay。QEMU 参数由 Rust 结构逐项构造，不经过 Shell。输入和输出通过 QEMU 内置 virtio-9p 的 `mapped-xattr` 模式提供，输入 `fsdev` 额外固定 `readonly=on`，输出只指向该 Attempt 的独立目录；不启动需要 root 或额外 capability 的宿主文件共享 daemon。控制通道使用 virtio-serial。ProfileFixture 明确传入 `-nic none`；Fetch 使用直接 QEMU user networking；Build 根据配置使用 `-nic none` 或直接 QEMU user networking。
 
-Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，删除 overlay 与控制 Socket 后，才把日志和输出原子移动到 completed 区。超时、QEMU 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录等待后续 TransferCapability 接管。Controller 对账时同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
+Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新核对 Job、Attempt、Revision、任务类型以及每个输出的安全相对路径、大小和摘要，删除 overlay 与控制 Socket 后，才把日志和输出原子移动到 completed 区。超时、QEMU 失败、取消和结果不匹配都会终止子进程并清理 staging/runtime；成功目录只保留到依赖它的 ReleaseBatch 终止。Controller 在反向租约中明确返回可释放的 Attempt UUID：Profile fixture、失败任务和已经 published/failed/superseded 批次的工作区由 Builder 幂等删除，Journal 终态继续保留。活动审计或构建仍引用的 Fetch/依赖产物不会按时间猜测清理。Controller 对账同时匹配 Attempt ID 和 generation，拒绝迟到或未知结果。
 
 Controller 对基础设施错误和 `FETCH_DEPENDENCY_DOWNLOAD_FAILED` 自动创建新 Attempt：`BUILDER_INFRASTRUCTURE`、VM 超时/异常、Guest 结果缺失、结果暂不可读、Worker 不可达或 Fetch Guest 的 pacman 下载耗尽。Profile 固定的是基础 packages 名称列表和 pacman、makepkg、systemd、Guest Agent 等配置，不固定软件包版本。共享 `root.qcow2` 只是启动缓存；Fetch Guest 每次从当前镜像刷新数据库，并用同一次 pacman 事务下载完整系统升级集合以及本次 `depends`、`makedepends`、`checkdepends` 的最新闭包。Build Guest 在任务私有 overlay 中离线安装整个集合后再运行 makepkg，因此基础系统和构建依赖都跟随任务开始时的镜像上游，同时不让并发任务共同修改启动缓存。该下载最多尝试三次，全部失败后才报告专用错误码；其他 `GUEST_FETCH_FAILED` 仍视为确定性错误，不自动循环。Build 日志出现 DNS、路由、连接失败或 NuGet `NU1301` 时单独标记 `NETWORK_DURING_BUILD`，同样不自动循环构建。generation 0 和 1 分别在 5 秒、10 秒后重试；generation 2 再失败即终止，因此一个 Fetch Job 最多三个 Attempt。输入摘要、Profile、身份、审计和确定性 Build 错误不会自动循环。SSH 提交或对账状态不明确时，Job 先进入 `uncertain`，三十分钟内不重新派发；届时再次查询 Journal，仍不可达才按同一 generation 上限重试，耗尽后打开稳定 fingerprint 告警。
 
-Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日志、Guest 结构化错误和 makepkg 日志复制到小型 `failed/<attempt>` 诊断目录，再删除 overlay、控制 Socket和临时输入；成功时日志随 completed 结果保存，overlay 同样先删除。这样不会为排错长期保留大型写时复制磁盘，也不会把 Guest 错误压缩成无法定位的 `VM_FAILED`。
+Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日志、Guest 结构化错误和 makepkg 日志复制到小型 `failed/<attempt>` 诊断目录，再删除 overlay、控制 Socket和临时输入；成功时日志暂随 completed 结果保存，overlay 同样先删除。Controller 持久化有界日志和最终结果、并确认批次终止后释放本地 completed/failed/staging/runtime 目录，避免桌面 Builder 逐次累积源码与二进制副本，也不会把 Guest 错误压缩成无法定位的 `VM_FAILED`。
 
 在 Builder 间 `TransferCapability` 传输尚未完成前，一个 ReleaseBatch 固定到第一个接单的 Builder。审计批准后的 Build Job 必须引用该节点上已经完成的 Fetch Attempt；Builder 再次验证 FetchResult、Source Manifest 和 completed 文件树后，才将 prepared source 复制进新的只读输入目录。Build VM 即使启用公网，也不能省略或替代已审计的 Fetch 输入。后续跨 Builder 调度只能通过同一摘要约束的 rsync Capability 扩展，不能绕过这条不变量。
 

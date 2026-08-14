@@ -525,7 +525,42 @@ async fn reverse_poll_once(
             std::fs::remove_dir_all(directory)?;
         }
     }
+    for attempt_id in &lease.releasable_attempts {
+        cleanup_releasable_attempt(worker, *attempt_id).await?;
+    }
     Ok(lease.next_poll_seconds.clamp(2, 60))
+}
+
+async fn cleanup_releasable_attempt(worker: &Worker, attempt_id: Uuid) -> anyhow::Result<()> {
+    let row = sqlx::query("SELECT status, workspace_cleaned_at FROM attempts WHERE attempt_id = ?")
+        .bind(attempt_id.to_string())
+        .fetch_optional(&worker.database)
+        .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if row
+        .get::<Option<String>, _>("workspace_cleaned_at")
+        .is_some()
+    {
+        return Ok(());
+    }
+    let status: String = row.get("status");
+    if !matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+        bail!("Controller 请求释放非终态 Attempt：{attempt_id}");
+    }
+    for state in ["completed", "failed", "staging", "runtime"] {
+        let directory = worker.jobs_dir.join(state).join(attempt_id.to_string());
+        if directory.exists() {
+            std::fs::remove_dir_all(directory)?;
+        }
+    }
+    sqlx::query("UPDATE attempts SET workspace_cleaned_at = ? WHERE attempt_id = ?")
+        .bind(Utc::now())
+        .bind(attempt_id.to_string())
+        .execute(&worker.database)
+        .await?;
+    Ok(())
 }
 
 async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Result<()> {
@@ -703,7 +738,7 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         "CREATE TABLE IF NOT EXISTS attempts(\
          job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
          envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
-         result_sha256 TEXT, spec_json TEXT, failure_code TEXT, reported_at TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
+         result_sha256 TEXT, spec_json TEXT, failure_code TEXT, reported_at TEXT, workspace_cleaned_at TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
     )
     .execute(&pool)
     .await?;
@@ -711,6 +746,7 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         "ALTER TABLE attempts ADD COLUMN spec_json TEXT",
         "ALTER TABLE attempts ADD COLUMN failure_code TEXT",
         "ALTER TABLE attempts ADD COLUMN reported_at TEXT",
+        "ALTER TABLE attempts ADD COLUMN workspace_cleaned_at TEXT",
     ] {
         if let Err(error) = sqlx::query(statement).execute(&pool).await
             && !error.to_string().contains("duplicate column name")
@@ -1863,10 +1899,7 @@ async fn materialize_release_inbox(
         }
         let source = source.context("Release Artifact 没有已验证的 TransferCapability")?;
         let metadata = std::fs::symlink_metadata(&source)?;
-        if !metadata.file_type().is_file()
-            || metadata.len() != artifact.size
-            || file_sha256(&source)? != artifact.sha256
-        {
+        if !metadata.file_type().is_file() || metadata.len() != artifact.size {
             bail!("Release Artifact 落地内容不匹配：{}", artifact.path);
         }
         let target = staging.join(&artifact.path);
@@ -1906,10 +1939,7 @@ async fn materialize_release_inbox(
         }
         let source = source.context("Release 证据文件没有已验证的 TransferCapability")?;
         let metadata = std::fs::symlink_metadata(&source)?;
-        if !metadata.file_type().is_file()
-            || metadata.len() != evidence.size
-            || file_sha256(&source)? != evidence.sha256
-        {
+        if !metadata.file_type().is_file() || metadata.len() != evidence.size {
             bail!("Release 证据文件落地内容不匹配：{}", evidence.path);
         }
         let target = staging.join(&evidence.path);
@@ -2352,11 +2382,7 @@ fn atomic_link_identical_file(
     target: &Path,
     expected_sha256: &str,
 ) -> anyhow::Result<()> {
-    if !source.is_file()
-        || !target.is_file()
-        || file_sha256(source)? != expected_sha256
-        || file_sha256(target)? != expected_sha256
-    {
+    if !source.is_file() || !target.is_file() {
         bail!("拒绝合并内容不一致的仓库文件：{}", target.display());
     }
     let source_metadata = std::fs::metadata(source)?;
@@ -2366,6 +2392,13 @@ fn atomic_link_identical_file(
         && source_metadata.ino() == target_metadata.ino()
     {
         return Ok(());
+    }
+    if source_metadata.len() != target_metadata.len()
+        || source_metadata.len() == 0
+        || file_sha256(source)? != expected_sha256
+        || file_sha256(target)? != expected_sha256
+    {
+        bail!("拒绝合并内容不一致的仓库文件：{}", target.display());
     }
     let temporary = target.with_file_name(format!(
         ".{}.link",
@@ -2480,6 +2513,7 @@ fn verify_and_publish_release(
         bail!("Signer 输出的 ReleaseAuthorization 与 Controller Envelope 不一致");
     }
     let mut package_names = std::collections::BTreeSet::new();
+    let mut changed_artifact_paths = std::collections::BTreeSet::new();
     for artifact in &authorization.artifacts {
         aursmith_protocol::validate_relative_path(&artifact.path)?;
         let file_name = Path::new(&artifact.path)
@@ -2501,6 +2535,7 @@ fn verify_and_publish_release(
                     size: artifact.size,
                 },
             )?;
+            changed_artifact_paths.insert(artifact.path.clone());
         } else {
             let hot = worker
                 .repository_dir
@@ -2525,6 +2560,7 @@ fn verify_and_publish_release(
             },
         )?;
         validate_repository_keyring_package(worker, &signed.join(&keyring.path), keyring)?;
+        changed_artifact_paths.insert(keyring.path.clone());
     }
 
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
@@ -2585,7 +2621,7 @@ fn verify_and_publish_release(
     std::fs::rename(&staging, &committed)?;
     sync_directory(&releases_root)?;
 
-    activate_committed_release(worker, &committed)?;
+    activate_incremental_release(worker, &committed, &manifest, &changed_artifact_paths)?;
     Ok(manifest_sha256)
 }
 
@@ -2804,6 +2840,44 @@ fn activate_committed_release(
             )?;
         }
     }
+    activate_repository_database_links(worker, &manifest)
+}
+
+fn activate_incremental_release(
+    worker: &Worker,
+    committed: &Path,
+    manifest: &ReleaseManifest,
+    changed_artifact_paths: &BTreeSet<String>,
+) -> anyhow::Result<ReleaseManifest> {
+    if manifest.writer_epoch != worker.writer_epoch {
+        bail!("Release writer epoch 与当前 Publisher 不一致");
+    }
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
+    std::fs::create_dir_all(&arch_root)?;
+    for artifact in manifest
+        .artifacts
+        .iter()
+        .chain(manifest.repository_keyring.iter())
+    {
+        let committed_package = committed.join(&artifact.path);
+        let committed_signature = committed.join(format!("{}.sig", artifact.path));
+        let hot_package = arch_root.join(&artifact.path);
+        let hot_signature = arch_root.join(format!("{}.sig", artifact.path));
+        if changed_artifact_paths.contains(&artifact.path) {
+            copy_new_or_verify(&committed_package, &hot_package)?;
+            copy_new_or_verify(&committed_signature, &hot_signature)?;
+        } else if !hot_package.is_file() || !hot_signature.is_file() {
+            bail!("增量 Release 缺少已提交的复用 Artifact：{}", artifact.path);
+        }
+    }
+    activate_repository_database_links(worker, manifest)
+}
+
+fn activate_repository_database_links(
+    worker: &Worker,
+    manifest: &ReleaseManifest,
+) -> anyhow::Result<ReleaseManifest> {
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
     let release_id = manifest.release_id;
     let repository_name = &manifest.repository_name;
     atomic_release_link(
@@ -2836,7 +2910,7 @@ fn activate_committed_release(
         ),
     )?;
     sync_directory(&arch_root)?;
-    Ok(manifest)
+    Ok(manifest.clone())
 }
 
 fn verify_signed_entry(

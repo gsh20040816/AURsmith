@@ -6,6 +6,7 @@ use chrono::Utc;
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File},
     io::Read,
@@ -118,7 +119,7 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir_all(&staging)?;
-    let mut package_paths = Vec::new();
+    let mut changed_package_paths = Vec::new();
     for artifact in &authorization.artifacts {
         let source = entry.path().join(&artifact.path);
         if source.is_file() {
@@ -129,22 +130,23 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
             );
             fs::copy(source, &destination)?;
             gpg_sign(cli, &destination)?;
-            package_paths.push(destination);
+            changed_package_paths.push(destination);
         } else {
-            let reusable = find_reusable_package(cli, artifact)?;
-            package_paths.push(reusable);
+            find_reusable_package(cli, artifact)?;
         }
     }
     let repository_keyring = if authorization.include_repository_keyring {
-        let artifact = if let Some(artifact) = reusable_repository_keyring(cli, &staging)? {
-            artifact
-        } else {
-            let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
-            gpg_sign(cli, &staging.join(&artifact.path))?;
-            artifact
-        };
-        let path = staging.join(&artifact.path);
-        package_paths.push(path);
+        let (artifact, changed) =
+            if let Some(artifact) = reusable_repository_keyring(cli, &staging)? {
+                (artifact, false)
+            } else {
+                let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
+                gpg_sign(cli, &staging.join(&artifact.path))?;
+                (artifact, true)
+            };
+        if changed {
+            changed_package_paths.push(staging.join(&artifact.path));
+        }
         Some(artifact)
     } else {
         None
@@ -159,17 +161,24 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         fs::copy(source, &destination)?;
         evidence_files.push(file_entry_with_path(&destination, evidence.path.clone())?);
     }
-    package_paths.sort();
+    changed_package_paths.sort();
     let database = staging.join(format!("{}.db.tar.gz", authorization.repository_name));
     let files_database = staging.join(format!("{}.files.tar.gz", authorization.repository_name));
-    if package_paths.is_empty() {
-        create_empty_repository_database(&database)?;
-        create_empty_repository_database(&files_database)?;
-    } else {
-        let mut repo_arguments = vec![database.as_os_str().to_owned()];
-        repo_arguments.extend(package_paths.iter().map(|path| path.as_os_str().to_owned()));
-        run_checked("/usr/bin/repo-add", &repo_arguments)?;
-    }
+    let had_baseline = copy_current_repository_databases(
+        cli,
+        &authorization.repository_name,
+        &database,
+        &files_database,
+    )?;
+    let expected_packages =
+        expected_repository_packages(&authorization, repository_keyring.as_ref())?;
+    update_repository_databases(
+        &database,
+        &files_database,
+        had_baseline,
+        &changed_package_paths,
+        &expected_packages,
+    )?;
     gpg_sign(cli, &database)?;
     gpg_sign(cli, &files_database)?;
     let inspection_source = entry.path().join("artifact-inspections.json");
@@ -526,6 +535,153 @@ fn validate_authorization(
     Ok(())
 }
 
+fn copy_current_repository_databases(
+    cli: &Cli,
+    repository_name: &str,
+    database: &Path,
+    files_database: &Path,
+) -> anyhow::Result<bool> {
+    let root = cli.repository.join("x86_64");
+    let current_database = root.join(format!("{repository_name}.db"));
+    let current_database_signature = root.join(format!("{repository_name}.db.sig"));
+    let current_files = root.join(format!("{repository_name}.files"));
+    let current_files_signature = root.join(format!("{repository_name}.files.sig"));
+    let present = [
+        &current_database,
+        &current_database_signature,
+        &current_files,
+        &current_files_signature,
+    ]
+    .map(|path| path.is_file());
+    if present.iter().all(|value| !value) {
+        return Ok(false);
+    }
+    if !present.iter().all(|value| *value) {
+        bail!("当前仓库数据库或签名不完整，拒绝增量发布");
+    }
+    gpg_verify(cli, &current_database, &current_database_signature)?;
+    gpg_verify(cli, &current_files, &current_files_signature)?;
+    fs::copy(current_database, database)?;
+    fs::copy(current_files, files_database)?;
+    Ok(true)
+}
+
+fn expected_repository_packages(
+    authorization: &ReleaseAuthorization,
+    repository_keyring: Option<&ArtifactRecord>,
+) -> anyhow::Result<BTreeMap<String, (String, String)>> {
+    let mut expected = BTreeMap::new();
+    for artifact in authorization
+        .artifacts
+        .iter()
+        .chain(repository_keyring.into_iter())
+    {
+        let name = artifact
+            .package_name
+            .as_ref()
+            .context("Release Artifact 缺少包名")?;
+        let version = artifact
+            .package_version
+            .as_ref()
+            .context("Release Artifact 缺少版本")?;
+        if expected
+            .insert(name.clone(), (version.clone(), artifact.path.clone()))
+            .is_some()
+        {
+            bail!("Release 包含重复包名：{name}");
+        }
+    }
+    Ok(expected)
+}
+
+fn update_repository_databases(
+    database: &Path,
+    files_database: &Path,
+    had_baseline: bool,
+    changed_package_paths: &[PathBuf],
+    expected_packages: &BTreeMap<String, (String, String)>,
+) -> anyhow::Result<()> {
+    if had_baseline {
+        let current_packages = read_repository_packages(database)?;
+        let removals = current_packages
+            .keys()
+            .filter(|name| !expected_packages.contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !removals.is_empty() {
+            let mut arguments = vec![database.as_os_str().to_owned()];
+            arguments.extend(removals.into_iter().map(Into::into));
+            run_checked("/usr/bin/repo-remove", &arguments)?;
+        }
+    } else if expected_packages.is_empty() {
+        create_empty_repository_database(database)?;
+        create_empty_repository_database(files_database)?;
+    } else if changed_package_paths.is_empty() {
+        bail!("仓库没有当前数据库，且 Release 没有可用于初始化的新增软件包");
+    }
+    if !changed_package_paths.is_empty() {
+        let mut arguments = vec![database.as_os_str().to_owned()];
+        arguments.extend(
+            changed_package_paths
+                .iter()
+                .map(|path| path.as_os_str().to_owned()),
+        );
+        run_checked("/usr/bin/repo-add", &arguments)?;
+    }
+    validate_repository_packages(database, expected_packages)
+}
+
+fn read_repository_packages(database: &Path) -> anyhow::Result<BTreeMap<String, (String, String)>> {
+    let output = Command::new("/usr/bin/bsdtar")
+        .args(["-xOf"])
+        .arg(database)
+        .args(["--include", "*/desc"])
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("无法读取仓库数据库：{}", database.display());
+    }
+    let text = String::from_utf8(output.stdout)?;
+    let mut packages = BTreeMap::new();
+    for record in text.split("%FILENAME%\n").skip(1) {
+        let file_name = record.lines().next().context("仓库条目缺少文件名")?;
+        let name = repository_field(record, "%NAME%")?;
+        let version = repository_field(record, "%VERSION%")?;
+        if packages
+            .insert(name.to_owned(), (version.to_owned(), file_name.to_owned()))
+            .is_some()
+        {
+            bail!("仓库数据库包含重复包名：{name}");
+        }
+    }
+    Ok(packages)
+}
+
+fn repository_field<'a>(record: &'a str, field: &str) -> anyhow::Result<&'a str> {
+    record
+        .split_once(&format!("{field}\n"))
+        .and_then(|(_, value)| value.lines().next())
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("仓库条目缺少 {field}"))
+}
+
+fn validate_repository_packages(
+    database: &Path,
+    expected: &BTreeMap<String, (String, String)>,
+) -> anyhow::Result<()> {
+    let actual = read_repository_packages(database)?;
+    if &actual != expected {
+        let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
+        let actual_names = actual.keys().cloned().collect::<BTreeSet<_>>();
+        bail!(
+            "增量仓库数据库与授权清单不一致：缺少 {:?}，多出 {:?}",
+            expected_names.difference(&actual_names).collect::<Vec<_>>(),
+            actual_names.difference(&expected_names).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
 fn create_empty_repository_database(path: &Path) -> anyhow::Result<()> {
     run_checked(
         "/usr/bin/bsdtar",
@@ -575,6 +731,20 @@ fn gpg_sign(cli: &Cli, path: &Path) -> anyhow::Result<()> {
             "--batch".into(),
             "--yes".into(),
             "--detach-sign".into(),
+            path.as_os_str().into(),
+        ],
+    )
+}
+
+fn gpg_verify(cli: &Cli, path: &Path, signature: &Path) -> anyhow::Result<()> {
+    run_checked(
+        "/usr/bin/gpg",
+        &[
+            "--homedir".into(),
+            cli.gpg_home.as_os_str().into(),
+            "--batch".into(),
+            "--verify".into(),
+            signature.as_os_str().into(),
             path.as_os_str().into(),
         ],
     )
@@ -640,6 +810,27 @@ mod tests {
             gpg_private_key: root.join("unused"),
             gpg_home: root.join("gnupg"),
         }
+    }
+
+    fn fixture_package(root: &Path, name: &str, version: &str) -> PathBuf {
+        let source = root.join(format!("source-{name}-{version}"));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join(".PKGINFO"),
+            format!("pkgname = {name}\npkgver = {version}\narch = any\n"),
+        )
+        .unwrap();
+        let package = root.join(format!("{name}-{version}-any.pkg.tar.zst"));
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["-cf"])
+            .arg(&package)
+            .arg("-C")
+            .arg(source)
+            .arg(".PKGINFO")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        package
     }
 
     #[test]
@@ -782,6 +973,54 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert!(fs::metadata(database).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn incremental_repository_update_only_adds_changes_and_removes_absent_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("aursmith.db.tar.gz");
+        let files_database = root.path().join("aursmith.files.tar.gz");
+        let old = fixture_package(root.path(), "old", "1-1");
+        let keep_v1 = fixture_package(root.path(), "keep", "1-1");
+        run_checked(
+            "/usr/bin/repo-add",
+            &[
+                database.as_os_str().to_owned(),
+                old.as_os_str().to_owned(),
+                keep_v1.as_os_str().to_owned(),
+            ],
+        )
+        .unwrap();
+
+        let keep_v2 = fixture_package(root.path(), "keep", "2-1");
+        let added = fixture_package(root.path(), "added", "1-1");
+        let expected = BTreeMap::from([
+            (
+                "added".to_owned(),
+                (
+                    "1-1".to_owned(),
+                    added.file_name().unwrap().to_string_lossy().into_owned(),
+                ),
+            ),
+            (
+                "keep".to_owned(),
+                (
+                    "2-1".to_owned(),
+                    keep_v2.file_name().unwrap().to_string_lossy().into_owned(),
+                ),
+            ),
+        ]);
+        update_repository_databases(
+            &database,
+            &files_database,
+            true,
+            &[keep_v2, added],
+            &expected,
+        )
+        .unwrap();
+
+        assert_eq!(read_repository_packages(&database).unwrap(), expected);
+        assert!(files_database.is_file());
     }
 
     #[test]

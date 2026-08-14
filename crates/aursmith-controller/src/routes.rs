@@ -1307,16 +1307,34 @@ async fn reverse_worker_poll(
         .bind(status["profiles"].to_string()).bind(status.to_string())
         .bind(Utc::now()).bind(Utc::now()).bind(poll.worker_id.to_string())
         .execute(&state.database).await.map_err(ApiError::internal)?;
+    let releasable_attempts = releasable_reverse_attempts(&state.database, poll.worker_id).await?;
     let job = crate::scheduler::lease_reverse_job(&state, poll.worker_id).await?;
     let transfer = crate::scheduler::lease_reverse_transfer(&state, poll.worker_id).await?;
     Ok(Json(ReverseWorkerLease {
         worker_id: poll.worker_id,
         acknowledged_attempts,
+        releasable_attempts,
         job,
         transfer,
         issued_at: Utc::now(),
         next_poll_seconds: 15,
     }))
+}
+
+async fn releasable_reverse_attempts(
+    database: &SqlitePool,
+    worker_id: Uuid,
+) -> Result<Vec<Uuid>, ApiError> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT attempts.id FROM attempts JOIN jobs ON jobs.id = attempts.job_id LEFT JOIN release_batches ON release_batches.id = jobs.batch_id WHERE jobs.worker_id = ? AND attempts.status IN ('succeeded', 'failed', 'cancelled') AND (jobs.kind = 'profile_fixture' OR jobs.status IN ('failed', 'cancelled') OR release_batches.state IN ('published', 'fetch_failed', 'build_failed', 'publish_failed', 'transfer_failed', 'superseded')) ORDER BY attempts.finished_at, attempts.id LIMIT 256",
+    )
+    .bind(worker_id.to_string())
+    .fetch_all(database)
+    .await
+    .map_err(ApiError::internal)?
+    .into_iter()
+    .filter_map(|value| value.parse().ok())
+    .collect())
 }
 
 async fn list_workers(
@@ -2057,6 +2075,52 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let lease: ReverseWorkerLease = serde_json::from_slice(&body).unwrap();
         assert!(lease.acknowledged_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reverse_worker_releases_only_terminal_batch_workspaces() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let worker_id = Uuid::new_v4();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, profiles_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', '[]', 'reverse', ?, ?)")
+            .bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+        let active_batch = Uuid::new_v4();
+        let published_batch = Uuid::new_v4();
+        for (id, state) in [(active_batch, "building"), (published_batch, "published")] {
+            sqlx::query("INSERT INTO release_batches(id, state, graph_json, created_at, updated_at) VALUES (?, ?, '{}', ?, ?)")
+                .bind(id.to_string()).bind(state).bind(now).bind(now).execute(&database).await.unwrap();
+        }
+        let active_attempt = Uuid::new_v4();
+        let published_attempt = Uuid::new_v4();
+        let failed_attempt = Uuid::new_v4();
+        let fixture_attempt = Uuid::new_v4();
+        for (batch, job_status, kind, attempt) in [
+            (Some(active_batch), "succeeded", "build", active_attempt),
+            (
+                Some(published_batch),
+                "succeeded",
+                "build",
+                published_attempt,
+            ),
+            (Some(active_batch), "failed", "build", failed_attempt),
+            (None, "succeeded", "profile_fixture", fixture_attempt),
+        ] {
+            let job_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO jobs(id, batch_id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', ?, ?, 1, ?, '[]', '[]', '[]', ?, ?)")
+                .bind(job_id.to_string()).bind(batch.map(|value| value.to_string())).bind(worker_id.to_string())
+                .bind(job_status).bind(kind).bind(now).bind(now).execute(&database).await.unwrap();
+            sqlx::query("INSERT INTO attempts(id, job_id, generation, token_sha256, status, finished_at) VALUES (?, ?, 0, ?, ?, ?)")
+                .bind(attempt.to_string()).bind(job_id.to_string()).bind(hex::encode(Sha256::digest(attempt.as_bytes())))
+                .bind(job_status).bind(now).execute(&database).await.unwrap();
+        }
+
+        let releasable = releasable_reverse_attempts(&database, worker_id)
+            .await
+            .unwrap();
+        assert!(!releasable.contains(&active_attempt));
+        assert!(releasable.contains(&published_attempt));
+        assert!(releasable.contains(&failed_attempt));
+        assert!(releasable.contains(&fixture_attempt));
     }
 
     #[tokio::test]

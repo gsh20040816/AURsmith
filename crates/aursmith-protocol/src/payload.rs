@@ -242,6 +242,8 @@ pub struct ReverseWorkerLease {
     #[serde(default)]
     pub acknowledged_attempts: Vec<Uuid>,
     #[serde(default)]
+    pub releasable_attempts: Vec<Uuid>,
+    #[serde(default)]
     pub job: Option<SignedEnvelope>,
     #[serde(default)]
     pub transfer: Option<SignedEnvelope>,
@@ -427,6 +429,7 @@ mod tests {
         let lease = ReverseWorkerLease {
             worker_id,
             acknowledged_attempts: Vec::new(),
+            releasable_attempts: Vec::new(),
             job: Some(envelope.clone()),
             transfer: None,
             issued_at: Utc::now(),

@@ -68,6 +68,8 @@
 - ADR-064（已替换）：namcap 与 Publisher 大型 ELF 检查均由 ADR-065 删除。
 - ADR-065：第一版遵循本地 makepkg 工作流。Agent 审计通过后，Guest 运行 makepkg；成功产生预期 split outputs 后直接上传。Publisher 仅核对授权、Attempt、文件大小和 SHA-256，Signer 仅核对 ReleaseAuthorization、摘要并调用官方 repo-add/GPG，不再扫描 ELF、INSTALL、hook、systemd、setuid、capability、内核模块或执行 namcap。首次发布不根据可能过时的 `.SRCINFO` 改写 PKGBUILD pkgrel；只有同一上游版本的本地重建才改工作副本。普通 Profile 与产物目录采用常见 0755/0644，只有 GPG、SSH、API key 等秘密保持 0700/0600。
 - ADR-066：Builder 与 pacoloco 默认使用中国科学技术大学 Arch Linux 镜像。Profile 固定基础 packages 名称列表及配置文件，不冻结软件包版本；签名的 `root.qcow2` 只是可验证的启动缓存。Fetch Guest 每次从当前镜像下载完整系统升级集合及本次 `depends`、`makedepends`、`checkdepends` 的最新闭包，Build Guest 在任务私有 overlay 中离线安装后构建。每个 Fetch Attempt 内最多尝试三次，Controller 对专用下载失败最多再调度两次；全部 pacman 输出进入 `fetch.log`。有限重试只处理外部获取阶段，不把确定性 Build、审计或输入错误伪装成瞬时故障。
+- ADR-067：ReleaseAuthorization 保持完整最终仓库清单，但发布执行采用成熟的增量数据库流程。Signer 验证并复制当前已签名 db/files，只对目标清单差集调用官方 `repo-remove`，只把本批次变化包交给官方 `repo-add`，最后用小型 desc 元数据对账完整授权并重新签名。Publisher 只在 rsync 接收边界和 Signer 输出边界读取变化大文件；已提交的未变化包通过 Manifest 信任链和硬链接复用，不在每次 Release 重复哈希或验签。回滚、恢复和周期完整巡检仍执行全量验证，因为它们不是高频发布路径。
+- ADR-068：Builder completed/failed 工作区是临时计算数据，不是归档。Controller 只有在 Profile fixture 已终止、Job 已失败，或对应 ReleaseBatch 已 published/failed/superseded 后，才通过反向租约返回明确的可释放 Attempt UUID；Builder 幂等删除该 UUID 的 completed、failed、staging 和 runtime 目录，但保留 SQLite Journal 终态。活动审计、人工处置和依赖构建仍可能读取的 Fetch/Build 输出不得按文件年龄猜测清理。
 
 ## 已拒绝
 
