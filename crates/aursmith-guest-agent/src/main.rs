@@ -39,7 +39,10 @@ fn main() {
 }
 
 fn guest_error_code(error: &anyhow::Error) -> &'static str {
-    if error.to_string().contains("官方依赖下载连续 3 次失败") {
+    if error
+        .to_string()
+        .contains("完整系统与构建依赖下载连续 3 次失败")
+    {
         "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
     } else {
         "GUEST_COMMAND_FAILED"
@@ -403,25 +406,27 @@ fn download_official_dependencies(
     let cache_text = cache.to_string_lossy().into_owned();
     let mut downloaded = false;
     for attempt in 1..=3_u8 {
-        let refresh = pacman_output(&["-Syy", "--noconfirm"], &[])?;
-        append_pacman_log(log, "刷新仓库数据库", attempt, &refresh)?;
-        if refresh.status.success() {
-            let download = pacman_output(
-                &["-Sw", "--noconfirm", "--needed", "--cachedir", &cache_text],
-                &names,
-            )?;
-            append_pacman_log(log, "下载官方依赖", attempt, &download)?;
-            if download.status.success() {
-                downloaded = true;
-                break;
-            }
+        let download = pacman_output(
+            &[
+                "-Syyuw",
+                "--noconfirm",
+                "--needed",
+                "--cachedir",
+                &cache_text,
+            ],
+            &names,
+        )?;
+        append_pacman_log(log, "同步完整系统与构建依赖", attempt, &download)?;
+        if download.status.success() {
+            downloaded = true;
+            break;
         }
         if attempt < 3 {
             std::thread::sleep(Duration::from_secs(u64::from(attempt) * 2));
         }
     }
     if !downloaded {
-        bail!("官方依赖下载连续 3 次失败，详情见 fetch.log");
+        bail!("完整系统与构建依赖下载连续 3 次失败，详情见 fetch.log");
     }
     let mut resolved = Vec::new();
     for item in fs::read_dir(&cache)? {
@@ -1027,7 +1032,7 @@ mod tests {
     fn only_exhausted_dependency_downloads_get_the_retryable_guest_code() {
         assert_eq!(
             guest_error_code(&anyhow::anyhow!(
-                "官方依赖下载连续 3 次失败，详情见 fetch.log"
+                "完整系统与构建依赖下载连续 3 次失败，详情见 fetch.log"
             )),
             "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
         );

@@ -67,7 +67,7 @@
 - ADR-063（已撤回）：不额外执行 `.SRCINFO` 与 `makepkg --printsrcinfo` 对账；本地 makepkg 能构建时平台按 PKGBUILD 实际行为构建。
 - ADR-064（已替换）：namcap 与 Publisher 大型 ELF 检查均由 ADR-065 删除。
 - ADR-065：第一版遵循本地 makepkg 工作流。Agent 审计通过后，Guest 运行 makepkg；成功产生预期 split outputs 后直接上传。Publisher 仅核对授权、Attempt、文件大小和 SHA-256，Signer 仅核对 ReleaseAuthorization、摘要并调用官方 repo-add/GPG，不再扫描 ELF、INSTALL、hook、systemd、setuid、capability、内核模块或执行 namcap。首次发布不根据可能过时的 `.SRCINFO` 改写 PKGBUILD pkgrel；只有同一上游版本的本地重建才改工作副本。普通 Profile 与产物目录采用常见 0755/0644，只有 GPG、SSH、API key 等秘密保持 0700/0600。
-- ADR-066：Builder 与 pacoloco 默认使用中国科学技术大学 Arch Linux 镜像。不可变 Profile 仍记录实际镜像地址；Fetch Guest 每次下载官方依赖前刷新 pacman 仓库数据库，避免滚动仓库已删除旧版本而 Profile 仍持有旧数据库。每个 Fetch Attempt 内最多尝试三次，Controller 对失败 Attempt 最多再调度两次；所有尝试和 pacman 输出进入 `fetch.log`。有限重试只处理外部获取阶段，不把确定性 Build、审计或输入错误伪装成瞬时故障。
+- ADR-066：Builder 与 pacoloco 默认使用中国科学技术大学 Arch Linux 镜像。Profile 固定基础 packages 名称列表及配置文件，不冻结软件包版本；签名的 `root.qcow2` 只是可验证的启动缓存。Fetch Guest 每次从当前镜像下载完整系统升级集合及本次 `depends`、`makedepends`、`checkdepends` 的最新闭包，Build Guest 在任务私有 overlay 中离线安装后构建。每个 Fetch Attempt 内最多尝试三次，Controller 对专用下载失败最多再调度两次；全部 pacman 输出进入 `fetch.log`。有限重试只处理外部获取阶段，不把确定性 Build、审计或输入错误伪装成瞬时故障。
 
 ## 已拒绝
 
