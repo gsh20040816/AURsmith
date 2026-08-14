@@ -25,7 +25,7 @@
 | W01 | 通过 Docker Compose 部署所有 AURsmith 服务 | Compose 策略测试 |
 | W02 | Builder 与 Publisher 可部署在不同主机；家庭 Builder 只主动连接公网节点 | 分布式冒烟测试 |
 | W03 | 公网节点使用固定 OpenSSH host key 和受限 rsync；家庭网络 Builder 只允许主动连接公网节点 | 传输测试 |
-| W04 | 使用 Attempt、Journal 和迟到结果拒绝保证任务幂等；批次终止后由 Controller 明确授权 Builder 释放临时工作区 | Worker 与存储回收测试 |
+| W04 | 使用 Attempt、Journal 和迟到结果拒绝保证任务幂等；成功 Attempt 在批次终止后由 Controller 明确授权释放，失败或取消 Attempt 在上报确认后由 Builder 本地释放 | Worker 与存储回收测试 |
 | W05 | 支持多 Builder 和单活动 Publisher；第一版不部署独立 Archiver | 调度测试 |
 | W06 | Builder 不开放公网入站端口；它以持久身份签名，通过 HTTPS 长轮询领取任务和上报结果，并以一次性 Capability 主动推送产物 | 反向 Worker 端到端测试 |
 | R01 | 把产物视为不可信内容，仅允许离线 Signer 签名 | Signer 测试 |

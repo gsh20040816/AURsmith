@@ -501,6 +501,7 @@ async fn reverse_poll_once(
             .execute(&worker.database)
             .await?;
     }
+    cleanup_reported_unsuccessful_attempts(worker).await?;
     if let Some(job) = lease.job {
         let accepted = submit(worker, job).await;
         if !accepted.ok {
@@ -529,6 +530,27 @@ async fn reverse_poll_once(
         cleanup_releasable_attempt(worker, *attempt_id).await?;
     }
     Ok(lease.next_poll_seconds.clamp(2, 60))
+}
+
+async fn cleanup_reported_unsuccessful_attempts(worker: &Worker) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT attempt_id, status, reported_at FROM attempts WHERE workspace_cleaned_at IS NULL AND status IN ('failed', 'cancelled')",
+    )
+    .fetch_all(&worker.database)
+    .await?;
+    for row in rows {
+        let status: String = row.get("status");
+        let reported_at: Option<String> = row.get("reported_at");
+        if attempt_can_be_released_locally(&status, reported_at.as_deref()) {
+            let attempt_id: String = row.get("attempt_id");
+            cleanup_releasable_attempt(worker, attempt_id.parse()?).await?;
+        }
+    }
+    Ok(())
+}
+
+fn attempt_can_be_released_locally(status: &str, reported_at: Option<&str>) -> bool {
+    reported_at.is_some() && matches!(status, "failed" | "cancelled")
 }
 
 async fn cleanup_releasable_attempt(worker: &Worker, attempt_id: Uuid) -> anyhow::Result<()> {
@@ -3718,6 +3740,20 @@ mod transfer_tests {
         assert!(validate_source_proxy_url("http://source-proxy:3128").is_ok());
         assert!(validate_source_proxy_url("http://user:secret@source-proxy:3128").is_err());
         assert!(validate_source_proxy_url("http://source-proxy:3128/?target=private").is_err());
+    }
+
+    #[test]
+    fn reported_failed_attempts_do_not_wait_for_release_authorization() {
+        assert!(attempt_can_be_released_locally("failed", Some("reported")));
+        assert!(attempt_can_be_released_locally(
+            "cancelled",
+            Some("reported")
+        ));
+        assert!(!attempt_can_be_released_locally("failed", None));
+        assert!(!attempt_can_be_released_locally(
+            "succeeded",
+            Some("reported")
+        ));
     }
 
     #[test]

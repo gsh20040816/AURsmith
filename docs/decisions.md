@@ -70,6 +70,7 @@
 - ADR-066：Builder 与 pacoloco 默认使用中国科学技术大学 Arch Linux 镜像。Profile 固定基础 packages 名称列表及配置文件，不冻结软件包版本；签名的 `root.qcow2` 只是可验证的启动缓存。Fetch Guest 每次从当前镜像下载完整系统升级集合及本次 `depends`、`makedepends`、`checkdepends` 的最新闭包，Build Guest 在任务私有 overlay 中离线安装后构建。每个 Fetch Attempt 内最多尝试三次，Controller 对专用下载失败最多再调度两次；全部 pacman 输出进入 `fetch.log`。有限重试只处理外部获取阶段，不把确定性 Build、审计或输入错误伪装成瞬时故障。
 - ADR-067：ReleaseAuthorization 保持完整最终仓库清单，但发布执行采用成熟的增量数据库流程。Signer 验证并复制当前已签名 db/files，只对目标清单差集调用官方 `repo-remove`，只把本批次变化包交给官方 `repo-add`，最后用小型 desc 元数据对账完整授权并重新签名。Publisher 只在 rsync 接收边界和 Signer 输出边界读取变化大文件；已提交的未变化包通过 Manifest 信任链和硬链接复用，不在每次 Release 重复哈希或验签。回滚、恢复和周期完整巡检仍执行全量验证，因为它们不是高频发布路径。
 - ADR-068：Builder completed/failed 工作区是临时计算数据，不是归档。Controller 只有在 Profile fixture 已终止、Job 已失败，或对应 ReleaseBatch 已 published/failed/superseded 后，才通过反向租约返回明确的可释放 Attempt UUID；Builder 幂等删除该 UUID 的 completed、failed、staging 和 runtime 目录，但保留 SQLite Journal 终态。活动审计、人工处置和依赖构建仍可能读取的 Fetch/Build 输出不得按文件年龄猜测清理。
+- ADR-069：失败和取消的 Builder Attempt 不包含可发布 Artifact；结果经 Controller 确认接收后由 Builder 本地立即释放工作目录，不再依赖 Controller 数据库长期保留该 Attempt。成功 Attempt 仍必须等待 Controller 明确授权。
 
 ## 已拒绝
 
