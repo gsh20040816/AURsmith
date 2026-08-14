@@ -650,6 +650,7 @@ fn classify_failure(error: &anyhow::Error) -> &'static str {
         "GUEST_RESULT_KIND_MISMATCH",
         "GUEST_BUILD_FAILED",
         "GUEST_FETCH_FAILED",
+        "FETCH_DEPENDENCY_DOWNLOAD_FAILED",
         "NETWORK_DURING_BUILD",
     ] {
         if message.contains(code) {
@@ -671,6 +672,16 @@ fn classify_guest_failure(spec: &JobSpec, output: &Path) -> &'static str {
             .is_some_and(|bytes| network_failure_in_log(&bytes))
     {
         "NETWORK_DURING_BUILD"
+    } else if spec.kind == JobKind::Fetch
+        && fs::read(output.join("guest-error.json"))
+            .ok()
+            .filter(|bytes| bytes.len() <= 64 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value["code"].as_str().map(str::to_owned))
+            .as_deref()
+            == Some("FETCH_DEPENDENCY_DOWNLOAD_FAILED")
+    {
+        "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
     } else if spec.kind == JobKind::Fetch {
         "GUEST_FETCH_FAILED"
     } else {
@@ -988,6 +999,29 @@ mod tests {
             output_directory: root.join("output"),
             control_socket: root.join("control.sock"),
         }
+    }
+
+    #[test]
+    fn only_dependency_download_guest_errors_are_retryable_fetch_failures() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("guest-error.json"),
+            br#"{"code":"FETCH_DEPENDENCY_DOWNLOAD_FAILED","error":"download failed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_guest_failure(&job(JobKind::Fetch), root.path()),
+            "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
+        );
+        fs::write(
+            root.path().join("guest-error.json"),
+            br#"{"code":"GUEST_COMMAND_FAILED","error":"validation failed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_guest_failure(&job(JobKind::Fetch), root.path()),
+            "GUEST_FETCH_FAILED"
+        );
     }
 
     #[test]

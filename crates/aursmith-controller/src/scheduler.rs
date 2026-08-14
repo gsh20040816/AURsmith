@@ -2267,6 +2267,7 @@ fn infrastructure_failure(code: &str) -> bool {
         "BUILDER_INFRASTRUCTURE"
             | "VM_TIMEOUT"
             | "VM_FAILED"
+            | "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
             | "GUEST_RESULT_MISSING"
             | "RESULT_UNAVAILABLE"
             | "WORKER_RESTARTED"
@@ -2799,6 +2800,8 @@ mod release_tests {
         assert!(infrastructure_failure("VM_TIMEOUT"));
         assert!(infrastructure_failure("WORKER_RESTARTED"));
         assert!(infrastructure_failure("BUILDER_INFRASTRUCTURE"));
+        assert!(infrastructure_failure("FETCH_DEPENDENCY_DOWNLOAD_FAILED"));
+        assert!(!infrastructure_failure("GUEST_FETCH_FAILED"));
         assert!(!infrastructure_failure("INPUT_INVALID"));
         assert!(!infrastructure_failure("PROFILE_DIGEST_MISMATCH"));
         assert!(!infrastructure_failure("AUDIT_REJECTED"));

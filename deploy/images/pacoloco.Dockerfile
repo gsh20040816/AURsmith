@@ -1,7 +1,7 @@
 FROM ghcr.io/anatol/pacoloco@sha256:c5e7c82e6081e1edfd95f8cac8dd9e5e029b75557a63019c2e5034f35dd6623a
 
 ARG AURSMITH_SOURCE_GIT_COMMIT=unknown
-ARG AURSMITH_ARCH_MIRROR=https://geo.mirror.pkgbuild.com
+ARG AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux
 USER 0:0
 RUN case "${AURSMITH_ARCH_MIRROR}" in https://*) ;; *) echo 'AURSMITH_ARCH_MIRROR 必须是 HTTPS URL' >&2; exit 1 ;; esac \
     && case "${AURSMITH_ARCH_MIRROR}" in *[[:space:]]*|*'@'*|*'?'*|*'#'*) echo 'AURSMITH_ARCH_MIRROR 不能包含空白、凭据、查询参数或片段' >&2; exit 1 ;; esac \

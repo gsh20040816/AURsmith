@@ -7,7 +7,7 @@ COPY crates ./crates
 RUN cargo build --locked --release -p aursmith-guest-agent -p aursmithctl
 
 FROM archlinux:base@sha256:345a872f6c95e082d4b8c050af637eebb57402c6e2177b411c3acf7df84eb33b AS profile
-ARG AURSMITH_ARCH_MIRROR=https://geo.mirror.pkgbuild.com
+ARG AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux
 RUN case "${AURSMITH_ARCH_MIRROR}" in https://*) ;; *) echo 'AURSMITH_ARCH_MIRROR 必须是 HTTPS URL' >&2; exit 1 ;; esac \
     && case "${AURSMITH_ARCH_MIRROR}" in *[[:space:]]*) echo 'AURSMITH_ARCH_MIRROR 不能包含空白' >&2; exit 1 ;; esac \
     && case "${AURSMITH_ARCH_MIRROR}" in *'@'*|*'?'*|*'#'*) echo 'AURSMITH_ARCH_MIRROR 不能包含凭据、查询参数或片段' >&2; exit 1 ;; esac \

@@ -91,10 +91,10 @@ Builder Stack 必须设置 `KVM_GID`、`AURSMITH_SECRET_GID`、`AURSMITH_CONTROL
 
 Builder 的 `AURSMITH_BUILD_NETWORK` 控制正式 Build Guest 网络。`false` 使用 `-nic none`；`true` 使用 QEMU user networking 直接访问公网，适用于会在 `build()` 内恢复 NuGet 等生态依赖的软件包。第一版部署以构建兼容性为主可设为 `true`，实际值会进入 Build provenance。无论是否联网，Guest 都不挂载 Controller、GPG、SSH、Docker 或宿主文件系统秘密。
 
-下面示例使用清华大学开源软件镜像站构建并导出 base candidate；未设置变量时使用 `https://geo.mirror.pkgbuild.com`：
+下面示例使用中国科学技术大学开源软件镜像站构建并导出 base candidate；未设置变量时也使用该镜像：
 
 ```bash
-AURSMITH_ARCH_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/archlinux \
+AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux \
   docker compose -f deploy/builder/compose.yaml --profile profile-build build profile-builder
 docker compose -f deploy/builder/compose.yaml --profile profile-build run --rm profile-builder --name base
 ```

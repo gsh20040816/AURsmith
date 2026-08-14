@@ -55,7 +55,7 @@ services:
       dockerfile: deploy/images/profile-builder.Dockerfile
       args:
         AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-        AURSMITH_ARCH_MIRROR: ${AURSMITH_ARCH_MIRROR:-https://geo.mirror.pkgbuild.com}
+        AURSMITH_ARCH_MIRROR: ${AURSMITH_ARCH_MIRROR:-https://mirrors.ustc.edu.cn/archlinux}
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

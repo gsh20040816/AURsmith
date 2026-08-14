@@ -8,11 +8,11 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -25,14 +25,25 @@ fn main() {
         let _ = fs::create_dir_all(OUTPUT);
         let _ = fs::write(
             format!("{OUTPUT}/guest-error.json"),
-            serde_json::to_vec(&serde_json::json!({"error": error.to_string()}))
-                .unwrap_or_default(),
+            serde_json::to_vec(&serde_json::json!({
+                "code": guest_error_code(&error),
+                "error": error.to_string()
+            }))
+            .unwrap_or_default(),
         );
         eprintln!("AURsmith Guest 失败：{error:#}");
         shutdown();
         std::process::exit(1);
     }
     shutdown();
+}
+
+fn guest_error_code(error: &anyhow::Error) -> &'static str {
+    if error.to_string().contains("官方依赖下载连续 3 次失败") {
+        "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
+    } else {
+        "GUEST_COMMAND_FAILED"
+    }
 }
 
 fn run() -> anyhow::Result<()> {
@@ -232,7 +243,7 @@ fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
     fs::create_dir_all(&prepared)?;
     copy_tree(Path::new(BUILD), &prepared, false)?;
     let dependency_download_started = std::time::Instant::now();
-    let resolved_dependencies = download_official_dependencies(spec, &prepared)?;
+    let resolved_dependencies = download_official_dependencies(spec, &prepared, &log)?;
     let dependency_download_milliseconds =
         u64::try_from(dependency_download_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let sources = manifest(&prepared, Path::new(OUTPUT))?;
@@ -367,6 +378,7 @@ fn declared_pgp_fingerprints(srcinfo: &str) -> anyhow::Result<Vec<String>> {
 fn download_official_dependencies(
     spec: &JobSpec,
     prepared: &Path,
+    log: &Path,
 ) -> anyhow::Result<Vec<ResolvedDependency>> {
     let names = spec
         .dependencies
@@ -388,17 +400,28 @@ fn download_official_dependencies(
     }
     let cache = prepared.join(".aursmith-official-dependencies");
     fs::create_dir(&cache)?;
-    let mut command = Command::new("/usr/bin/pacman");
-    command
-        .args(["-Sw", "--noconfirm", "--needed", "--cachedir"])
-        .arg(&cache)
-        .args(&names)
-        .stdin(Stdio::null())
-        .env_clear()
-        .env("PATH", "/usr/bin");
-    let status = command.status()?;
-    if !status.success() {
-        bail!("官方依赖下载失败，状态 {status}");
+    let cache_text = cache.to_string_lossy().into_owned();
+    let mut downloaded = false;
+    for attempt in 1..=3_u8 {
+        let refresh = pacman_output(&["-Syy", "--noconfirm"], &[])?;
+        append_pacman_log(log, "刷新仓库数据库", attempt, &refresh)?;
+        if refresh.status.success() {
+            let download = pacman_output(
+                &["-Sw", "--noconfirm", "--needed", "--cachedir", &cache_text],
+                &names,
+            )?;
+            append_pacman_log(log, "下载官方依赖", attempt, &download)?;
+            if download.status.success() {
+                downloaded = true;
+                break;
+            }
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_secs(u64::from(attempt) * 2));
+        }
+    }
+    if !downloaded {
+        bail!("官方依赖下载连续 3 次失败，详情见 fetch.log");
     }
     let mut resolved = Vec::new();
     for item in fs::read_dir(&cache)? {
@@ -441,6 +464,33 @@ fn download_official_dependencies(
     }
     resolved.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(resolved)
+}
+
+fn pacman_output(arguments: &[&str], packages: &[&str]) -> anyhow::Result<Output> {
+    Ok(Command::new("/usr/bin/pacman")
+        .args(arguments)
+        .args(packages)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/bin")
+        .output()?)
+}
+
+fn append_pacman_log(
+    log: &Path,
+    operation: &str,
+    attempt: u8,
+    output: &Output,
+) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(log)?;
+    writeln!(
+        file,
+        "\n==> AURsmith {operation}（第 {attempt}/3 次，状态 {}）",
+        output.status
+    )?;
+    file.write_all(&output.stdout)?;
+    file.write_all(&output.stderr)?;
+    Ok(())
 }
 
 fn is_package_archive_name(name: &str) -> bool {
@@ -972,6 +1022,20 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn only_exhausted_dependency_downloads_get_the_retryable_guest_code() {
+        assert_eq!(
+            guest_error_code(&anyhow::anyhow!(
+                "官方依赖下载连续 3 次失败，详情见 fetch.log"
+            )),
+            "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
+        );
+        assert_eq!(
+            guest_error_code(&anyhow::anyhow!("checksum 校验失败")),
+            "GUEST_COMMAND_FAILED"
+        );
+    }
 
     fn temporary_build_directory() -> PathBuf {
         let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
