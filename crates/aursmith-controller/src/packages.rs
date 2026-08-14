@@ -1081,7 +1081,7 @@ pub(crate) async fn schedule_rebuild_batch(
         .await?;
     }
     for (index, package_base) in order.into_iter().enumerate() {
-        let previous = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, rebuild_generation, metadata_json FROM revisions WHERE package_base = ? AND state != 'superseded' ORDER BY rebuild_generation DESC, created_at DESC LIMIT 1")
+        let previous = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, metadata_json FROM revisions WHERE package_base = ? AND rebuild_generation = 0 ORDER BY created_at DESC LIMIT 1")
             .bind(&package_base).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::conflict("REBUILD_REVISION_MISSING", format!("{package_base} 没有可重建 Revision")))?;
         let previous_id: String = previous.get("id");
@@ -1097,7 +1097,15 @@ pub(crate) async fn schedule_rebuild_batch(
             }))
             .map_err(ApiError::internal)?,
         ));
-        let rebuild_generation = previous.get::<i64, _>("rebuild_generation") + 1;
+        let rebuild_generation: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(rebuild_generation), 0) + 1 FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = ? AND provider_selection_sha256 = ?")
+            .bind(&package_base)
+            .bind(previous.get::<String, _>("aur_commit"))
+            .bind(previous.get::<Option<String>, _>("vcs_commit"))
+            .bind(previous.get::<String, _>("audit_policy_version"))
+            .bind(previous.get::<String, _>("provider_selection_sha256"))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(ApiError::internal)?;
         sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, rebuild_generation, state, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?, ?)")
             .bind(&revision_id).bind(&package_base).bind(previous.get::<String,_>("aur_commit"))
             .bind(previous.get::<Option<String>,_>("vcs_commit")).bind(previous.get::<String,_>("upstream_version"))
@@ -2578,6 +2586,66 @@ mod tests {
         let new_pre_scan: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_pre_scans WHERE revision_id = ? AND state = 'ready_for_fetch'")
             .bind(&revisions[1].0).fetch_one(&database).await.unwrap();
         assert_eq!(new_pre_scan, 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_uses_latest_upstream_before_local_generation() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        schedule_rebuild_batch(
+            &database,
+            BTreeSet::from(["demo".into()]),
+            "tester",
+            "manual_rebuild",
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE revisions SET state = 'published' WHERE package_base = 'demo' AND aur_commit = ? AND rebuild_generation = 1")
+            .bind("a".repeat(40))
+            .execute(&database)
+            .await
+            .unwrap();
+
+        let mut updated_package = package();
+        updated_package.version = "2.0-1".into();
+        let mut updated_snapshot = snapshot();
+        updated_snapshot.aur_commit = "b".repeat(40);
+        updated_snapshot.version = "2.0-1".into();
+        apply_snapshot(
+            &database,
+            "tester",
+            &updated_package,
+            &updated_snapshot,
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+
+        schedule_rebuild_batch(
+            &database,
+            BTreeSet::from(["demo".into()]),
+            "tester",
+            "manual_rebuild",
+        )
+        .await
+        .unwrap();
+        let rebuilt: (String, String, i64) = sqlx::query_as(
+            "SELECT aur_commit, upstream_version, rebuild_generation FROM revisions WHERE package_base = 'demo' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(rebuilt, ("b".repeat(40), "2.0-1".into(), 1));
     }
 
     #[tokio::test]
