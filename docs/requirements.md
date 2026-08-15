@@ -19,7 +19,7 @@
 | A05 | AUR/VCS commit、源码清单、Provider 和审计策略均未变化时复用已通过的自动审计，不重复调用 Agent | 审计复用回归测试 |
 | B01 | 所有不可信构建都运行在 KVM Guest 中 | KVM 集成测试 |
 | B02 | Fetch Guest 直接访问公网；Build Guest 可由 Builder 配置为无网或直接访问公网，实际模式必须写入 provenance | KVM 网络模式测试 |
-| B03 | 记录输入、依赖、Profile、工具、日志和产物 | provenance 测试 |
+| B03 | 记录输入、依赖、Profile、工具、资源限制、日志和产物；第一版自动 Build Job 默认使用 4 个 vCPU | provenance 与 JobSpec 测试 |
 | B04 | 统计依赖使用情况并优化不可变 Guest Profile | 优化器测试 |
 | B05 | 允许为 Profile 构建和 Fetch Guest 的官方依赖下载配置 Arch HTTPS 镜像源，并在 Profile 与 provenance 中固定实际镜像 | Profile 构建与协议测试 |
 | W01 | 通过 Docker Compose 部署所有 AURsmith 服务 | Compose 策略测试 |

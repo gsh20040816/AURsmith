@@ -975,7 +975,7 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
             .bind(dependency_snapshot_sha256).bind(worker_id).bind(source_attempt_id)
             .bind(serde_json::to_string(&snapshot.outputs).map_err(ApiError::internal)?)
             .bind(allow_check)
-            .bind(r#"{"cpu_count":2,"memory_mib":4096,"disk_mib":32768,"timeout_seconds":3600}"#)
+            .bind(r#"{"cpu_count":4,"memory_mib":4096,"disk_mib":32768,"timeout_seconds":3600}"#)
             .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE revisions SET state = 'build_pending' WHERE id = ?")
             .bind(&revision_id)
@@ -3099,11 +3099,14 @@ mod tests {
 
         schedule_ready_builds(&database).await.unwrap();
 
-        let row = sqlx::query("SELECT expected_outputs_json, allow_check FROM jobs WHERE batch_id = ? AND kind = 'build'")
+        let row = sqlx::query("SELECT expected_outputs_json, allow_check, limits_json FROM jobs WHERE batch_id = ? AND kind = 'build'")
             .bind(batch_id).fetch_one(&database).await.unwrap();
         let outputs: Vec<String> = serde_json::from_str(row.get("expected_outputs_json")).unwrap();
+        let limits: aursmith_protocol::ResourceLimits =
+            serde_json::from_str(row.get("limits_json")).unwrap();
         assert_eq!(outputs, ["demo-cli", "demo-lib"]);
         assert_eq!(row.get::<i64, _>("allow_check"), 0);
+        assert_eq!(limits.cpu_count, 4);
     }
 
     #[tokio::test]
