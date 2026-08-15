@@ -92,7 +92,7 @@ export function App() {
     );
   }
 
-  const activeAlerts = alerts.filter((alert) => alert.state !== "resolved");
+  const activeAlerts = alerts.filter((alert) => alert.state === "open");
   const leadingAlert = activeAlerts.find((alert) => alert.severity === "warning") ?? activeAlerts[0];
   return (
     <div className="shell">
