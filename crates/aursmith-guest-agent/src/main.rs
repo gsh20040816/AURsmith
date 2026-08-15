@@ -94,7 +94,7 @@ fn run() -> anyhow::Result<()> {
         )?;
     }
     if spec.kind == JobKind::Build {
-        install_offline_dependencies(Path::new(BUILD))?;
+        install_offline_dependencies(Path::new(BUILD), &Path::new(OUTPUT).join("build.log"))?;
         apply_published_pkgrel(
             Path::new(BUILD),
             spec.upstream_pkgrel.as_deref(),
@@ -134,7 +134,7 @@ fn configure_network() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn install_offline_dependencies(build: &Path) -> anyhow::Result<()> {
+fn install_offline_dependencies(build: &Path, log: &Path) -> anyhow::Result<()> {
     let mut packages = Vec::new();
     for directory in [
         build.join(".aursmith-official-dependencies"),
@@ -159,15 +159,19 @@ fn install_offline_dependencies(build: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     packages.sort();
-    let status = Command::new("/usr/bin/pacman")
+    let output = Command::new("/usr/bin/pacman")
         .args(["-U", "--noconfirm", "--needed"])
         .args(packages)
         .stdin(Stdio::null())
         .env_clear()
         .env("PATH", "/usr/bin")
-        .status()?;
-    if !status.success() {
-        bail!("离线依赖安装失败，状态 {status}");
+        .output()?;
+    let mut file = File::create(log)?;
+    file.write_all(&output.stdout)?;
+    file.write_all(&output.stderr)?;
+    file.flush()?;
+    if !output.status.success() {
+        bail!("离线依赖安装失败，状态 {}，详情见 build.log", output.status);
     }
     Ok(())
 }

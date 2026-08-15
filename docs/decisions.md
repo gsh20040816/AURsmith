@@ -78,6 +78,7 @@
 - ADR-074：单机 Builder 宿主有 16 个逻辑 CPU，第一版自动 Build Job 默认从 2 个提高到 4 个 vCPU。Waywallen 的并行 C++ 构建在 4 GiB、无 Swap Guest 中重复出现全部编译进程等待文件页、QEMU 无新增 I/O 的停滞，因此默认内存提高到 8 GiB；磁盘和超时保持 32 GiB、1 小时。已经运行的 QEMU 不热改；新创建的 JobSpec 才使用新默认值。
 - ADR-075：反向 Builder 的任务容量由 Controller 中该 Worker 的未结束 Job 判定。第一版单 Worker 并发为一，只要存在 `dispatched`、`running` 或 `uncertain` Job 就不签发下一 JobSpec，避免已签名任务在 Worker 本地排队超过十分钟有效期。不能通过单纯延长 JobSpec 有效期掩盖超额派发。
 - ADR-076：Guest 使用仓库自带的最小 pacman 配置，固定启用 Arch 官方 `core`、`extra` 和 `multilib`，镜像地址仍由 Profile 构建参数配置。AUR 的 x86_64 包可以合法依赖 `lib32-*` 官方包；缺少 `multilib` 是构建环境错误，不能把这些依赖删除或对具体包加特判。
+- ADR-077：Build Guest 在执行 makepkg 前安装离线依赖时，必须把 pacman stdout/stderr 写入 `build.log`。失败证据不能只保留退出码，否则无法区分包冲突、依赖版本和损坏输入；补充日志不改变 pacman 参数、依赖集合或失败语义。
 
 ## 已拒绝
 
