@@ -669,19 +669,19 @@ fn parse_srcinfo(
             "pkgname" => {
                 outputs.insert(value.to_owned());
             }
-            "depends" => {
+            "depends" | "depends_x86_64" => {
                 dependencies.insert((dependency_name(value), "runtime".to_owned()));
             }
-            "makedepends" => {
+            "makedepends" | "makedepends_x86_64" => {
                 dependencies.insert((dependency_name(value), "build".to_owned()));
             }
-            "checkdepends" => {
+            "checkdepends" | "checkdepends_x86_64" => {
                 dependencies.insert((dependency_name(value), "check".to_owned()));
             }
-            "optdepends" => {
+            "optdepends" | "optdepends_x86_64" => {
                 optional_dependencies.insert(dependency_name(value));
             }
-            "provides" => {
+            "provides" | "provides_x86_64" => {
                 provides.insert(dependency_name(value));
             }
             "arch" => {
@@ -795,6 +795,37 @@ mod tests {
             kind: "runtime".into()
         }));
         assert_eq!(parsed.version, "2.0-3");
+    }
+
+    #[test]
+    fn srcinfo_includes_x86_64_dependencies_and_ignores_other_architectures() {
+        let parsed = parse_srcinfo(
+            "demo",
+            "a".repeat(40),
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = x86_64\ndepends = common\ndepends_x86_64 = lib32-glibc>=2.11\nmakedepends_x86_64 = nasm\ncheckdepends_x86_64 = test-tool\noptdepends_x86_64 = optional-tool: feature\nprovides_x86_64 = demo-abi=1\ndepends_i686 = glibc\ndepends_aarch64 = aarch64-only\npkgname = demo\n".into(),
+        )
+        .unwrap();
+
+        assert!(parsed.dependencies.contains(&Dependency {
+            name: "lib32-glibc".into(),
+            kind: "runtime".into()
+        }));
+        assert!(parsed.dependencies.contains(&Dependency {
+            name: "nasm".into(),
+            kind: "build".into()
+        }));
+        assert!(parsed.dependencies.contains(&Dependency {
+            name: "test-tool".into(),
+            kind: "check".into()
+        }));
+        assert!(
+            !parsed
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "glibc" || dependency.name == "aarch64-only")
+        );
+        assert_eq!(parsed.optional_dependencies, ["optional-tool: feature"]);
+        assert_eq!(parsed.provides, ["demo-abi"]);
     }
 
     #[test]

@@ -74,6 +74,7 @@
 - ADR-070：确定性审计只阻断能够由输入直接证明的违规。PKGBUILD 或安装脚本中静态出现私网、回环或链路本地地址可能只是本机服务配置，记录为可疑发现并交给 Agent 结合上下文判断；Fetch 实际发起的目标仍在网络入口拒绝私网、回环和链路本地地址。这样不会把文字匹配误当成恶意行为，也不放宽真实下载边界。
 - ADR-071：直接调度器与反向租约共用同一 Worker 资格判定。若不存在可主动连接的 Builder，但存在符合标签、Profile 和亲和性要求的在线反向 Builder，任务保持 queued 等待其长轮询，不写入 `NO_ELIGIBLE_WORKER`；只有两种连接模式均无合格 Worker 时才产生告警。
 - ADR-072：JobSpec 的依赖来源不能只根据外部 Provider 解析结果判断，还必须对照当前 pkgbase 的完整 split output。由同一 pkgbase 产出的依赖标记为批次内部来源，使 Fetch 不会要求 pacman 下载不存在的同名官方包；makepkg 仍一次构建并校验全部 split outputs。该分类在生成 JobSpec 时实施，也能修复已经持久化但尚未成功的 Revision。
+- ADR-073：第一版只构建 x86_64，因此 Publisher 解析 `.SRCINFO` 时合并通用字段和 `_x86_64` 架构字段，并忽略其他架构后缀。不能把 `depends_x86_64` 留到 makepkg 才发现，否则 Fetch 生成的离线依赖快照不完整，Build 会在无机会补齐依赖时确定性失败。未来增加多架构 Worker 时必须把目标架构加入 Revision 和 JobSpec，再把该规则参数化。
 
 ## 已拒绝
 
