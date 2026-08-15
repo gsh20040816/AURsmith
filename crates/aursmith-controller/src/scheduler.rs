@@ -1602,14 +1602,16 @@ pub(crate) async fn lease_reverse_job(
         } else {
             None
         };
-        let eligible = required_labels.is_subset(&labels)
-            && explicit_preference
-                .or(batch_preference)
-                .is_none_or(|preferred| preferred == worker_id.to_string())
-            && row
-                .get::<Option<String>, _>("profile_sha256")
-                .as_ref()
-                .is_none_or(|profile| profiles.contains(profile));
+        let preferred_worker = explicit_preference.or(batch_preference);
+        let required_profile: Option<String> = row.get("profile_sha256");
+        let eligible = worker_matches_job(
+            &worker_id.to_string(),
+            &labels,
+            &profiles,
+            &required_labels,
+            required_profile.as_deref(),
+            preferred_worker.as_deref(),
+        );
         if eligible {
             selected = Some(row);
             break;
@@ -1806,15 +1808,42 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
             serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
         let profiles: BTreeSet<String> =
             serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
-        required_labels.is_subset(&labels)
-            && preferred_worker_id
-                .as_ref()
-                .is_none_or(|preferred| worker.get::<String, _>("id") == *preferred)
-            && required_profile
-                .as_ref()
-                .is_none_or(|profile| profiles.contains(profile))
+        worker_matches_job(
+            worker.get::<String, _>("id").as_str(),
+            &labels,
+            &profiles,
+            &required_labels,
+            required_profile.as_deref(),
+            preferred_worker_id.as_deref(),
+        )
     });
     let Some(worker) = selected else {
+        let reverse_workers = if role == "builder" {
+            sqlx::query("SELECT id, labels_json, profiles_json FROM workers WHERE role = 'builder' AND state = 'online' AND protocol_version = ? AND connection_mode = 'reverse'")
+                .bind(i64::from(aursmith_protocol::PROTOCOL_MAJOR))
+                .fetch_all(&state.database)
+                .await
+                .map_err(ApiError::internal)?
+        } else {
+            Vec::new()
+        };
+        let reverse_eligible = reverse_workers.iter().any(|worker| {
+            let labels: BTreeSet<String> =
+                serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
+            let profiles: BTreeSet<String> =
+                serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
+            worker_matches_job(
+                worker.get::<String, _>("id").as_str(),
+                &labels,
+                &profiles,
+                &required_labels,
+                required_profile.as_deref(),
+                preferred_worker_id.as_deref(),
+            )
+        });
+        if reverse_eligible {
+            return Ok(());
+        }
         sqlx::query("UPDATE jobs SET status = 'no_eligible_worker', failure_code = 'NO_ELIGIBLE_WORKER', updated_at = ? WHERE id = ?")
             .bind(Utc::now())
             .bind(&job_id)
@@ -1915,6 +1944,19 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     }
     resolve_alert(state, &format!("no-eligible-worker:{job_id}")).await?;
     Ok(())
+}
+
+fn worker_matches_job(
+    worker_id: &str,
+    worker_labels: &BTreeSet<String>,
+    worker_profiles: &BTreeSet<String>,
+    required_labels: &BTreeSet<String>,
+    required_profile: Option<&str>,
+    preferred_worker_id: Option<&str>,
+) -> bool {
+    required_labels.is_subset(worker_labels)
+        && preferred_worker_id.is_none_or(|preferred| preferred == worker_id)
+        && required_profile.is_none_or(|profile| worker_profiles.contains(profile))
 }
 
 async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, ApiError> {
@@ -2540,6 +2582,38 @@ async fn load_batch_dependency_attempts(
 #[cfg(test)]
 mod release_tests {
     use super::*;
+
+    #[test]
+    fn worker_eligibility_is_shared_by_direct_and_reverse_dispatch() {
+        let labels = BTreeSet::from(["fast".to_string(), "x86_64".to_string()]);
+        let profiles = BTreeSet::from(["profile-a".to_string()]);
+        let required = BTreeSet::from(["x86_64".to_string()]);
+
+        assert!(worker_matches_job(
+            "builder-1",
+            &labels,
+            &profiles,
+            &required,
+            Some("profile-a"),
+            Some("builder-1"),
+        ));
+        assert!(!worker_matches_job(
+            "builder-1",
+            &labels,
+            &profiles,
+            &required,
+            Some("profile-b"),
+            None,
+        ));
+        assert!(!worker_matches_job(
+            "builder-1",
+            &labels,
+            &profiles,
+            &required,
+            None,
+            Some("builder-2"),
+        ));
+    }
 
     #[test]
     fn receipt_manifest_comparison_ignores_order_but_rejects_duplicate_paths() {

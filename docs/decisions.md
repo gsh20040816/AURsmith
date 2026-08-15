@@ -71,6 +71,8 @@
 - ADR-067：ReleaseAuthorization 保持完整最终仓库清单，但发布执行采用成熟的增量数据库流程。Signer 验证并复制当前已签名 db/files，只对目标清单差集调用官方 `repo-remove`，只把本批次变化包交给官方 `repo-add`，最后用小型 desc 元数据对账完整授权并重新签名。Publisher 只在 rsync 接收边界和 Signer 输出边界读取变化大文件；已提交的未变化包通过 Manifest 信任链和硬链接复用，不在每次 Release 重复哈希或验签。回滚、恢复和周期完整巡检仍执行全量验证，因为它们不是高频发布路径。
 - ADR-068：Builder completed/failed 工作区是临时计算数据，不是归档。Controller 只有在 Profile fixture 已终止、Job 已失败，或对应 ReleaseBatch 已 published/failed/superseded 后，才通过反向租约返回明确的可释放 Attempt UUID；Builder 幂等删除该 UUID 的 completed、failed、staging 和 runtime 目录，但保留 SQLite Journal 终态。活动审计、人工处置和依赖构建仍可能读取的 Fetch/Build 输出不得按文件年龄猜测清理。
 - ADR-069：失败和取消的 Builder Attempt 不包含可发布 Artifact；结果经 Controller 确认接收后由 Builder 本地立即释放工作目录，不再依赖 Controller 数据库长期保留该 Attempt。成功 Attempt 仍必须等待 Controller 明确授权。
+- ADR-070：确定性审计只阻断能够由输入直接证明的违规。PKGBUILD 或安装脚本中静态出现私网、回环或链路本地地址可能只是本机服务配置，记录为可疑发现并交给 Agent 结合上下文判断；Fetch 实际发起的目标仍在网络入口拒绝私网、回环和链路本地地址。这样不会把文字匹配误当成恶意行为，也不放宽真实下载边界。
+- ADR-071：直接调度器与反向租约共用同一 Worker 资格判定。若不存在可主动连接的 Builder，但存在符合标签、Profile 和亲和性要求的在线反向 Builder，任务保持 queued 等待其长轮询，不写入 `NO_ELIGIBLE_WORKER`；只有两种连接模式均无合格 Worker 时才产生告警。
 
 ## 已拒绝
 

@@ -143,7 +143,7 @@ Profile 页面接受 profile-builder 生成的 `profile-candidate.json`，通过
 
 ## 审计流水线与 Agent 边界
 
-每个 Revision 首先形成只包含 AUR Git 跟踪文件、文件摘要、source 声明和确定性发现的不可变 `AuditPreScan`。预扫描命中路径逃逸、摘要不一致、私网 source URL 等绝对阻断时直接停止；未阻断时只允许创建 Fetch Job，绝不提前创建 Agent 调用。
+每个 Revision 首先形成只包含 AUR Git 跟踪文件、文件摘要、source 声明和确定性发现的不可变 `AuditPreScan`。预扫描命中路径逃逸、摘要不一致等可由输入本身证明的违规时直接停止；包装脚本或安装脚本中仅出现私网、回环地址文字属于可疑线索，交给 Agent 结合用途判断。Fetch 实际请求私网、回环、链路本地或未授权目标时仍由网络入口确定性拒绝。未阻断时只允许创建 Fetch Job，绝不提前创建 Agent 调用。
 
 Fetch VM 完成下载和校验后生成完整 Source Manifest，清单显式区分普通文件、目录和符号链接，并附带按固定规则选择的构建入口、脚本、安装、网络、权限和持久化相关文本。Builder 验证完整结果，Controller 再核对 Journal 中的结果摘要、Job、Attempt 和 Revision 身份，消费一次 `AuditPreScan`，形成内容寻址且不可再修改的最终 `AuditBundle`。此时才创建三个低成本 Agent 任务。覆盖说明必须明确列出完整清单和 Agent 实际读取的文件，并声明风险选读不能证明全部上游源码安全。
 

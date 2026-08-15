@@ -77,9 +77,9 @@ pub fn scan_aur_wrapper(files: &[AuditFile]) -> Vec<DeterministicFinding> {
             if text.contains(marker) {
                 findings.push(finding(
                     "PRIVATE_NETWORK_TARGET",
-                    FindingSeverity::Block,
+                    FindingSeverity::Suspicious,
                     file,
-                    "包装文件引用私网、回环或链路本地目标",
+                    "包装文件引用私网、回环或链路本地目标，需要结合用途审计",
                 ));
                 break;
             }
@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_and_private_target_are_absolute_blocks() {
+    fn digest_mismatch_blocks_but_static_private_target_needs_review() {
         let mut input = file("PKGBUILD", "source=(http://127.0.0.1/payload)");
         input.declared_sha256 = "0".repeat(64);
         let findings = scan_aur_wrapper(&[input]);
@@ -149,8 +149,12 @@ mod tests {
                 .iter()
                 .filter(|finding| finding.severity == FindingSeverity::Block)
                 .count(),
-            2
+            1
         );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "PRIVATE_NETWORK_TARGET"
+                && finding.severity == FindingSeverity::Suspicious
+        }));
     }
 
     #[test]

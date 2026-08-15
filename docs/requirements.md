@@ -12,7 +12,7 @@
 | P06 | 同一上游版本重建时派生本地 pkgrel | 版本测试 |
 | P07 | 显示官方仓库晋升、ABI、删除、合并和维护者事件 | 事件测试 |
 | P08 | 新 Revision 任意阶段失败后保留当前稳定 Release | 故障注入测试 |
-| A01 | 构建前执行确定性扫描和 Agent 审计 | 审计流水线测试 |
+| A01 | 构建前执行确定性扫描和 Agent 审计；只有输入本身可证明的违规才确定性阻断，脚本中静态出现本地地址等上下文相关线索交给 Agent 判断 | 审计流水线测试 |
 | A02 | 精确实施三个低成本 Agent 的 3/2/不超过 1 票规则 | 投票测试 |
 | A03 | 仅适配 Codex CLI 与 Claude Code；三个低成本 Runner 的 provider、模型、Base URL、API key 和思考强度必须独立配置；隔离调用并保存完整溯源 | 容器、凭据网关及适配器测试 |
 | A04 | 如实记录源码审计覆盖范围 | 报告 Schema 测试 |
@@ -27,7 +27,7 @@
 | W03 | 公网节点使用固定 OpenSSH host key 和受限 rsync；家庭网络 Builder 只允许主动连接公网节点 | 传输测试 |
 | W04 | 使用 Attempt、Journal 和迟到结果拒绝保证任务幂等；成功 Attempt 在批次终止后由 Controller 明确授权释放，失败或取消 Attempt 在上报确认后由 Builder 本地释放 | Worker 与存储回收测试 |
 | W05 | 支持多 Builder 和单活动 Publisher；第一版不部署独立 Archiver | 调度测试 |
-| W06 | Builder 不开放公网入站端口；它以持久身份签名，通过 HTTPS 长轮询领取任务和上报结果，并以一次性 Capability 主动推送产物 | 反向 Worker 端到端测试 |
+| W06 | Builder 不开放公网入站端口；它以持久身份签名，通过 HTTPS 长轮询领取任务和上报结果，并以一次性 Capability 主动推送产物；存在符合标签、Profile 和亲和性要求的在线反向 Builder 时，排队任务不得误报无可用 Worker | 反向 Worker 端到端测试 |
 | R01 | 把产物视为不可信内容，仅允许离线 Signer 签名 | Signer 测试 |
 | R02 | 原子发布完整、不可变的 pacman Release；高频发布只用官方 repo-add/repo-remove 增量更新变化包，不重复读取全部未变化大包 | 崩溃、增量发布与真实仓库测试 |
 | R03 | Publisher 内置 Release 保留：当前 Release 永不清理；其他 Release 必须同时位于最近 30 天内且属于每个包最新 3 个不同版本之一，对应审计证据和 provenance 随 Release 保留 | 保留与恢复测试 |
