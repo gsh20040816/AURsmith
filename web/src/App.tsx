@@ -31,6 +31,7 @@ export function App() {
   const [error, setError] = useState("");
   const [liveVersion, setLiveVersion] = useState(0);
   const [liveState, setLiveState] = useState("等待实时连接");
+  const [alerts, setAlerts] = useState<Alert[]>([]);
 
   useEffect(() => {
     void api.setupStatus()
@@ -62,6 +63,16 @@ export function App() {
     return () => source.close();
   }, [boot]);
 
+  useEffect(() => {
+    if (boot !== "ready") return;
+    const refreshAlerts = () => void api.alerts()
+      .then((response) => setAlerts(response.items))
+      .catch(() => undefined);
+    refreshAlerts();
+    const interval = window.setInterval(refreshAlerts, 30_000);
+    return () => window.clearInterval(interval);
+  }, [boot]);
+
   if (boot === "loading") {
     return <LoadingScreen />;
   }
@@ -81,6 +92,8 @@ export function App() {
     );
   }
 
+  const activeAlerts = alerts.filter((alert) => alert.state !== "resolved");
+  const leadingAlert = activeAlerts.find((alert) => alert.severity === "warning") ?? activeAlerts[0];
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -93,7 +106,7 @@ export function App() {
               onClick={() => setView(item.id)}
             >
               <span>{item.label}</span>
-              <code>{item.requirement}</code>
+              <span className="nav-meta">{item.id === "alerts" && activeAlerts.length > 0 && <strong className="alert-count">{activeAlerts.length}</strong>}<code>{item.requirement}</code></span>
             </button>
           ))}
         </nav>
@@ -113,7 +126,8 @@ export function App() {
         </div>
       </aside>
       <main className="workspace">
-        {view === "dashboard" && <Dashboard />}
+        {leadingAlert && view !== "alerts" && <section className={`global-alert ${leadingAlert.severity}`} role="alert"><div><strong>{leadingAlert.title}</strong><span>{lifecycleAlertSummary(leadingAlert)}</span></div><button className="secondary-button" onClick={() => setView("alerts")}>查看 {activeAlerts.length} 条待处理告警</button></section>}
+        {view === "dashboard" && <Dashboard alerts={activeAlerts} onShowAlerts={() => setView("alerts")} />}
         {view === "workers" && <WorkersView />}
         {view === "builds" && <BuildsView liveVersion={liveVersion} />}
         {view === "packages" && <PackagesView />}
@@ -140,7 +154,7 @@ function Brand() {
   );
 }
 
-function Dashboard() {
+function Dashboard({ alerts, onShowAlerts }: { alerts: Alert[]; onShowAlerts: () => void }) {
   const [requirements, setRequirements] = useState<Requirement[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [error, setError] = useState("");
@@ -181,12 +195,12 @@ function Dashboard() {
         <div className="work-panel">
           <div className="section-heading">
             <div><p className="eyebrow">待处理</p><h2>现在需要你的决定</h2></div>
-            <button className="text-button">查看全部</button>
+            {alerts.length > 0 && <button className="text-button" onClick={onShowAlerts}>查看全部</button>}
           </div>
-          <div className="empty-state">
+          {alerts.length === 0 ? <div className="empty-state">
             <span className="empty-symbol">✓</span>
             <div><strong>没有待处理项目</strong><p>出现 Provider 冲突或审计分歧时，会在这里说明原因和下一步。</p></div>
-          </div>
+          </div> : <div className="finding-list">{alerts.slice(0, 4).map((alert) => <div key={alert.id}><code>{alert.severity}</code><strong>{alert.title}</strong><span>{lifecycleAlertSummary(alert)}</span></div>)}</div>}
         </div>
         <div className="ledger-panel">
           <p className="eyebrow">需求总账</p>
@@ -496,7 +510,14 @@ function AlertsView() {
   const refresh = () => void api.alerts().then((response) => setAlerts(response.items)).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
   const acknowledge = async (alert: Alert) => { setBusy(alert.id); setError(""); try { await api.acknowledgeAlert(alert.id); refresh(); } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); } };
-  return <><header className="page-header compact"><div><p className="eyebrow">U03</p><h1>告警</h1><p className="lede">相同故障按稳定 fingerprint 去重；恢复检测会保留历史并把状态改为 resolved。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{alerts.length === 0 ? <div className="empty-state"><span className="empty-symbol">✓</span><div><strong>没有告警记录</strong><p>Worker、磁盘、时钟、传输、发布和归档异常会显示在这里。</p></div></div> : alerts.map((alert) => <article className="audit-card" key={alert.id}><div className="audit-title"><div><p className="eyebrow">{alert.severity} · {alert.fingerprint}</p><h2>{alert.title}</h2></div><span className={`state ${alert.state}`}>{alert.state}</span></div><pre><code>{JSON.stringify(alert.details, null, 2)}</code></pre><p className="panel-note">首次发现：{new Date(alert.opened_at).toLocaleString("zh-CN")}</p>{alert.state === "open" && <button className="secondary-button" disabled={busy === alert.id} onClick={() => void acknowledge(alert)}>确认已知晓</button>}</article>)}</section></>;
+  return <><header className="page-header compact"><div><p className="eyebrow">U03</p><h1>告警</h1><p className="lede">相同故障按稳定 fingerprint 去重；恢复检测会保留历史并把状态改为 resolved。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{alerts.length === 0 ? <div className="empty-state"><span className="empty-symbol">✓</span><div><strong>没有告警记录</strong><p>Worker、磁盘、时钟、传输、发布和归档异常会显示在这里。</p></div></div> : alerts.map((alert) => <article className="audit-card" key={alert.id}><div className="audit-title"><div><p className="eyebrow">{alert.severity} · {alert.fingerprint}</p><h2>{alert.title}</h2></div><span className={`state ${alert.state}`}>{alert.state}</span></div>{alert.fingerprint.startsWith("aur-lifecycle-missing:") && <Notice kind="error">当前仓库中的稳定版本会继续保留。请确认该包是否被删除、重命名或合并，并在订阅新包后退订旧包。</Notice>}<pre><code>{JSON.stringify(alert.details, null, 2)}</code></pre><p className="panel-note">首次发现：{new Date(alert.opened_at).toLocaleString("zh-CN")}</p>{alert.state === "open" && <button className="secondary-button" disabled={busy === alert.id} onClick={() => void acknowledge(alert)}>确认已知晓</button>}</article>)}</section></>;
+}
+
+function lifecycleAlertSummary(alert: Alert): string {
+  if (alert.fingerprint.startsWith("aur-lifecycle-missing:")) {
+    return "AUR 上游已不可见；当前已发布版本继续保留，请检查替代包并迁移订阅。";
+  }
+  return alert.fingerprint;
 }
 
 function PlannedView({ view }: { view: View }) {

@@ -35,7 +35,7 @@
 | R05 | 每个 Release 包含由隔离 Signer 生成的 `aursmith-keyring`，安装后自动执行 `pacman-key --populate aursmith` | Signer、Publisher 与真实 pacman 测试 |
 | U01 | 提供完整 Web UI | 浏览器验收测试 |
 | U02 | 提供单用户局域网认证和客户端接入引导 | 认证与接入测试 |
-| U03 | 提供告警、存储、Worker、Doctor 和恢复状态 | 运维测试 |
+| U03 | 提供告警、存储、Worker、Doctor 和恢复状态；未解决告警必须在全局和总览可见，AUR 包消失时说明当前版本保留及订阅迁移方式 | Web UI 与运维测试 |
 | O01 | 包装成熟 Arch 工具，不重新实现基础能力或 Fork AURCache | 架构审查 |
 | O02 | 使用 Git 管理实现、版本、Release Manifest 和发布全过程 | Git 与发布测试 |
 

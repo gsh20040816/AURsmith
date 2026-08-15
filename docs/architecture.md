@@ -55,7 +55,7 @@ Controller 对公网可达 Worker定期执行固定 host key 的 `status`；反�
 
 `/api/v1/metrics` 汇总任务状态、成功 Attempt 的阶段平均耗时、Agent 调用/失败/成本、依赖下载与缓存命中，以及归档副本状态。第一版由认证后的 Web UI 消费该 JSON，不另行引入 Prometheus、Redis 或消息系统。
 
-`/api/v1/events` 使用与普通 API 相同的管理员会话认证，并以 SSE 发送控制面增量快照。Controller 每两秒比较事件序号、Job/Release/Archive 更新时间和未解决告警数，只有状态变化时才发送 data frame；每十五秒发送 keep-alive 注释。浏览器断线使用 EventSource 原生重连，构建页收到变化后重新读取权威 JSON，不把 SSE 数据本身当作可写状态或完整日志存储。
+`/api/v1/events` 使用与普通 API 相同的管理员会话认证，并以 SSE 发送控制面增量快照。Controller 每两秒比较事件序号、Job/Release/Archive 更新时间和未解决告警数，只有状态变化时才发送 data frame；每十五秒发送 keep-alive 注释。浏览器断线使用 EventSource 原生重连，构建页收到变化后重新读取权威 JSON，不把 SSE 数据本身当作可写状态或完整日志存储。未解决告警同时显示在导航计数、全局横幅和总览待处理区。AUR 包从 RPC 索引消失时，UI 明确说明当前已发布版本仍保留，并提示确认删除、重命名或合并后迁移订阅。
 
 Controller 每 24 小时或按管理员请求执行一次控制面一致性备份。备份使用 SQLite `VACUUM INTO` 从 WAL 数据库生成单文件快照，随后执行 `PRAGMA integrity_check`、计算 SHA-256，并用 Controller Ed25519 身份签署版本化 `ControlPlaneBackup`。数据库文件和签名 Envelope 先在同一文件系统暂存、同步，再以目录 rename 提交；失败记录不会冒充 verified。控制面数据库保存密码哈希和业务状态但不保存 GPG、SSH、CA 或 Agent API 私钥，因此这些 secret 仍必须按首次向导要求另行离线备份。
 

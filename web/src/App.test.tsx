@@ -27,6 +27,21 @@ describe("AURsmith 控制台", () => {
     expect(await screen.findByText("AUR 软件包搜索和订阅生命周期")).toBeInTheDocument();
   });
 
+  it("AUR 软件包消失时在全局和总览显示迁移告警", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/setup/status") ? { initialized: true }
+        : url.endsWith("/auth/me") ? { id: "admin-id", username: "admin" }
+          : url.endsWith("/alerts") ? { items: [{ id: "alert-1", fingerprint: "aur-lifecycle-missing:removed-demo", severity: "warning", state: "open", title: "AUR 软件包已不可见：removed-demo", details: { package_base: "removed-demo", possible_causes: ["deleted", "renamed", "merged"] }, opened_at: "2026-08-15T00:00:00Z", acknowledged_at: null, resolved_at: null }] }
+            : { items: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("AUR 软件包已不可见：removed-demo");
+    expect(screen.getByRole("button", { name: "查看 1 条待处理告警" })).toBeInTheDocument();
+    expect(screen.getAllByText(/当前已发布版本继续保留/).length).toBeGreaterThan(0);
+  });
+
   it("Worker 页面提供探测注册表单", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /Worker/ }));
