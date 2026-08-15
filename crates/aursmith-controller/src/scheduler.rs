@@ -1580,6 +1580,9 @@ pub(crate) async fn lease_reverse_job(
     let Some(worker) = worker else {
         return Ok(None);
     };
+    if reverse_worker_has_active_job(&state.database, worker_id).await? {
+        return Ok(None);
+    }
     let profiles: BTreeSet<String> =
         serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
     let labels: BTreeSet<String> =
@@ -1624,6 +1627,20 @@ pub(crate) async fn lease_reverse_job(
     let envelope = dispatch_job_to_worker(state, &job_id, worker_id).await?;
     resolve_alert(state, &format!("no-eligible-worker:{job_id}")).await?;
     Ok(Some(envelope))
+}
+
+async fn reverse_worker_has_active_job(
+    database: &sqlx::SqlitePool,
+    worker_id: Uuid,
+) -> Result<bool, ApiError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE worker_id = ? AND status IN ('dispatched', 'running', 'uncertain')",
+    )
+    .bind(worker_id.to_string())
+    .fetch_one(database)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(count > 0)
 }
 
 pub(crate) async fn lease_reverse_transfer(
@@ -2628,6 +2645,35 @@ mod release_tests {
             None,
             Some("builder-2"),
         ));
+    }
+
+    #[tokio::test]
+    async fn reverse_worker_does_not_lease_while_an_attempt_is_active() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let worker_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, profiles_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', '[]', 'reverse', ?, ?)")
+            .bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO jobs(id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', ?, 'dispatched', 1, 'fetch', '[]', '[]', '[]', ?, ?)")
+            .bind(job_id.to_string()).bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+
+        assert!(
+            reverse_worker_has_active_job(&database, worker_id)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query("UPDATE jobs SET status = 'succeeded' WHERE id = ?")
+            .bind(job_id.to_string())
+            .execute(&database)
+            .await
+            .unwrap();
+        assert!(
+            !reverse_worker_has_active_job(&database, worker_id)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

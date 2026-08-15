@@ -76,6 +76,7 @@
 - ADR-072：JobSpec 的依赖来源不能只根据外部 Provider 解析结果判断，还必须对照当前 pkgbase 的完整 split output。由同一 pkgbase 产出的依赖标记为批次内部来源，使 Fetch 不会要求 pacman 下载不存在的同名官方包；makepkg 仍一次构建并校验全部 split outputs。该分类在生成 JobSpec 时实施，也能修复已经持久化但尚未成功的 Revision。
 - ADR-073：第一版只构建 x86_64，因此 Publisher 解析 `.SRCINFO` 时合并通用字段和 `_x86_64` 架构字段，并忽略其他架构后缀。不能把 `depends_x86_64` 留到 makepkg 才发现，否则 Fetch 生成的离线依赖快照不完整，Build 会在无机会补齐依赖时确定性失败。未来增加多架构 Worker 时必须把目标架构加入 Revision 和 JobSpec，再把该规则参数化。
 - ADR-074：单机 Builder 宿主有 16 个逻辑 CPU，第一版自动 Build Job 默认从 2 个提高到 4 个 vCPU，内存、磁盘和超时保持 4 GiB、32 GiB、1 小时。已经运行的 QEMU 不取消或热改；新创建的 JobSpec 才使用新默认值，避免浪费已经完成的编译工作。
+- ADR-075：反向 Builder 的任务容量由 Controller 中该 Worker 的未结束 Job 判定。第一版单 Worker 并发为一，只要存在 `dispatched`、`running` 或 `uncertain` Job 就不签发下一 JobSpec，避免已签名任务在 Worker 本地排队超过十分钟有效期。不能通过单纯延长 JobSpec 有效期掩盖超额派发。
 
 ## 已拒绝
 
