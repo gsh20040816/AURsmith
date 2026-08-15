@@ -81,6 +81,8 @@ AUR 依赖以 `subscription_references` 保存有向边，隐式订阅的引用�
 
 普通包的 AUR commit 变化就产生新 Revision。`-git` 包还从 `.SRCINFO` 的 `git+https` source 查询上游 commit；查询前拒绝私网、回环、链路本地和保留地址，并禁用 Git 重定向及 file/ext 协议。AUR commit、VCS commit 或固定 Provider 变化都会产生新 Revision，未开始发布的旧 Revision 标记为 `superseded`。split outputs 始终整体固定和构建，用户选择只表示客户端关注项。
 
+依赖分类同时检查 Provider 解析结果和当前 pkgbase 的完整 split output 集合。依赖名称若由同一 pkgbase 的另一个 output 提供，只作为本次 split 构建的内部关系，不交给 pacman 从官方仓库下载，也不创建对自身的隐式订阅；其他 AUR 依赖仍由批次内已完成的依赖 Artifact 提供。
+
 Agent 审计身份只由 `pkgbase`、AUR Git commit（即完整 AUR 包装仓库文件）、固定 VCS commit、Provider 选择和审计策略版本组成。以上内容不变且已有自动批准结果时，后续手工重建直接复用该审计；Build Profile、官方依赖快照、下载缓存、内部 GPG 公钥包和其他 Fetch 实现元数据变化不触发重新审计。它们仍进入构建 provenance 和确定性校验，但不属于“AUR 打包脚本是否变化”的判定。
 
 Git VCS commit 变化时，Controller 把上一 Revision 的 commit 交给 Publisher。Publisher 先用固定 IP 的 smart HTTP 广告取得当前 ref，再以 `protocol.file/ext=never`、禁重定向、`GIT_TERMINAL_PROMPT=0` 和 `http.curloptResolve` 固定同一公共地址，仅获取该 ref 的无 blob 历史并执行 `merge-base --is-ancestor`。正常快进自动继续；上一 commit 不存在或不是祖先时，不创建新 Revision，而是写入 `vcs_history_rewrite_detected` 事件、critical 告警和待处理人工动作。管理员在包详情中批准或拒绝精确的 previous/current commit 对；批准不能永久信任包，下一次不同重写仍重新阻断。

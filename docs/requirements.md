@@ -6,7 +6,7 @@
 |---|---|---|
 | P01 | 搜索、订阅、暂停、退订、清除和手工重建 AUR 软件包 | API 与生命周期测试 |
 | P02 | 跟踪 AUR commit 和 Git VCS 上游 commit；历史重写必须阻断并人工确认 | 同步器、祖先关系与人工审批测试 |
-| P03 | 以 pkgbase 为单位构建全部 split outputs | 软件包基础模型测试 |
+| P03 | 以 pkgbase 为单位构建全部 split outputs；同一 pkgbase 内 output 之间的依赖不得作为官方包下载或创建自身隐式订阅 | 软件包基础模型与依赖分类测试 |
 | P04 | 解析依赖 DAG、隐式引用、Provider 和循环依赖 | 依赖图测试 |
 | P05 | 把受影响依赖闭包作为一个 ReleaseBatch 构建和发布 | 发布批次测试 |
 | P06 | 同一上游版本重建时派生本地 pkgrel | 版本测试 |

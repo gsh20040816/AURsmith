@@ -2548,23 +2548,38 @@ async fn load_job_dependencies(
     state: &AppState,
     job_id: &str,
 ) -> Result<Vec<DependencyInput>, ApiError> {
-    let rows = sqlx::query("SELECT revision_dependencies.dependency_name, revision_dependencies.dependency_kind, revision_dependencies.target_package_base FROM jobs JOIN revision_dependencies ON revision_dependencies.revision_id = jobs.revision_id WHERE jobs.id = ? ORDER BY revision_dependencies.dependency_name, revision_dependencies.dependency_kind")
+    let rows = sqlx::query("SELECT revision_dependencies.dependency_name, revision_dependencies.dependency_kind, revision_dependencies.target_package_base, package_bases.outputs_json FROM jobs JOIN revisions ON revisions.id = jobs.revision_id JOIN package_bases ON package_bases.name = revisions.package_base JOIN revision_dependencies ON revision_dependencies.revision_id = jobs.revision_id WHERE jobs.id = ? ORDER BY revision_dependencies.dependency_name, revision_dependencies.dependency_kind")
         .bind(job_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
     Ok(rows
         .into_iter()
-        .map(|row| DependencyInput {
-            name: row.get("dependency_name"),
-            kind: row.get("dependency_kind"),
-            source: if row
-                .get::<Option<String>, _>("target_package_base")
-                .is_some()
-            {
-                DependencySource::AurBatch
-            } else {
-                DependencySource::Official
-            },
+        .map(|row| {
+            let name: String = row.get("dependency_name");
+            let outputs: BTreeSet<String> =
+                serde_json::from_str(row.get("outputs_json")).unwrap_or_default();
+            DependencyInput {
+                source: dependency_source(
+                    &name,
+                    row.get::<Option<String>, _>("target_package_base")
+                        .as_deref(),
+                    &outputs,
+                ),
+                name,
+                kind: row.get("dependency_kind"),
+            }
         })
         .collect())
+}
+
+fn dependency_source(
+    dependency_name: &str,
+    target_package_base: Option<&str>,
+    current_outputs: &BTreeSet<String>,
+) -> DependencySource {
+    if target_package_base.is_some() || current_outputs.contains(dependency_name) {
+        DependencySource::AurBatch
+    } else {
+        DependencySource::Official
+    }
 }
 
 async fn load_batch_dependency_attempts(
@@ -2613,6 +2628,24 @@ mod release_tests {
             None,
             Some("builder-2"),
         ));
+    }
+
+    #[test]
+    fn split_output_dependency_is_not_downloaded_from_official_repositories() {
+        let outputs = BTreeSet::from(["demo-cli".to_string(), "demo-lib".to_string()]);
+
+        assert_eq!(
+            dependency_source("demo-lib", None, &outputs),
+            DependencySource::AurBatch
+        );
+        assert_eq!(
+            dependency_source("glibc", None, &outputs),
+            DependencySource::Official
+        );
+        assert_eq!(
+            dependency_source("aur-dependency", Some("aur-dependency"), &outputs),
+            DependencySource::AurBatch
+        );
     }
 
     #[test]

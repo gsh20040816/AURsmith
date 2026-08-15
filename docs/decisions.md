@@ -73,6 +73,7 @@
 - ADR-069：失败和取消的 Builder Attempt 不包含可发布 Artifact；结果经 Controller 确认接收后由 Builder 本地立即释放工作目录，不再依赖 Controller 数据库长期保留该 Attempt。成功 Attempt 仍必须等待 Controller 明确授权。
 - ADR-070：确定性审计只阻断能够由输入直接证明的违规。PKGBUILD 或安装脚本中静态出现私网、回环或链路本地地址可能只是本机服务配置，记录为可疑发现并交给 Agent 结合上下文判断；Fetch 实际发起的目标仍在网络入口拒绝私网、回环和链路本地地址。这样不会把文字匹配误当成恶意行为，也不放宽真实下载边界。
 - ADR-071：直接调度器与反向租约共用同一 Worker 资格判定。若不存在可主动连接的 Builder，但存在符合标签、Profile 和亲和性要求的在线反向 Builder，任务保持 queued 等待其长轮询，不写入 `NO_ELIGIBLE_WORKER`；只有两种连接模式均无合格 Worker 时才产生告警。
+- ADR-072：JobSpec 的依赖来源不能只根据外部 Provider 解析结果判断，还必须对照当前 pkgbase 的完整 split output。由同一 pkgbase 产出的依赖标记为批次内部来源，使 Fetch 不会要求 pacman 下载不存在的同名官方包；makepkg 仍一次构建并校验全部 split outputs。该分类在生成 JobSpec 时实施，也能修复已经持久化但尚未成功的 Revision。
 
 ## 已拒绝
 
