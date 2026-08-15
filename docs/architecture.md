@@ -131,7 +131,7 @@ Controller 对基础设施错误和 `FETCH_DEPENDENCY_DOWNLOAD_FAILED` 自动创
 
 反向 Builder 第一版每次只租约一个未结束 Job。只要同一 Worker 仍有 `dispatched`、`running` 或 `uncertain` Job，Controller 就保留后续任务为 queued，不提前签发 JobSpec。这样 JobSpec 的十分钟有效期只覆盖传输和启动，不会在 Worker 本地等待队列中消耗；前一结果完成对账后才签发下一任务。
 
-第一版自动创建的 Build Job 默认分配 4 个 vCPU、4 GiB 内存、32 GiB 临时磁盘和 1 小时超时；Fetch Job 仍保持 1 个 vCPU。QEMU 按签名 JobSpec 生成 `-smp 4`，Ninja、CMake 等会根据 Guest 可见 CPU 数自动并行。已经启动的 VM 不热改资源，默认值只作用于修改后新创建的 Build Job。
+第一版自动创建的 Build Job 默认分配 4 个 vCPU、8 GiB 内存、32 GiB 临时磁盘和 1 小时超时；Fetch Job 仍保持 1 个 vCPU。QEMU 按签名 JobSpec 生成 `-smp 4`，Ninja、CMake 等会根据 Guest 可见 CPU 数自动并行。8 GiB 内存用于避免大型并行 C++ 编译在无 Swap Guest 中因页回收失去进展。已经启动的 VM 不热改资源，默认值只作用于修改后新创建的 Build Job。
 
 Worker 将 QEMU stdout/stderr 写入 Attempt runtime。失败时只把 QEMU 日志、Guest 结构化错误和 makepkg 日志复制到小型 `failed/<attempt>` 诊断目录，再删除 overlay、控制 Socket和临时输入；成功时日志暂随 completed 结果保存，overlay 同样先删除。Controller 持久化有界日志和最终结果；上报确认后立即释放失败/取消工作区，批次终止后释放成功工作区，避免桌面 Builder 逐次累积源码与二进制副本，也不会把 Guest 错误压缩成无法定位的 `VM_FAILED`。
 
