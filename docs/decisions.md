@@ -77,6 +77,7 @@
 - ADR-073：第一版只构建 x86_64，因此 Publisher 解析 `.SRCINFO` 时合并通用字段和 `_x86_64` 架构字段，并忽略其他架构后缀。不能把 `depends_x86_64` 留到 makepkg 才发现，否则 Fetch 生成的离线依赖快照不完整，Build 会在无机会补齐依赖时确定性失败。未来增加多架构 Worker 时必须把目标架构加入 Revision 和 JobSpec，再把该规则参数化。
 - ADR-074：单机 Builder 宿主有 16 个逻辑 CPU，第一版自动 Build Job 默认从 2 个提高到 4 个 vCPU。Waywallen 的并行 C++ 构建在 4 GiB、无 Swap Guest 中重复出现全部编译进程等待文件页、QEMU 无新增 I/O 的停滞，因此默认内存提高到 8 GiB；磁盘和超时保持 32 GiB、1 小时。已经运行的 QEMU 不热改；新创建的 JobSpec 才使用新默认值。
 - ADR-075：反向 Builder 的任务容量由 Controller 中该 Worker 的未结束 Job 判定。第一版单 Worker 并发为一，只要存在 `dispatched`、`running` 或 `uncertain` Job 就不签发下一 JobSpec，避免已签名任务在 Worker 本地排队超过十分钟有效期。不能通过单纯延长 JobSpec 有效期掩盖超额派发。
+- ADR-076：Guest 使用仓库自带的最小 pacman 配置，固定启用 Arch 官方 `core`、`extra` 和 `multilib`，镜像地址仍由 Profile 构建参数配置。AUR 的 x86_64 包可以合法依赖 `lib32-*` 官方包；缺少 `multilib` 是构建环境错误，不能把这些依赖删除或对具体包加特判。
 
 ## 已拒绝
 

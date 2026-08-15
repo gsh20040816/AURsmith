@@ -129,6 +129,8 @@ Guest 完成后写出带类型的 FetchResult 或 BuildResult。Builder 重新�
 
 Controller 对基础设施错误和 `FETCH_DEPENDENCY_DOWNLOAD_FAILED` 自动创建新 Attempt：`BUILDER_INFRASTRUCTURE`、VM 超时/异常、Guest 结果缺失、结果暂不可读、Worker 不可达或 Fetch Guest 的 pacman 下载耗尽。Profile 固定的是基础 packages 名称列表和 pacman、makepkg、systemd、Guest Agent 等配置，不固定软件包版本。共享 `root.qcow2` 只是启动缓存；Fetch Guest 每次从当前镜像刷新数据库，并用同一次 pacman 事务下载完整系统升级集合以及本次 `depends`、`makedepends`、`checkdepends` 的最新闭包。Build Guest 在任务私有 overlay 中离线安装整个集合后再运行 makepkg，因此基础系统和构建依赖都跟随任务开始时的镜像上游，同时不让并发任务共同修改启动缓存。该下载最多尝试三次，全部失败后才报告专用错误码；其他 `GUEST_FETCH_FAILED` 仍视为确定性错误，不自动循环。Build 日志出现 DNS、路由、连接失败或 NuGet `NU1301` 时单独标记 `NETWORK_DURING_BUILD`，同样不自动循环构建。generation 0 和 1 分别在 5 秒、10 秒后重试；generation 2 再失败即终止，因此一个 Fetch Job 最多三个 Attempt。输入摘要、Profile、身份、审计和确定性 Build 错误不会自动循环。SSH 提交或对账状态不明确时，Job 先进入 `uncertain`，三十分钟内不重新派发；届时再次查询 Journal，仍不可达才按同一 generation 上限重试，耗尽后打开稳定 fingerprint 告警。
 
+Guest 的最小 pacman 配置固定启用 Arch 官方 `core`、`extra` 和 `multilib`，因此 x86_64 AUR 包声明的 `lib32-*` 依赖仍从配置的同一镜像获取。Profile 固定仓库集合与配置，但每次 Fetch 继续同步这些仓库的最新数据库和依赖版本。
+
 反向 Builder 第一版每次只租约一个未结束 Job。只要同一 Worker 仍有 `dispatched`、`running` 或 `uncertain` Job，Controller 就保留后续任务为 queued，不提前签发 JobSpec。这样 JobSpec 的十分钟有效期只覆盖传输和启动，不会在 Worker 本地等待队列中消耗；前一结果完成对账后才签发下一任务。
 
 第一版自动创建的 Build Job 默认分配 4 个 vCPU、8 GiB 内存、32 GiB 临时磁盘和 1 小时超时；Fetch Job 仍保持 1 个 vCPU。QEMU 按签名 JobSpec 生成 `-smp 4`，Ninja、CMake 等会根据 Guest 可见 CPU 数自动并行。8 GiB 内存用于避免大型并行 C++ 编译在无 Swap Guest 中因页回收失去进展。已经启动的 VM 不热改资源，默认值只作用于修改后新创建的 Build Job。
