@@ -644,11 +644,23 @@ fn validate_expected_outputs(
         .filter_map(|artifact| artifact.package_name.clone())
         .collect::<BTreeSet<_>>();
     let expected = expected_outputs.iter().cloned().collect::<BTreeSet<_>>();
-    if !expected.is_empty() && actual != expected {
+    let missing = expected
+        .difference(&actual)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let unexpected = actual
+        .difference(&expected)
+        .filter(|name| {
+            name.strip_suffix("-debug")
+                .is_none_or(|parent| !expected.contains(parent))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !expected.is_empty() && (!missing.is_empty() || !unexpected.is_empty()) {
         bail!(
-            "构建产物与签名 JobSpec 的 split outputs 不一致：预期 {:?}，实际 {:?}",
-            expected,
-            actual
+            "构建产物与签名 JobSpec 的 split outputs 不一致：缺少 {:?}，非 makepkg debug 产物 {:?}",
+            missing,
+            unexpected
         );
     }
     Ok(())
@@ -1197,6 +1209,21 @@ mod tests {
         assert!(
             validate_expected_outputs(std::slice::from_ref(&artifact), &["demo".into()]).is_ok()
         );
-        assert!(validate_expected_outputs(&[artifact], &["missing-split-output".into()]).is_err());
+        let debug = ArtifactRecord {
+            path: "demo-debug-1-1-any.pkg.tar.zst".into(),
+            package_name: Some("demo-debug".into()),
+            ..artifact.clone()
+        };
+        assert!(validate_expected_outputs(&[artifact.clone(), debug], &["demo".into()]).is_ok());
+        assert!(
+            validate_expected_outputs(&[artifact.clone()], &["missing-split-output".into()])
+                .is_err()
+        );
+        let unrelated = ArtifactRecord {
+            path: "unrelated-1-1-any.pkg.tar.zst".into(),
+            package_name: Some("unrelated".into()),
+            ..artifact.clone()
+        };
+        assert!(validate_expected_outputs(&[artifact, unrelated], &["demo".into()]).is_err());
     }
 }
