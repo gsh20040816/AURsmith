@@ -77,6 +77,7 @@ services:
       AURSMITH_SIGNER_INBOX: /inbox
       AURSMITH_SIGNER_OUTPUT: /signed
       AURSMITH_SIGNER_REPOSITORY: /repository
+      AURSMITH_KEYRING_REFRESH_DAYS: ${AURSMITH_KEYRING_REFRESH_DAYS:-30}
     secrets:
       - repository_gpg_private_key
     volumes:

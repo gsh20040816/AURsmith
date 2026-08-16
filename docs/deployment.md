@@ -86,6 +86,8 @@ Controller 自行提供 Web/API，Publisher 自行提供仓库 HTTP；两者默�
 
 Publisher Stack 还自带独立 pacoloco。它只缓存 Arch 官方仓库，缓存卷为 `pacoloco-cache`，不应与 Publisher staging 或公开仓库卷合并。外部 Arch 上游由 Publisher Compose 的 `AURSMITH_ARCH_MIRROR` 构建参数配置，必须是无凭据和参数的 HTTPS Base URL。宿主反向代理把 `https://<稳定仓库域名>/arch-cache/` 转发到 pacoloco；首次部署可连续请求同一 `core.db`，再在 Doctor 中确认 requests、misses 和 hits 递增。
 
+Signer 默认通过 `AURSMITH_KEYRING_REFRESH_DAYS=30` 限制仓库 keyring 包的复用时间，允许范围为 1 到 365 天。到期后不会制造空 Release；最迟在到期后的下一次普通 Release 中生成新版 keyring 包。相同 Release 的重试仍复用其固定 Release ID 和签发时间，因此包版本保持一致。
+
 Builder Stack 必须设置 `DOCKER_GID`、`AURSMITH_JOBS_DIR`、`AURSMITH_SECRET_GID`、`AURSMITH_CONTROLLER_POLL_URL` 和 `AURSMITH_REVERSE_PUBLISHER_ENDPOINT`。`DOCKER_GID` 是宿主 Docker Socket 所属组；`AURSMITH_JOBS_DIR` 必须是宿主绝对路径，并以同一路径 bind 到 Worker，使宿主 Docker daemon 能解析每个 Attempt 的 input/output bind。`AURSMITH_SECRET_GID` 是宿主部署密钥文件所属组，私钥应保持 `0440` 且仅允许该组读取。轮询地址必须是公网 Controller 的无凭据 HTTPS URL；Publisher 端点仍是只允许 Capability 接收与完成命令的 SSH forced-command 账户。
 
 反向 Builder 首次注册时，在本地执行 `aursmithctl worker status` 取得持久实例 UUID 与 `identity_signing_key_hex`，由管理员在 Web UI 选择 `reverse` 模式录入。私钥只存在 Builder Journal 中，Controller 只保存公钥。注册完成后 Builder 每次轮询都签署 UUID、nonce、时间、状态和 Attempt Journal；Controller 不尝试连接家庭网络。Publisher 的推送 SSH 入口只接受固定 rsync receiver 路径 `/landing/.<Capability ID>.partial/` 与 `finalize-push-import`，不允许 Shell、PTY、转发或任意目标路径。

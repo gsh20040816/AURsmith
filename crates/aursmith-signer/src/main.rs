@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use aursmith_protocol::{
     ArtifactRecord, ManifestEntry, ReleaseAuthorization, ReleaseManifest, SignedEnvelope,
 };
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,6 +35,8 @@ struct Cli {
     gpg_private_key: PathBuf,
     #[arg(long, env = "AURSMITH_GPG_HOME", default_value = "/run/aursmith-gnupg")]
     gpg_home: PathBuf,
+    #[arg(long, env = "AURSMITH_KEYRING_REFRESH_DAYS", default_value_t = 30)]
+    keyring_refresh_days: i64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,6 +45,9 @@ fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
     let cli = Cli::parse();
+    if !(1..=365).contains(&cli.keyring_refresh_days) {
+        bail!("AURSMITH_KEYRING_REFRESH_DAYS 必须在 1 到 365 之间");
+    }
     let controller_key = hex::decode(&cli.controller_key_hex)?;
     if controller_key.len() != 32 {
         bail!("Controller verifying key 必须是 32 字节");
@@ -220,6 +225,7 @@ fn reusable_repository_keyring(
     staging: &Path,
 ) -> anyhow::Result<Option<ArtifactRecord>> {
     let fingerprint = repository_fingerprint(cli)?;
+    let earliest_reusable = Utc::now() - ChronoDuration::days(cli.keyring_refresh_days);
     let releases = cli.repository.join("x86_64/releases");
     let mut candidates = fs::read_dir(releases)
         .ok()
@@ -230,6 +236,9 @@ fn reusable_repository_keyring(
             let manifest: ReleaseManifest =
                 serde_json::from_slice(&fs::read(entry.path().join("release-manifest.json")).ok()?)
                     .ok()?;
+            if manifest.committed_at < earliest_reusable {
+                return None;
+            }
             manifest
                 .repository_keyring
                 .map(|artifact| (manifest.committed_at, artifact))
@@ -809,6 +818,7 @@ mod tests {
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.join("unused"),
             gpg_home: root.join("gnupg"),
+            keyring_refresh_days: 30,
         }
     }
 
@@ -852,6 +862,7 @@ mod tests {
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home: root.path().join("gnupg"),
+            keyring_refresh_days: 30,
         };
 
         assert!(process_pending(&cli, &[0; 32]).is_ok());
@@ -878,6 +889,7 @@ mod tests {
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home: root.path().join("gnupg"),
+            keyring_refresh_days: 30,
         };
 
         assert!(process_release(&cli, &[0; 32], &entry).is_ok());
@@ -1053,6 +1065,7 @@ mod tests {
             controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home,
+            keyring_refresh_days: 30,
         };
         let authorization = ReleaseAuthorization {
             release_id: Uuid::new_v4(),
@@ -1079,7 +1092,7 @@ mod tests {
         assert!(repository_keyring_matches(&cli, &package, &fingerprint).unwrap());
         let entries = Command::new("/usr/bin/bsdtar")
             .args(["-tf"])
-            .arg(package)
+            .arg(&package)
             .output()
             .unwrap();
         assert!(entries.status.success());
@@ -1091,5 +1104,51 @@ mod tests {
         ] {
             assert!(entries.lines().any(|entry| entry == expected));
         }
+
+        let repository_root = cli.repository.join("x86_64");
+        let release_root = repository_root.join("releases/fixture");
+        let reuse_staging = root.path().join("reuse-staging");
+        fs::create_dir_all(&release_root).unwrap();
+        fs::create_dir_all(&reuse_staging).unwrap();
+        fs::copy(&package, repository_root.join(&artifact.path)).unwrap();
+        fs::write(
+            repository_root.join(format!("{}.sig", artifact.path)),
+            b"fixture-signature",
+        )
+        .unwrap();
+        let placeholder = ManifestEntry {
+            path: "placeholder".into(),
+            sha256: "0".repeat(64),
+            size: 0,
+        };
+        let mut manifest = ReleaseManifest {
+            release_id: Uuid::new_v4(),
+            batch_id: Uuid::new_v4(),
+            source_git_commit: "a".repeat(40),
+            repository_name: "aursmith".into(),
+            writer_epoch: 1,
+            artifacts: vec![],
+            evidence_files: vec![],
+            removed_package_names: vec![],
+            repository_keyring: Some(artifact.clone()),
+            repository_database: placeholder.clone(),
+            repository_files: placeholder,
+            artifact_inspections: None,
+            release_authorization: None,
+            committed_at: Utc::now(),
+        };
+        let manifest_path = release_root.join("release-manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            reusable_repository_keyring(&cli, &reuse_staging).unwrap(),
+            Some(artifact.clone())
+        );
+
+        manifest.committed_at = Utc::now() - Duration::days(31);
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            reusable_repository_keyring(&cli, &reuse_staging).unwrap(),
+            None
+        );
     }
 }
