@@ -1,0 +1,15 @@
+[Unit]
+Description=AURsmith Guest 构建任务
+DefaultDependencies=no
+After=systemd-remount-fs.service systemd-udev-trigger.service
+Wants=systemd-udev-trigger.service
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aursmith-guest-agent
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

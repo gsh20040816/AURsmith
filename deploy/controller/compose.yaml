@@ -1,0 +1,216 @@
+name: aursmith-controller
+
+services:
+  controller:
+    build:
+      context: ../..
+      dockerfile: deploy/images/controller.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_BIND: 0.0.0.0:8080
+      AURSMITH_DATABASE_URL: sqlite:///var/lib/aursmith/controller.db
+      AURSMITH_PUBLIC_ORIGIN: ${AURSMITH_PUBLIC_ORIGIN:?必须设置管理站点的固定 HTTPS Origin}
+      AURSMITH_SESSION_IDLE_MINUTES: ${AURSMITH_SESSION_IDLE_MINUTES:-60}
+      AURSMITH_SESSION_ABSOLUTE_HOURS: ${AURSMITH_SESSION_ABSOLUTE_HOURS:-168}
+      AURSMITH_SIGNING_KEY_FILE: /run/secrets/controller_signing_key
+      AURSMITH_SSH_IDENTITY_SOURCE_FILE: /run/secrets/worker_ssh_key
+      AURSMITH_SSH_IDENTITY_FILE: /run/aursmith-private/worker_ssh_key
+      AURSMITH_SSH_KNOWN_HOSTS_FILE: /run/secrets/worker_known_hosts
+      AURSMITH_LOW_AGENT_ENDPOINTS: http://agent-low-1:8090,http://agent-low-2:8090,http://agent-low-3:8090
+      AURSMITH_HIGH_AGENT_ENDPOINT: http://agent-high:8090
+      AURSMITH_AGENT_DAILY_CALL_LIMIT: ${AURSMITH_AGENT_DAILY_CALL_LIMIT:-300}
+      AURSMITH_AGENT_MONTHLY_CALL_LIMIT: ${AURSMITH_AGENT_MONTHLY_CALL_LIMIT:-3000}
+      AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD: ${AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD:-5000000}
+      AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS: ${AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS:-0}
+      AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
+      AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+      AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
+      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: ${AURSMITH_CLIENT_CA_CERTIFICATE_FILE:-}
+      AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
+      AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
+      AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
+      AURSMITH_BACKUP_DIR: /var/lib/aursmith/backups
+      AURSMITH_BACKUP_EXPORT_DIR: /var/lib/aursmith/transfers
+      AURSMITH_BACKUP_EXPORT_SOCKET: /run/aursmith/worker.sock
+      RUST_LOG: ${RUST_LOG:-aursmith=info}
+    secrets:
+      - controller_signing_key
+      - worker_ssh_key
+      - worker_known_hosts
+      - webhook_hmac_secret
+    volumes:
+      - controller-data:/var/lib/aursmith
+      - controller-run:/run/aursmith
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run/aursmith-private:uid=10001,gid=10001,mode=0700,size=2m
+    ports:
+      - ${AURSMITH_WEB_BIND:-127.0.0.1:18443}:8080
+    networks: [control, agent, egress, edge, backbone]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aursmithctl, doctor, --role, controller]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  backup-ssh:
+    profiles: [external-archiver]
+    build:
+      context: ../..
+      dockerfile: deploy/images/controller.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    entrypoint: [/usr/local/bin/aursmithctl]
+    command: [run-sshd]
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH, SETGID, SETPCAP, SETUID]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - controller-run:/run/aursmith
+      - controller-data:/jobs:ro
+      - ../common/sshd_config:/etc/ssh/sshd_config:ro
+    secrets:
+      - source: source_ssh_host_ed25519_key
+        target: ssh_host_ed25519_key
+      - source: source_authorized_keys
+        target: authorized_keys
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/private:uid=0,gid=0,mode=0755,size=2m
+    ports:
+      - ${AURSMITH_BACKUP_SSH_BIND:-127.0.0.1:2221}:2222
+    networks: [control, edge]
+    depends_on:
+      controller:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent-low-1: &agent-runner
+    build:
+      context: ../..
+      dockerfile: deploy/images/agent-runner.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    # Codex 使用非特权 bubblewrap user namespace；Docker 默认 seccomp 和 Debian 的
+    # docker-default AppArmor 都会阻止其 mount namespace。Runner 自身仍无 capability、
+    # 无特权、根文件系统只读，并由 Codex 的 workspace sandbox 限制审计工作区。
+    security_opt: [no-new-privileges:true, seccomp:unconfined, apparmor:unconfined]
+    environment:
+      AURSMITH_AGENT_ADAPTER: codex
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_1_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_1_MODEL-}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_1_REASONING_EFFORT-}
+      AURSMITH_AGENT_TIMEOUT_SECONDS: ${AURSMITH_AGENT_TIMEOUT_SECONDS:-600}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low-1/
+    tmpfs:
+      - /tmp:uid=10002,gid=10002,mode=0700,size=32m
+    networks: [agent]
+    restart: unless-stopped
+
+  agent-low-2:
+    <<: *agent-runner
+    environment:
+      AURSMITH_AGENT_ADAPTER: codex
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_2_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_2_MODEL-}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_2_REASONING_EFFORT-}
+      AURSMITH_AGENT_TIMEOUT_SECONDS: ${AURSMITH_AGENT_TIMEOUT_SECONDS:-600}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low-2/
+
+  agent-low-3:
+    <<: *agent-runner
+    environment:
+      AURSMITH_AGENT_ADAPTER: codex
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_LOW_AGENT_3_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_LOW_AGENT_3_MODEL-}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_LOW_AGENT_3_REASONING_EFFORT-}
+      AURSMITH_AGENT_TIMEOUT_SECONDS: ${AURSMITH_AGENT_TIMEOUT_SECONDS:-600}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/low-3/
+
+  agent-high:
+    <<: *agent-runner
+    environment:
+      AURSMITH_AGENT_ADAPTER: ${AURSMITH_HIGH_AGENT_ADAPTER:-codex}
+      AURSMITH_AGENT_PROVIDER: ${AURSMITH_HIGH_AGENT_PROVIDER:-openai}
+      AURSMITH_AGENT_MODEL: ${AURSMITH_HIGH_AGENT_MODEL-gpt-5.6-terra}
+      AURSMITH_AGENT_REASONING_EFFORT: ${AURSMITH_HIGH_AGENT_REASONING_EFFORT-}
+      AURSMITH_AGENT_TIMEOUT_SECONDS: ${AURSMITH_AGENT_TIMEOUT_SECONDS:-600}
+      AURSMITH_AGENT_BASE_URL: http://agent-credential-gateway:8091/high/
+
+  agent-credential-gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/images/agent-gateway.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_LOW_AGENT_1_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_1_BASE_URL-}
+      AURSMITH_LOW_AGENT_1_AUTH_STYLE: ${AURSMITH_LOW_AGENT_1_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_1_API_KEY_FILE: /run/secrets/low_agent_1_api_key
+      AURSMITH_LOW_AGENT_2_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_2_BASE_URL-}
+      AURSMITH_LOW_AGENT_2_AUTH_STYLE: ${AURSMITH_LOW_AGENT_2_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_2_API_KEY_FILE: /run/secrets/low_agent_2_api_key
+      AURSMITH_LOW_AGENT_3_PROVIDER_BASE_URL: ${AURSMITH_LOW_AGENT_3_BASE_URL-}
+      AURSMITH_LOW_AGENT_3_AUTH_STYLE: ${AURSMITH_LOW_AGENT_3_AUTH_STYLE:-bearer}
+      AURSMITH_LOW_AGENT_3_API_KEY_FILE: /run/secrets/low_agent_3_api_key
+      AURSMITH_HIGH_AGENT_PROVIDER_BASE_URL: ${AURSMITH_HIGH_AGENT_BASE_URL-https://api.openai.com/v1/}
+      AURSMITH_HIGH_AGENT_AUTH_STYLE: ${AURSMITH_HIGH_AGENT_AUTH_STYLE:-bearer}
+      AURSMITH_HIGH_AGENT_API_KEY_FILE: /run/secrets/high_agent_api_key
+    secrets:
+      - low_agent_1_api_key
+      - low_agent_2_api_key
+      - low_agent_3_api_key
+      - high_agent_api_key
+    tmpfs:
+      - /tmp:uid=10003,gid=10003,mode=0700,size=8m
+    networks: [agent, egress]
+    restart: unless-stopped
+
+secrets:
+  controller_signing_key:
+    file: ${AURSMITH_SIGNING_KEY_FILE:-./secrets/controller_signing_key}
+  worker_ssh_key:
+    file: ${AURSMITH_WORKER_SSH_KEY_FILE:-./secrets/worker_ssh_key}
+  worker_known_hosts:
+    file: ${AURSMITH_WORKER_KNOWN_HOSTS_FILE:-./secrets/worker_known_hosts}
+  webhook_hmac_secret:
+    file: ${AURSMITH_WEBHOOK_HMAC_SECRET_FILE:-./secrets/webhook_hmac_secret}
+  source_ssh_host_ed25519_key:
+    file: ${AURSMITH_BACKUP_SSH_HOST_KEY_FILE:-./secrets/backup_ssh_host_ed25519_key}
+  source_authorized_keys:
+    file: ${AURSMITH_BACKUP_AUTHORIZED_KEYS_FILE:-./secrets/backup_authorized_keys}
+  low_agent_1_api_key:
+    file: ${AURSMITH_LOW_AGENT_1_API_KEY_FILE:-./secrets/low_agent_1_api_key}
+  low_agent_2_api_key:
+    file: ${AURSMITH_LOW_AGENT_2_API_KEY_FILE:-./secrets/low_agent_2_api_key}
+  low_agent_3_api_key:
+    file: ${AURSMITH_LOW_AGENT_3_API_KEY_FILE:-./secrets/low_agent_3_api_key}
+  high_agent_api_key:
+    file: ${AURSMITH_HIGH_AGENT_API_KEY_FILE:-./secrets/high_agent_api_key}
+
+volumes:
+  controller-data:
+  controller-run:
+
+networks:
+  backbone:
+    external: true
+    name: aursmith-backbone
+  control:
+    internal: true
+  agent:
+    internal: true
+  egress:
+  edge:

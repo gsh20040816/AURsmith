@@ -1,0 +1,20 @@
+services:
+  worker:
+    networks:
+      control:
+      egress:
+      backbone:
+        aliases:
+          - publisher-worker
+
+  ssh:
+    networks:
+      control:
+      backbone:
+        aliases:
+          - publisher-ssh
+
+networks:
+  backbone:
+    external: true
+    name: aursmith-backbone

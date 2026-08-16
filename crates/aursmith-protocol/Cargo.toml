@@ -1,0 +1,22 @@
+[package]
+name = "aursmith-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aursmith-domain = { path = "../aursmith-domain" }
+chrono.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+base64.workspace = true
