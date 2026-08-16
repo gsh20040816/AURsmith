@@ -58,20 +58,6 @@ for required_file in deploy/Dockerfile deploy/compose.yaml deploy/Caddyfile.exam
   fi
 done
 
-if ! rg -q 'https://aur[.]archlinux[.]org/\{pkgbase\}[.]git' crates/aursmith/src/aur.rs \
-  || ! rg -q 'OsStr::new\("--depth=1"\)' crates/aursmith/src/aur.rs; then
-  echo "生产 AUR 输入必须固定为官方 HTTPS pkgbase URL 和 depth=1 fetch" >&2
-  exit 1
-fi
-if rg -n \
-  -g '!docs/refactor-requirements.md' \
-  -g '!scripts/check-residuals.sh' \
-  'AURSMITH_(AUR|GIT)_(URL|REMOTE|PROXY)' \
-  .; then
-  echo "禁止任意 AUR 远端或代理配置" >&2
-  exit 1
-fi
-
 if rg -n \
   -g '!docs/refactor-requirements.md' \
   -g '!scripts/check-residuals.sh' \

@@ -1,5 +1,5 @@
 PRAGMA application_id = 0x41555253;
-PRAGMA user_version = 2;
+PRAGMA user_version = 1;
 
 CREATE TABLE administrators (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -31,7 +31,6 @@ CREATE TABLE tracked_packages (
     approved_aur_commit TEXT,
     approved_tree_sha256 TEXT,
     approved_at TEXT,
-    last_checked_at TEXT,
     last_error TEXT CHECK (last_error IS NULL OR length(last_error) BETWEEN 1 AND 16384),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -50,79 +49,3 @@ CREATE TABLE tracked_packages (
         )
     )
 ) STRICT;
-
-CREATE TABLE aur_reviews (
-    pkgbase TEXT NOT NULL
-        REFERENCES tracked_packages(pkgbase) ON DELETE CASCADE,
-    aur_commit TEXT NOT NULL
-        CHECK (length(aur_commit) = 40 AND aur_commit NOT GLOB '*[^0-9a-f]*'),
-    tree_sha256 TEXT
-        CHECK (
-            tree_sha256 IS NULL
-            OR (length(tree_sha256) = 64 AND tree_sha256 NOT GLOB '*[^0-9a-f]*')
-        ),
-    comparison_kind TEXT NOT NULL CHECK (comparison_kind IN ('full', 'diff')),
-    baseline_aur_commit TEXT,
-    baseline_tree_sha256 TEXT,
-    full_reason TEXT,
-    status TEXT NOT NULL CHECK (status IN ('prepared', 'input_blocked', 'superseded')),
-    blocker TEXT CHECK (blocker IS NULL OR length(blocker) BETWEEN 1 AND 16384),
-    review_json_sha256 TEXT NOT NULL
-        CHECK (length(review_json_sha256) = 64 AND review_json_sha256 NOT GLOB '*[^0-9a-f]*'),
-    changes_diff_sha256 TEXT
-        CHECK (
-            changes_diff_sha256 IS NULL
-            OR (
-                length(changes_diff_sha256) = 64
-                AND changes_diff_sha256 NOT GLOB '*[^0-9a-f]*'
-            )
-        ),
-    findings_json_sha256 TEXT NOT NULL
-        CHECK (
-            length(findings_json_sha256) = 64
-            AND findings_json_sha256 NOT GLOB '*[^0-9a-f]*'
-        ),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (pkgbase, aur_commit),
-    CHECK (
-        (baseline_aur_commit IS NULL AND baseline_tree_sha256 IS NULL)
-        OR
-        (
-            baseline_aur_commit IS NOT NULL
-            AND baseline_tree_sha256 IS NOT NULL
-            AND length(baseline_aur_commit) = 40
-            AND baseline_aur_commit NOT GLOB '*[^0-9a-f]*'
-            AND length(baseline_tree_sha256) = 64
-            AND baseline_tree_sha256 NOT GLOB '*[^0-9a-f]*'
-        )
-    ),
-    CHECK (
-        (comparison_kind = 'full' AND full_reason IS NOT NULL AND changes_diff_sha256 IS NULL)
-        OR
-        (
-            comparison_kind = 'diff'
-            AND tree_sha256 IS NOT NULL
-            AND baseline_aur_commit IS NOT NULL
-            AND full_reason IS NULL
-            AND changes_diff_sha256 IS NOT NULL
-        )
-    ),
-    CHECK (
-        (status = 'prepared' AND tree_sha256 IS NOT NULL AND blocker IS NULL)
-        OR (status = 'input_blocked' AND blocker IS NOT NULL)
-        OR
-        (
-            status = 'superseded'
-            AND
-            (
-                (tree_sha256 IS NOT NULL AND blocker IS NULL)
-                OR blocker IS NOT NULL
-            )
-        )
-    )
-) STRICT;
-
-CREATE UNIQUE INDEX aur_reviews_one_current_per_package
-    ON aur_reviews(pkgbase)
-    WHERE status IN ('prepared', 'input_blocked');

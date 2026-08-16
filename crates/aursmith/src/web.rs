@@ -2,7 +2,7 @@ use crate::{
     auth::{self, AuthenticatedSession},
     config::Config,
     error::ApiError,
-    packages, reviews,
+    packages,
 };
 use axum::{
     Extension, Json, Router,
@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024;
@@ -26,13 +26,10 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub(crate) login_throttle: Arc<Mutex<auth::LoginThrottle>>,
     pub(crate) password_verification_permits: Arc<Semaphore>,
-    pub(crate) review_engine: Arc<reviews::ReviewEngine>,
-    pub(crate) package_mutation_permit: Arc<Semaphore>,
 }
 
 impl AppState {
     pub fn new(database: SqlitePool, config: Config) -> Self {
-        let review_engine = reviews::ReviewEngine::production(config.aur_state_directory());
         Self {
             database,
             config: Arc::new(config),
@@ -40,20 +37,7 @@ impl AppState {
             password_verification_permits: Arc::new(Semaphore::new(
                 PASSWORD_VERIFICATION_CONCURRENCY,
             )),
-            review_engine: Arc::new(review_engine),
-            package_mutation_permit: Arc::new(Semaphore::new(1)),
         }
-    }
-
-    #[cfg(test)]
-    fn with_review_engine(
-        database: SqlitePool,
-        config: Config,
-        review_engine: reviews::ReviewEngine,
-    ) -> Self {
-        let mut state = Self::new(database, config);
-        state.review_engine = Arc::new(review_engine);
-        state
     }
 }
 
@@ -64,11 +48,6 @@ pub fn router(state: AppState) -> Router {
         .route("/manage/packages", post(add_package))
         .route("/manage/packages/{pkgbase}/pause", post(pause_package))
         .route("/manage/packages/{pkgbase}/resume", post(resume_package))
-        .route("/manage/packages/{pkgbase}/refresh", post(refresh_package))
-        .route(
-            "/manage/packages/{pkgbase}/reviews/{commit}",
-            get(review_page),
-        )
         .route("/manage/packages/{pkgbase}", delete(delete_package))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -152,98 +131,32 @@ async fn add_package(
     State(state): State<AppState>,
     Json(request): Json<AddPackageRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let database = state.database.clone();
-    run_package_mutation(&state, async move {
-        packages::add(&database, &request.pkgbase).await?;
-        Ok(StatusCode::CREATED)
-    })
-    .await
+    packages::add(&state.database, &request.pkgbase).await?;
+    Ok(StatusCode::CREATED)
 }
 
 async fn pause_package(
     State(state): State<AppState>,
     Path(pkgbase): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let database = state.database.clone();
-    run_package_mutation(&state, async move {
-        packages::set_state(&database, &pkgbase, "paused").await?;
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
+    packages::set_state(&state.database, &pkgbase, "paused").await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn resume_package(
     State(state): State<AppState>,
     Path(pkgbase): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let database = state.database.clone();
-    run_package_mutation(&state, async move {
-        packages::set_state(&database, &pkgbase, "active").await?;
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
+    packages::set_state(&state.database, &pkgbase, "active").await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_package(
     State(state): State<AppState>,
     Path(pkgbase): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let database = state.database.clone();
-    let review_engine = state.review_engine.clone();
-    run_package_mutation(&state, async move {
-        reviews::delete_package(&database, &review_engine, &pkgbase).await?;
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
-}
-
-async fn refresh_package(
-    State(state): State<AppState>,
-    Path(pkgbase): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let database = state.database.clone();
-    let review_engine = state.review_engine.clone();
-    run_package_mutation(&state, async move {
-        reviews::refresh(&database, &review_engine, &pkgbase).await?;
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
-}
-
-async fn run_package_mutation<T, F>(state: &AppState, operation: F) -> Result<T, ApiError>
-where
-    T: Send + 'static,
-    F: Future<Output = Result<T, ApiError>> + Send + 'static,
-{
-    let permit = state
-        .package_mutation_permit
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::conflict(
-                "PACKAGE_MUTATION_BUSY",
-                "已有包变更正在运行；请等待其完成后重试",
-            )
-        })?;
-    tokio::spawn(async move {
-        let _permit = permit;
-        operation.await
-    })
-    .await
-    .map_err(ApiError::internal)?
-}
-
-async fn review_page(
-    State(state): State<AppState>,
-    Extension(session): Extension<AuthenticatedSession>,
-    Path((pkgbase, commit)): Path<(String, String)>,
-) -> Result<Html<String>, ApiError> {
-    let detail = reviews::detail(&state.database, &state.review_engine, &pkgbase, &commit).await?;
-    let username = session.username;
-    let rendered = tokio::task::spawn_blocking(move || render_review_page(&username, &detail))
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Html(rendered))
+    packages::delete(&state.database, &pkgbase).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn render_management_page(username: &str, tracked_packages: &[packages::TrackedPackage]) -> String {
@@ -309,135 +222,19 @@ fn render_package(package: &packages::TrackedPackage) -> String {
         .as_deref()
         .map(|error| format!("<p class=\"last-error\">{}</p>", escape_html(error)))
         .unwrap_or_else(|| "<p class=\"muted\">没有记录错误</p>".to_owned());
-    let current_review = match (
-        package.current_review_commit.as_deref(),
-        package.current_review_tree_sha256.as_deref(),
-        package.current_review_status.as_deref(),
-        package.current_review_comparison.as_deref(),
-    ) {
-        (Some(commit), tree, Some(review_status), Some(comparison)) => format!(
-            "<a href=\"/manage/packages/{}/reviews/{}\"><code>{}…</code> · <span class=\"state {}\">{}</span> · {}</a>{}",
-            pkgbase,
-            escape_html(commit),
-            escape_html(&commit[..12]),
-            escape_html(review_status),
-            escape_html(review_status),
-            escape_html(comparison),
-            tree.map(|tree| format!("<small>tree {}…</small>", escape_html(&tree[..12])))
-                .unwrap_or_default()
-        ),
-        _ => "<span class=\"muted\">尚未刷新 AUR</span>".to_owned(),
-    };
-    let last_checked = package
-        .last_checked_at
-        .map(|checked| escape_html(&checked.to_rfc3339()))
-        .unwrap_or_else(|| "尚未检查".to_owned());
     let state_action = if package.state == "active" {
         "<button type=\"button\" class=\"quiet\" data-action=\"pause\">暂停</button>"
     } else {
         "<button type=\"button\" class=\"quiet\" data-action=\"resume\">恢复</button>"
     };
-    let refresh_action = if package.state == "active" {
-        "<button type=\"button\" data-action=\"refresh\">刷新 AUR</button>"
-    } else {
-        "<button type=\"button\" disabled title=\"恢复后才能刷新 AUR\">刷新 AUR</button>"
-    };
     format!(
         r#"<article class="package" data-pkgbase="{}">
   <div class="forge-tag {}" aria-hidden="true"><span>PKG</span></div>
-  <div class="package-main"><div class="package-title"><h2>{}</h2><span class="state {}">{}</span></div><dl><div><dt>当前 AUR 输入</dt><dd>{}</dd></div><div><dt>最后检查</dt><dd>{}</dd></div><div><dt>批准 baseline</dt><dd>{}</dd></div><div><dt>最后错误</dt><dd>{}</dd></div></dl></div>
-  <div class="actions">{}{}<button type="button" class="danger" data-action="delete">物理删除</button></div>
+  <div class="package-main"><div class="package-title"><h2>{}</h2><span class="state {}">{}</span></div><dl><div><dt>批准 baseline</dt><dd>{}</dd></div><div><dt>最后错误</dt><dd>{}</dd></div></dl></div>
+  <div class="actions">{}<button type="button" class="danger" data-action="delete">物理删除</button></div>
 </article>"#,
-        pkgbase,
-        state,
-        pkgbase,
-        state,
-        state,
-        current_review,
-        last_checked,
-        baseline,
-        last_error,
-        refresh_action,
-        state_action
+        pkgbase, state, pkgbase, state, state, baseline, last_error, state_action
     )
-}
-
-fn render_review_page(username: &str, detail: &reviews::ReviewDetail) -> String {
-    let record = &detail.record;
-    let tree = record
-        .tree_sha256
-        .as_deref()
-        .map(escape_html)
-        .unwrap_or_else(|| "未生成：输入在完整物化前被阻止".to_owned());
-    let comparison = if record.comparison_kind == "diff" {
-        format!(
-            "完整 diff，相对 baseline {} / {}",
-            escape_html(record.baseline_aur_commit.as_deref().unwrap_or("")),
-            escape_html(record.baseline_tree_sha256.as_deref().unwrap_or(""))
-        )
-    } else {
-        format!(
-            "full：{}",
-            escape_html(record.full_reason.as_deref().unwrap_or("未记录原因"))
-        )
-    };
-    let blockers = if detail.findings.blockers.is_empty() {
-        "<p class=\"muted\">确定性输入检查未发现 blocker。</p>".to_owned()
-    } else {
-        format!(
-            "<ul class=\"findings\">{}</ul>",
-            detail
-                .findings
-                .blockers
-                .iter()
-                .map(|finding| format!("<li>{}</li>", escape_html(finding)))
-                .collect::<Vec<_>>()
-                .join("")
-        )
-    };
-    let diff = match detail.diff.as_deref() {
-        Some(diff) => {
-            let (label, rendered) = render_diff(diff);
-            format!(
-                "<section class=\"diff-panel\"><h2>{}</h2><pre><code>{}</code></pre></section>",
-                escape_html(label),
-                rendered
-            )
-        }
-        None => format!(
-            "<section class=\"full-note\"><h2>Full 输入</h2><p>{}</p></section>",
-            comparison
-        ),
-    };
-    format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{pkgbase} 输入审查 · AURsmith</title><link rel="stylesheet" href="/assets/aursmith.css"><script src="/assets/aursmith.js" defer></script></head>
-<body><main class="shell review-shell">
-  <header class="masthead"><div><p class="eyebrow">AURsmith / AUR 输入证据</p><h1>{pkgbase}</h1><p class="lede">这里只展示固定 commit 的原始输入与确定性检查；尚未执行 Agent、批准、构建或发布。</p></div><div class="operator"><span>{username}</span><a href="/manage">返回包目录</a></div></header>
-  <section class="review-identity"><span class="forge-mark" aria-hidden="true">PKG</span><dl><div><dt>状态</dt><dd><span class="state {status}">{status}</span></dd></div><div><dt>commit</dt><dd><code>{commit}</code></dd></div><div><dt>tree SHA-256</dt><dd><code>{tree}</code></dd></div><div><dt>比较</dt><dd>{comparison}</dd></div></dl></section>
-  <section class="finding-panel"><h2>确定性 findings</h2>{blockers}</section>
-  {diff}
-</main></body></html>"#,
-        pkgbase = escape_html(&record.pkgbase),
-        username = escape_html(username),
-        status = escape_html(&record.status),
-        commit = escape_html(&record.aur_commit),
-    )
-}
-
-fn render_diff(diff: &[u8]) -> (&'static str, String) {
-    match std::str::from_utf8(diff) {
-        Ok(diff) => ("完整 changes.diff（UTF-8）", escape_html(diff)),
-        Err(_) => {
-            let encoded = diff
-                .chunks(32)
-                .map(hex::encode)
-                .collect::<Vec<_>>()
-                .join("\n");
-            ("完整 changes.diff（非 UTF-8，可逆十六进制）", encoded)
-        }
-    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -542,7 +339,7 @@ const JAVASCRIPT: &str = r#"(() => {
       const pkgbase = row?.dataset.pkgbase;
       if (!pkgbase) return;
       if (action === 'delete' && !window.confirm(`物理删除 ${pkgbase}？批准 baseline 和最后错误也会删除。`)) return;
-      const suffix = action === 'pause' || action === 'resume' || action === 'refresh' ? `/${action}` : '';
+      const suffix = action === 'pause' || action === 'resume' ? `/${action}` : '';
       const method = action === 'delete' ? 'DELETE' : 'POST';
       if (await write(`/manage/packages/${encodeURIComponent(pkgbase)}${suffix}`, method)) window.location.reload();
     } catch (error) {
@@ -569,9 +366,7 @@ button, input { border-radius: .35rem; }
 button { border: 1px solid var(--temper); background: var(--temper); color: var(--surface); padding: .72rem 1rem; font-weight: 700; cursor: pointer; }
 button.quiet { background: transparent; color: var(--temper); }
 button.danger { border-color: var(--ember); background: transparent; color: var(--ember); }
-button:disabled { cursor: not-allowed; opacity: .55; }
-a { color: var(--temper); text-underline-offset: .18em; }
-button:focus-visible, input:focus-visible, a:focus-visible { outline: 3px solid var(--temper); outline-offset: 3px; }
+button:focus-visible, input:focus-visible { outline: 3px solid var(--temper); outline-offset: 3px; }
 input { width: 100%; border: 1px solid #9AA8AE; background: var(--surface); color: var(--ink); padding: .72rem .8rem; }
 h1, h2 { font-family: "Arial Narrow", "Roboto Condensed", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; margin: 0; letter-spacing: .01em; }
 code, .state, .eyebrow { font-family: ui-monospace, "Cascadia Mono", "Noto Sans Mono CJK SC", Consolas, monospace; }
@@ -580,7 +375,7 @@ code, .state, .eyebrow { font-family: ui-monospace, "Cascadia Mono", "Noto Sans 
 .eyebrow { margin: 0 0 .65rem; color: var(--temper); font-size: .78rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .lede { max-width: 46rem; color: var(--muted); line-height: 1.65; }
 .operator { display: flex; align-items: center; gap: .75rem; white-space: nowrap; }
-.add-panel, .package, .login-panel, .review-identity, .finding-panel, .diff-panel, .full-note { background: var(--surface); border: 1px solid #C1CDD2; box-shadow: 0 8px 24px rgba(23,36,45,.07); }
+.add-panel, .package, .login-panel { background: var(--surface); border: 1px solid #C1CDD2; box-shadow: 0 8px 24px rgba(23,36,45,.07); }
 .add-panel { display: grid; grid-template-columns: minmax(15rem, .8fr) minmax(20rem, 1.2fr); gap: 2rem; padding: 1.5rem; margin-bottom: 1rem; }
 .add-panel p, .login-panel p { color: var(--muted); line-height: 1.55; }
 label { display: block; margin-bottom: .4rem; font-weight: 700; }
@@ -597,8 +392,6 @@ label { display: block; margin-bottom: .4rem; font-weight: 700; }
 .package-title h2 { overflow-wrap: anywhere; }
 .state { border: 1px solid currentColor; padding: .16rem .45rem; color: var(--temper); font-size: .72rem; }
 .state.paused { color: var(--muted); }
-.state.input_blocked, .state.input-blocked { color: var(--ember); }
-.state.superseded { color: var(--muted); }
 dl { display: grid; gap: .6rem; margin: 1rem 0 0; }
 dl div { display: grid; grid-template-columns: 9rem 1fr; gap: .75rem; }
 dt { color: var(--muted); }
@@ -612,23 +405,12 @@ dd small { display: block; color: var(--muted); margin-top: .25rem; }
 .login-body { display: grid; place-items: center; padding: 1rem; }
 .login-panel { width: min(28rem, 100%); padding: 2rem; }
 .login-panel form { display: grid; gap: .7rem; margin-top: 1.5rem; }
-.review-shell { display: grid; gap: 1rem; }
-.review-shell .masthead { margin-bottom: 1rem; }
-.review-identity { display: grid; grid-template-columns: 4.5rem 1fr; overflow: hidden; }
-.forge-mark { display: grid; place-items: center; background: var(--temper); color: var(--surface); writing-mode: vertical-rl; letter-spacing: .16em; font: 800 .72rem ui-monospace, monospace; }
-.review-identity dl { padding: .5rem 1.5rem 1.5rem; }
-.finding-panel, .diff-panel, .full-note { padding: 1.5rem; }
-.findings { margin: 1rem 0 0; color: var(--ember); line-height: 1.6; }
-.diff-panel pre { max-width: 100%; max-height: 65vh; overflow: auto; margin: 1rem 0 0; padding: 1rem; background: var(--ink); color: var(--surface); border-radius: .35rem; }
-.diff-panel code { white-space: pre; }
-.full-note p { margin-bottom: 0; color: var(--muted); }
 @media (max-width: 700px) {
   .shell { width: min(100% - 1rem, 42rem); padding: 1.25rem 0; }
   .masthead, .add-panel { display: grid; grid-template-columns: 1fr; gap: 1rem; }
   .package { grid-template-columns: 2.75rem 1fr; }
   .actions { grid-column: 1 / -1; flex-direction: row; border-left: 0; border-top: 1px solid #D5DEE2; }
   dl div { grid-template-columns: 1fr; gap: .2rem; }
-  .review-identity { grid-template-columns: 2.75rem 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
@@ -643,105 +425,9 @@ mod tests {
         http::{Request, header::SET_COOKIE},
     };
     use serde_json::json;
-    use std::{fs, path::Path, process::Command};
     use tower::ServiceExt;
 
     const PASSWORD: &str = "足够长的测试密码-123456";
-
-    struct WebGitFixture {
-        remote: std::path::PathBuf,
-        work: std::path::PathBuf,
-    }
-
-    impl WebGitFixture {
-        fn new(root: &Path) -> Self {
-            let remote = root.join("remote.git");
-            let work = root.join("work");
-            run_git(
-                root,
-                [
-                    "init",
-                    "--quiet",
-                    "--bare",
-                    "--initial-branch=master",
-                    remote.to_str().unwrap(),
-                ],
-            );
-            run_git(
-                root,
-                [
-                    "init",
-                    "--quiet",
-                    "--initial-branch=master",
-                    work.to_str().unwrap(),
-                ],
-            );
-            run_git(&work, ["config", "user.name", "AURsmith Web Test"]);
-            run_git(&work, ["config", "user.email", "aursmith@example.invalid"]);
-            Self { remote, work }
-        }
-
-        fn write_package(&self, pkgver: &str, marker: &str) {
-            fs::write(
-                self.work.join("PKGBUILD"),
-                format!("pkgname=demo\npkgver={pkgver}\n{marker}\n"),
-            )
-            .unwrap();
-            fs::write(
-                self.work.join(".SRCINFO"),
-                b"pkgbase = demo\npkgname = demo\narch = any\n",
-            )
-            .unwrap();
-        }
-
-        fn commit(&self, message: &str) -> String {
-            run_git(&self.work, ["add", "-A"]);
-            run_git(
-                &self.work,
-                ["commit", "--quiet", "--no-gpg-sign", "-m", message],
-            );
-            run_git(
-                &self.work,
-                [
-                    "push",
-                    "--quiet",
-                    "--force",
-                    self.remote.to_str().unwrap(),
-                    "HEAD:master",
-                ],
-            );
-            git_stdout(&self.work, ["rev-parse", "HEAD"])
-        }
-    }
-
-    fn run_git<I, S>(directory: &Path, arguments: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        assert!(
-            Command::new("/usr/bin/git")
-                .current_dir(directory)
-                .args(arguments)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
-
-    fn git_stdout<I, S>(directory: &Path, arguments: I) -> String
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let output = Command::new("/usr/bin/git")
-            .current_dir(directory)
-            .args(arguments)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
 
     async fn test_app(username: &str) -> (Router, SqlitePool, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -793,24 +479,6 @@ mod tests {
             .to_owned()
     }
 
-    async fn refresh_request(app: &Router, cookie: Option<&str>, csrf: bool) -> Response {
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("/manage/packages/demo/refresh");
-        if let Some(cookie) = cookie {
-            request = request.header("cookie", cookie);
-        }
-        if csrf {
-            request = request
-                .header("origin", "https://aursmith.test")
-                .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE);
-        }
-        app.clone()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap()
-    }
-
     async fn body_text(response: Response) -> String {
         String::from_utf8(
             to_bytes(response.into_body(), 1024 * 1024)
@@ -824,19 +492,6 @@ mod tests {
     #[test]
     fn html_escape_covers_text_and_attribute_delimiters() {
         assert_eq!(escape_html("<&>\"'"), "&lt;&amp;&gt;&quot;&#39;");
-    }
-
-    #[test]
-    fn diff_rendering_is_complete_escaped_or_reversible_hex() {
-        let (label, rendered) = render_diff(b"header\n<script>&tail");
-        assert!(label.contains("UTF-8"));
-        assert_eq!(rendered, "header\n&lt;script&gt;&amp;tail");
-
-        let bytes = [0xff, 0x00, b'<', b'&', 0x80];
-        let (label, rendered) = render_diff(&bytes);
-        assert!(label.contains("非 UTF-8"));
-        assert_eq!(rendered.replace('\n', ""), hex::encode(bytes));
-        assert!(!rendered.contains('\u{fffd}'));
     }
 
     #[tokio::test]
@@ -1330,201 +985,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(failed_after_success.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn refresh_and_review_pages_require_auth_csrf_and_escape_the_complete_diff() {
-        let directory = tempfile::tempdir().unwrap();
-        let fixture = WebGitFixture::new(directory.path());
-        fixture.write_package("1", "initial");
-        let first_commit = fixture.commit("first");
-        let database = crate::db::open_or_create(&directory.path().join("aursmith.db"))
-            .await
-            .unwrap();
-        admin::initialize(&database, "admin", PASSWORD)
-            .await
-            .unwrap();
-        packages::add(&database, "demo").await.unwrap();
-        let config = Config::new(
-            "127.0.0.1:0".parse().unwrap(),
-            directory.path().join("aursmith.db"),
-            "https://aursmith.test",
-            30,
-            1,
-        )
-        .unwrap();
-        let engine =
-            reviews::ReviewEngine::fixture(directory.path().join("aur"), fixture.remote.clone());
-        let state = AppState::with_review_engine(database.clone(), config, engine);
-        let app = router(state.clone());
-
-        assert_eq!(
-            refresh_request(&app, None, true).await.status(),
-            StatusCode::UNAUTHORIZED
-        );
-        let cookie = login(&app, "admin", "192.0.2.90").await;
-        assert_eq!(
-            refresh_request(&app, Some(&cookie), false).await.status(),
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            refresh_request(&app, Some(&cookie), true).await.status(),
-            StatusCode::NO_CONTENT
-        );
-        let first = reviews::latest_for_package(&database, "demo")
-            .await
-            .unwrap()
-            .unwrap();
-        let first_tree = first.tree_sha256.unwrap();
-        let now = chrono::Utc::now();
-        sqlx::query("UPDATE tracked_packages SET approved_aur_commit = ?, approved_tree_sha256 = ?, approved_at = ?, updated_at = ? WHERE pkgbase = 'demo'")
-            .bind(&first_commit)
-            .bind(&first_tree)
-            .bind(now)
-            .bind(now)
-            .execute(&database)
-            .await
-            .unwrap();
-
-        fixture.write_package("2", "<script>unsafe</script>&DIFF-TAIL-MARKER");
-        let second_commit = fixture.commit("second");
-        assert_eq!(
-            refresh_request(&app, Some(&cookie), true).await.status(),
-            StatusCode::NO_CONTENT
-        );
-        let unauthenticated_page = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/manage/packages/demo/reviews/{second_commit}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unauthenticated_page.status(), StatusCode::SEE_OTHER);
-
-        let page = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/manage/packages/demo/reviews/{second_commit}"))
-                    .header("cookie", &cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(page.status(), StatusCode::OK);
-        let page = body_text(page).await;
-        assert!(page.contains(&second_commit));
-        assert!(page.contains(&first_tree));
-        assert!(page.contains("&lt;script&gt;unsafe&lt;/script&gt;&amp;DIFF-TAIL-MARKER"));
-        assert!(!page.contains("<script>unsafe</script>"));
-        assert!(page.contains("完整 changes.diff"));
-
-        let manage = app
-            .oneshot(
-                Request::builder()
-                    .uri("/manage")
-                    .header("cookie", cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let manage = body_text(manage).await;
-        assert!(manage.contains("刷新 AUR"));
-        assert!(manage.contains(&second_commit[..12]));
-    }
-
-    #[tokio::test]
-    async fn cancelled_outer_future_leaves_detached_mutation_holding_gate_until_terminal_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = crate::db::open_or_create(&directory.path().join("aursmith.db"))
-            .await
-            .unwrap();
-        admin::initialize(&database, "admin", PASSWORD)
-            .await
-            .unwrap();
-        packages::add(&database, "demo").await.unwrap();
-        let config = Config::new(
-            "127.0.0.1:0".parse().unwrap(),
-            directory.path().join("aursmith.db"),
-            "https://aursmith.test",
-            30,
-            1,
-        )
-        .unwrap();
-        let state = AppState::new(database.clone(), config);
-        let app = router(state.clone());
-        let cookie = login(&app, "admin", "192.0.2.91").await;
-
-        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
-        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
-        let mutation_state = state.clone();
-        let mutation_database = database.clone();
-        let outer = tokio::spawn(async move {
-            run_package_mutation(&mutation_state, async move {
-                let _ = entered_sender.send(());
-                let _ = release_receiver.await;
-                packages::set_state(&mutation_database, "demo", "paused").await?;
-                Ok::<_, ApiError>(())
-            })
-            .await
-        });
-        entered_receiver.await.unwrap();
-        outer.abort();
-        assert!(outer.await.unwrap_err().is_cancelled());
-
-        let busy = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/manage/packages/demo/refresh")
-                    .header("cookie", &cookie)
-                    .header("origin", "https://aursmith.test")
-                    .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(busy.status(), StatusCode::CONFLICT);
-
-        release_sender.send(()).unwrap();
-        for _ in 0..100 {
-            let package_state: String =
-                sqlx::query_scalar("SELECT state FROM tracked_packages WHERE pkgbase = 'demo'")
-                    .fetch_one(&database)
-                    .await
-                    .unwrap();
-            if package_state == "paused" {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let completed: String =
-            sqlx::query_scalar("SELECT state FROM tracked_packages WHERE pkgbase = 'demo'")
-                .fetch_one(&database)
-                .await
-                .unwrap();
-        assert_eq!(completed, "paused", "被取消的外层 future 后台操作必须完成");
-
-        let resume = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/manage/packages/demo/resume")
-                    .header("cookie", cookie)
-                    .header("origin", "https://aursmith.test")
-                    .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resume.status(), StatusCode::NO_CONTENT);
     }
 }
