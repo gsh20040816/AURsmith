@@ -123,12 +123,12 @@ fn configure_network() -> anyhow::Result<()> {
     run_checked("/usr/bin/ip", &["link", "set", &interface, "up"], None)?;
     run_checked(
         "/usr/bin/ip",
-        &["address", "add", "10.0.2.15/24", "dev", &interface],
+        &["address", "replace", "10.0.2.15/24", "dev", &interface],
         None,
     )?;
     run_checked(
         "/usr/bin/ip",
-        &["route", "add", "default", "via", "10.0.2.2"],
+        &["route", "replace", "default", "via", "10.0.2.2"],
         None,
     )?;
     fs::write("/etc/resolv.conf", b"nameserver 10.0.2.3\n")?;
