@@ -172,7 +172,6 @@ pub struct BuildResult {
     pub revision_sha256: String,
     pub source_manifest_sha256: String,
     pub dependency_snapshot_sha256: String,
-    pub profile_sha256: String,
     pub artifacts: Vec<ArtifactRecord>,
     pub provenance: BTreeMap<String, String>,
     pub log_sha256: String,

@@ -1477,10 +1477,7 @@ async fn evaluate_worker_health(
     } else {
         resolve_alert(state, &skew_fingerprint).await?;
     }
-    for (field, title) in [
-        ("cgroup_v2", "Worker 缺少 cgroup v2"),
-        ("kvm_available", "Builder 缺少 KVM"),
-    ] {
+    for (field, title) in [("cgroup_v2", "Worker 缺少 cgroup v2")] {
         let fingerprint = format!("worker-capability:{field}:{worker_id}");
         if status[field].as_bool() == Some(false) {
             upsert_operational_alert(
@@ -2160,45 +2157,6 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             }
         }
     }
-    if row.get::<String, _>("kind") == "fetch" && status == "succeeded" {
-        let revision_id: Option<String> = row.get("revision_id");
-        let Some(revision_id) = revision_id else {
-            return Err(ApiError::internal("Fetch Job 缺少 revision_id"));
-        };
-        let Some(GuestResult::Fetch(fetch_result)) = guest_result.as_ref() else {
-            return Err(ApiError::conflict(
-                "RESULT_KIND_MISMATCH",
-                "Fetch Job 返回了其他类型的 GuestResult",
-            ));
-        };
-        let expected_revision: Option<String> = row.get("revision_sha256");
-        if fetch_result.job_id.to_string() != job_id
-            || fetch_result.attempt.attempt_id.to_string() != attempt_id
-            || expected_revision.as_deref() != Some(fetch_result.revision_sha256.as_str())
-        {
-            return Err(ApiError::conflict(
-                "RESULT_IDENTITY_MISMATCH",
-                "GuestResult 身份与 Controller 的 Job/Attempt/Revision 不一致",
-            ));
-        }
-        crate::packages::complete_fetch(&mut transaction, &revision_id, fetch_result).await?;
-        advance_build_batch = true;
-        if let Some(batch_id) = row.get::<Option<String>, _>("batch_id") {
-            let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE batch_id = ? AND kind = 'fetch' AND status != 'succeeded'")
-                .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
-            if unfinished == 0 {
-                sqlx::query("UPDATE release_batches SET state = 'awaiting_audit', updated_at = ? WHERE id = ?")
-                    .bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-            }
-        }
-    } else if row.get::<String, _>("kind") == "fetch"
-        && status == "failed"
-        && !retry_scheduled
-        && let Some(batch_id) = row.get::<Option<String>, _>("batch_id")
-    {
-        sqlx::query("UPDATE release_batches SET state = 'fetch_failed', failure_reason = ?, updated_at = ? WHERE id = ?")
-            .bind(failure).bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    }
     if row.get::<String, _>("kind") == "build" && status == "succeeded" {
         let Some(GuestResult::Build(build_result)) = guest_result.as_ref() else {
             return Err(ApiError::conflict(
@@ -2323,11 +2281,11 @@ fn accepted_build_version(
 fn infrastructure_failure(code: &str) -> bool {
     matches!(
         code,
-        "BUILDER_INFRASTRUCTURE"
-            | "VM_TIMEOUT"
-            | "VM_FAILED"
-            | "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
-            | "GUEST_RESULT_MISSING"
+        "DOCKER_TIMEOUT"
+            | "DOCKER_DAEMON_UNAVAILABLE"
+            | "DOCKER_PULL_FAILED"
+            | "DOCKER_NETWORK_TIMEOUT"
+            | "BUILD_NETWORK_TRANSIENT"
             | "RESULT_UNAVAILABLE"
             | "WORKER_RESTARTED"
             | "WORKER_UNREACHABLE"
@@ -2335,12 +2293,10 @@ fn infrastructure_failure(code: &str) -> bool {
 }
 
 fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-    const ALLOWED_PATHS: [&str; 6] = [
-        "qemu.stdout.log",
-        "qemu.stderr.log",
-        "output/fetch.log",
+    const ALLOWED_PATHS: [&str; 4] = [
+        "docker.stdout.log",
+        "docker.stderr.log",
         "output/build.log",
-        "output/namcap.log",
         "output/guest-error.json",
     ];
     let logs = value
@@ -2950,16 +2906,22 @@ mod release_tests {
 
     #[test]
     fn only_infrastructure_failures_are_automatically_retried() {
-        assert!(infrastructure_failure("VM_TIMEOUT"));
+        assert!(infrastructure_failure("DOCKER_TIMEOUT"));
+        assert!(infrastructure_failure("DOCKER_DAEMON_UNAVAILABLE"));
+        assert!(infrastructure_failure("DOCKER_PULL_FAILED"));
+        assert!(infrastructure_failure("DOCKER_NETWORK_TIMEOUT"));
+        assert!(infrastructure_failure("BUILD_NETWORK_TRANSIENT"));
         assert!(infrastructure_failure("WORKER_RESTARTED"));
-        assert!(infrastructure_failure("BUILDER_INFRASTRUCTURE"));
-        assert!(infrastructure_failure("FETCH_DEPENDENCY_DOWNLOAD_FAILED"));
-        assert!(!infrastructure_failure("GUEST_FETCH_FAILED"));
+        assert!(!infrastructure_failure("DOCKER_UNAUTHORIZED"));
+        assert!(!infrastructure_failure("DOCKER_MANIFEST_INVALID"));
+        assert!(!infrastructure_failure("DOCKER_PERMISSION_DENIED"));
+        assert!(!infrastructure_failure("DOCKER_DISK_FULL"));
         assert!(!infrastructure_failure("INPUT_INVALID"));
-        assert!(!infrastructure_failure("PROFILE_DIGEST_MISMATCH"));
         assert!(!infrastructure_failure("AUDIT_REJECTED"));
         assert!(!infrastructure_failure("GUEST_BUILD_FAILED"));
-        assert!(!infrastructure_failure("NETWORK_DURING_BUILD"));
+        assert!(!infrastructure_failure("GUEST_CHECKSUM_FAILED"));
+        assert!(!infrastructure_failure("GUEST_PGP_FAILED"));
+        assert!(!infrastructure_failure("GUEST_OUTPUT_MISMATCH"));
     }
 
     #[test]

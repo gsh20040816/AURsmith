@@ -65,12 +65,8 @@ struct Cli {
     source_proxy_url: Option<String>,
     #[arg(long, env = "AURSMITH_PACOLOCO_METRICS_URL")]
     pacoloco_metrics_url: Option<String>,
-    #[arg(long, env = "AURSMITH_PROFILES_DIR", default_value = "/profiles")]
-    profiles_dir: String,
     #[arg(long, env = "AURSMITH_JOBS_DIR", default_value = "/jobs")]
     jobs_dir: String,
-    #[arg(long, env = "AURSMITH_BUILD_NETWORK", default_value_t = false)]
-    build_network: bool,
     #[arg(long, env = "AURSMITH_TRANSFER_ENDPOINTS_JSON", default_value = "{}")]
     transfer_endpoints_json: String,
     #[arg(long, env = "AURSMITH_TRANSFER_SSH_IDENTITY_FILE")]
@@ -280,6 +276,9 @@ async fn main() -> anyhow::Result<()> {
     let database = connect(&cli.database).await?;
     let identity_signing_key = load_or_create_identity_signing_key(&database).await?;
     let jobs_dir = PathBuf::from(&cli.jobs_dir);
+    if matches!(cli.role, RoleArg::Builder) && !jobs_dir.is_absolute() {
+        bail!("Builder jobs 目录必须是绝对路径");
+    }
     let transfer_endpoints: BTreeMap<String, String> =
         serde_json::from_str(&cli.transfer_endpoints_json)
             .context("AURSMITH_TRANSFER_ENDPOINTS_JSON 不是字符串映射")?;
@@ -304,10 +303,7 @@ async fn main() -> anyhow::Result<()> {
         source_proxy_url: cli.source_proxy_url,
         pacoloco_metrics_url: cli.pacoloco_metrics_url,
         builder: if matches!(cli.role, RoleArg::Builder) {
-            Some(
-                builder::BuilderRuntime::new(cli.profiles_dir.into(), jobs_dir.clone())
-                    .with_build_network(cli.build_network),
-            )
+            Some(builder::BuilderRuntime::new(jobs_dir.clone()))
         } else {
             None
         },
@@ -3420,8 +3416,7 @@ async fn status(worker: &Worker) -> WorkerResponse {
                     "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
                     "storage": disk_usage(storage_path),
                     "cgroup_v2": Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
-                    "kvm_available": worker.role != WorkerRole::Builder || Path::new("/dev/kvm").exists(),
-                    "profiles": worker.builder.as_ref().map(builder::BuilderRuntime::available_profiles).unwrap_or_default(),
+                    "profiles": [],
                     "pacoloco": pacoloco,
                     "time": Utc::now(),
                 }),
@@ -3534,13 +3529,13 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
         }
     }
 
-    if !spec.inline_inputs.is_empty() && spec.source_attempt_id.is_some() {
+    if spec.source_attempt_id.is_some() {
         return WorkerResponse::error(
-            "AMBIGUOUS_JOB_INPUT",
-            "Job 不能同时携带内联输入和已准备源码引用",
+            "SOURCE_ATTEMPT_UNSUPPORTED",
+            "Builder 只接受当前 AUR snapshot 的内联构建输入",
         );
     }
-    let needs_materialization = !spec.inline_inputs.is_empty() || spec.source_attempt_id.is_some();
+    let needs_materialization = !spec.inline_inputs.is_empty();
     let initial_status = if !needs_materialization {
         "queued"
     } else {
@@ -3571,11 +3566,7 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
                         "只有 Builder 可以接收内联构建输入",
                     );
                 };
-                let materialized = if spec.source_attempt_id.is_some() {
-                    builder.materialize_prepared_source(&spec)
-                } else {
-                    builder.materialize_inline_inputs(&spec)
-                };
+                let materialized = builder.materialize_inline_inputs(&spec);
                 if let Err(error) = materialized {
                     let _ = sqlx::query("DELETE FROM attempts WHERE attempt_id = ?")
                         .bind(spec.attempt.attempt_id.to_string())

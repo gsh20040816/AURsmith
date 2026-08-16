@@ -782,6 +782,13 @@ mod tests {
     }
 
     #[test]
+    fn builder_jobs_directory_must_be_absolute_and_writable() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(jobs_directory_usable(directory.path()));
+        assert!(!jobs_directory_usable(Path::new("relative/jobs")));
+    }
+
+    #[test]
     fn controller_key_can_be_written_without_printing_the_private_value() {
         let directory = tempfile::tempdir().unwrap();
         let private = directory.path().join("controller.key");
@@ -1140,11 +1147,18 @@ fn doctor(role: &str) -> anyhow::Result<()> {
     let mut checks = Vec::new();
     checks.push(json!({"check": "proc", "ok": std::path::Path::new("/proc").exists()}));
     if role == "builder" {
-        checks.push(json!({"check": "kvm", "ok": std::path::Path::new("/dev/kvm").exists()}));
-        checks.push(json!({"check": "qemu-system-x86_64", "ok": command_works("/usr/bin/qemu-system-x86_64", "--version")}));
         checks.push(
-            json!({"check": "qemu-img", "ok": command_works("/usr/bin/qemu-img", "--version")}),
+            json!({"check": "docker-cli", "ok": command_works("/usr/bin/docker", "--version")}),
         );
+        checks.push(
+            json!({"check": "docker-daemon", "ok": command_works("/usr/bin/docker", "version")}),
+        );
+        let jobs = env::var_os("AURSMITH_JOBS_DIR").map(PathBuf::from);
+        checks.push(json!({
+            "check": "jobs-directory",
+            "path": jobs.as_ref().map(|path| path.display().to_string()),
+            "ok": jobs.as_deref().is_some_and(jobs_directory_usable)
+        }));
     }
     let ok = checks.iter().all(|check| check["ok"] == true);
     println!(
@@ -1165,4 +1179,22 @@ fn command_works(program: &str, argument: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn jobs_directory_usable(path: &Path) -> bool {
+    if !path.is_absolute() || !path.is_dir() {
+        return false;
+    }
+    let probe = path.join(format!(".aursmith-doctor-{}", std::process::id()));
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|file| file.sync_all())
+        .is_ok();
+    if created {
+        fs::remove_file(probe).is_ok()
+    } else {
+        false
+    }
 }

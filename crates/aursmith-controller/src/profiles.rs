@@ -138,7 +138,6 @@ pub async fn activate(
         &actor,
     )
     .await?;
-    crate::packages::schedule_waiting_fetches(&state.database).await?;
     Ok(Json(json!({"id": id, "state": "active"})))
 }
 

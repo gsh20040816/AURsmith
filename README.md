@@ -1,6 +1,6 @@
 # AURsmith
 
-AURsmith 是面向少量 Arch Linux 客户端的私有、可审计 AUR 二进制仓库。它持续跟踪用户订阅的 AUR 软件包，审计不可变修订，在 KVM 虚拟机中构建，发布经过签名的 pacman 仓库，并独立归档历史 Release。
+AURsmith 是面向少量 Arch Linux 客户端的私有、可审计 AUR 二进制仓库。它持续跟踪用户订阅的 AUR 软件包，审计不可变修订，在普通联网 Docker 容器中构建，发布经过签名的 pacman 仓库，并独立归档历史 Release。
 
 系统第一版拆分为 Controller、Builder 和 Publisher 三套 Docker Compose Stack；外部 Archiver 保留为可选扩展。任何 AURsmith 服务都不会直接部署到宿主机。
 

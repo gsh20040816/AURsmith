@@ -1,6 +1,16 @@
 name: aursmith-builder
 
 services:
+  build-image:
+    profiles: [build-image]
+    image: aursmith-build:latest
+    build:
+      context: ../..
+      dockerfile: deploy/images/build.Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+        AURSMITH_ARCH_MIRROR: ${AURSMITH_ARCH_MIRROR:-https://mirrors.ustc.edu.cn/archlinux}
+
   worker:
     build:
       context: ../..
@@ -10,10 +20,8 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    devices:
-      - /dev/kvm:/dev/kvm
     group_add:
-      - ${KVM_GID:?请设置宿主机 KVM_GID}
+      - ${DOCKER_GID:?请设置宿主机 Docker Socket 所属 GID}
       - ${AURSMITH_SECRET_GID:?请设置宿主机部署密钥所属 GID}
     environment:
       AURSMITH_WORKER_NAME: ${AURSMITH_WORKER_NAME:-compute-01}
@@ -21,9 +29,7 @@ services:
       AURSMITH_WORKER_DATABASE: sqlite:///var/lib/aursmith/runtime/worker.db
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
-      AURSMITH_PROFILES_DIR: /profiles
-      AURSMITH_JOBS_DIR: /jobs
-      AURSMITH_BUILD_NETWORK: ${AURSMITH_BUILD_NETWORK:-false}
+      AURSMITH_JOBS_DIR: ${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}
       AURSMITH_CONTROLLER_POLL_URL: ${AURSMITH_CONTROLLER_POLL_URL:?必须设置公网 Controller HTTPS 轮询地址}
       AURSMITH_REVERSE_PUBLISHER_ENDPOINT: ${AURSMITH_REVERSE_PUBLISHER_ENDPOINT:?必须设置 Publisher SSH 推送端点}
       AURSMITH_REVERSE_PUSH_SSH_IDENTITY_FILE: /run/secrets/publisher_push_key
@@ -35,9 +41,8 @@ services:
     volumes:
       - worker-run:/run/aursmith
       - builder-state:/var/lib/aursmith
-      - builder-profiles:/profiles
-      - builder-jobs:/jobs
-      - builder-cache:/cache
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}:${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}
     tmpfs:
       - /tmp:size=512m,mode=1777
     networks: [worker]
@@ -48,23 +53,6 @@ services:
       retries: 3
     restart: unless-stopped
 
-  profile-builder:
-    profiles: [profile-build]
-    build:
-      context: ../..
-      dockerfile: deploy/images/profile-builder.Dockerfile
-      args:
-        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-        AURSMITH_ARCH_MIRROR: ${AURSMITH_ARCH_MIRROR:-https://mirrors.ustc.edu.cn/archlinux}
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    network_mode: none
-    volumes:
-      - profile-output:/out
-    tmpfs:
-      - /tmp:size=64m,mode=1777
-
 secrets:
   publisher_push_key:
     file: ${AURSMITH_PUBLISHER_PUSH_KEY_FILE:-./secrets/publisher_push_key}
@@ -74,10 +62,6 @@ secrets:
 volumes:
   worker-run:
   builder-state:
-  builder-profiles:
-  builder-jobs:
-  builder-cache:
-  profile-output:
 
 networks:
   worker:

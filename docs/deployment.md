@@ -3,8 +3,7 @@
 ## 宿主机要求
 
 - Docker Engine 与 Docker Compose。
-- Builder 宿主机需要 x86_64 KVM 和可访问的 `/dev/kvm`。
-- Controller 和 Publisher 宿主机不要求 KVM。
+- Builder 宿主机需要 Docker Engine，并允许可信 Builder Worker 访问 Docker Socket。
 - 每个角色使用独立持久卷、SSH host key 和 Controller 访问密钥。
 
 AURsmith 不安装裸机 daemon。文档中的所有管理命令都通过构建产物或 `docker compose exec` 运行。
@@ -78,45 +77,30 @@ Controller 自行提供 Web/API，Publisher 自行提供仓库 HTTP；两者默�
 4. 在公网核心设备本地执行 `aursmithctl admin init`；已存在管理员时不得重复初始化。
 5. 通过 HTTPS Web 登录。
 6. 注册 Builder 和 Publisher，并执行“探测”。
-7. 运行 Doctor，确认 KVM、SSH、协议、仓库和保留策略状态。
+7. 运行 Doctor，确认 Docker daemon、绝对 jobs 目录、SSH、协议、仓库和保留策略状态。
 8. 在订阅真实软件包前，确认四个 Agent Runner 都能返回符合 Schema 的测试报告，且报告与容器日志中不含 API key。
 
 不同宿主机部署时只需要复制对应 Stack 的 Compose、镜像和该角色的 secret，不要复制其他角色的数据卷或私钥。
 
-## Builder KVM 配置
-
-Fetch VM 通过 QEMU user networking 直接访问公网，不依赖 Publisher HTTP 代理。下载来源、摘要和实际网络模式继续写入 Source Manifest 与 provenance。
+## Builder Docker 配置
 
 Publisher Stack 还自带独立 pacoloco。它只缓存 Arch 官方仓库，缓存卷为 `pacoloco-cache`，不应与 Publisher staging 或公开仓库卷合并。外部 Arch 上游由 Publisher Compose 的 `AURSMITH_ARCH_MIRROR` 构建参数配置，必须是无凭据和参数的 HTTPS Base URL。宿主反向代理把 `https://<稳定仓库域名>/arch-cache/` 转发到 pacoloco；首次部署可连续请求同一 `core.db`，再在 Doctor 中确认 requests、misses 和 hits 递增。
 
-Builder Stack 必须设置 `KVM_GID`、`AURSMITH_SECRET_GID`、`AURSMITH_CONTROLLER_POLL_URL` 和 `AURSMITH_REVERSE_PUBLISHER_ENDPOINT`。`AURSMITH_SECRET_GID` 是宿主部署密钥文件所属组，私钥应保持 `0440` 且仅允许该组读取，不能改成全局可读。轮询地址必须是公网 Controller 的无凭据 HTTPS URL；Publisher 端点是只允许 Capability 接收与完成命令的 SSH forced-command 账户。Builder 容器挂载独立推送私钥和固定 `known_hosts`，宿主不开放 AURsmith 端口。容器只映射 `/dev/kvm`，不需要 privileged、TUN、Docker Socket 或 libvirt Socket。
+Builder Stack 必须设置 `DOCKER_GID`、`AURSMITH_JOBS_DIR`、`AURSMITH_SECRET_GID`、`AURSMITH_CONTROLLER_POLL_URL` 和 `AURSMITH_REVERSE_PUBLISHER_ENDPOINT`。`DOCKER_GID` 是宿主 Docker Socket 所属组；`AURSMITH_JOBS_DIR` 必须是宿主绝对路径，并以同一路径 bind 到 Worker，使宿主 Docker daemon 能解析每个 Attempt 的 input/output bind。`AURSMITH_SECRET_GID` 是宿主部署密钥文件所属组，私钥应保持 `0440` 且仅允许该组读取。轮询地址必须是公网 Controller 的无凭据 HTTPS URL；Publisher 端点仍是只允许 Capability 接收与完成命令的 SSH forced-command 账户。
 
 反向 Builder 首次注册时，在本地执行 `aursmithctl worker status` 取得持久实例 UUID 与 `identity_signing_key_hex`，由管理员在 Web UI 选择 `reverse` 模式录入。私钥只存在 Builder Journal 中，Controller 只保存公钥。注册完成后 Builder 每次轮询都签署 UUID、nonce、时间、状态和 Attempt Journal；Controller 不尝试连接家庭网络。Publisher 的推送 SSH 入口只接受固定 rsync receiver 路径 `/landing/.<Capability ID>.partial/` 与 `finalize-push-import`，不允许 Shell、PTY、转发或任意目标路径。
 
 当 Controller 与 Publisher 同机部署到 netcup 时，使用 `deploy/*/compose.netcup.yaml` 把相关服务接入外部 internal 网络 `aursmith-backbone`。Controller 通过 `publisher-ssh:2222` 进行同机控制；该内部 SSH 端口不映射到宿主。公网入口和宿主 Caddy 示例见 `deploy/netcup/README.md`。
 
-每个可用 Profile 放在 `/profiles/<profile_sha256>/`，包含：
-
-- `root.qcow2`；
-- `vmlinuz-linux`；
-- `initramfs-linux.img`；
-- `profile-envelope.json`。
-
-`profile-envelope.json` 的 payload type 必须是 `aursmith.build_profile`，并由当前 Controller 公钥签署。仅复制文件或修改目录名不能激活 Profile。构建前可通过 Builder Stack 的 `AURSMITH_ARCH_MIRROR` 选择 Arch 镜像，地址必须是无凭据、查询参数和片段的 HTTPS Base URL。该值同时用于构建 Profile 根文件系统，并写入 Guest 的 `/etc/pacman.d/mirrorlist`，因此 Fetch Guest 后续下载官方依赖时使用同一镜像。若使用内置缓存，应填写 `https://<稳定仓库域名>/arch-cache`；Publisher Stack 的同名变量则配置 pacoloco 自己访问的外部上游，二者不能形成循环。
-
-Builder 的 `AURSMITH_BUILD_NETWORK` 控制正式 Build Guest 网络。`false` 使用 `-nic none`；`true` 使用 QEMU user networking 直接访问公网，适用于会在 `build()` 内恢复 NuGet 等生态依赖的软件包。第一版部署以构建兼容性为主可设为 `true`，实际值会进入 Build provenance。无论是否联网，Guest 都不挂载 Controller、GPG、SSH、Docker 或宿主文件系统秘密。
-
-下面示例使用中国科学技术大学开源软件镜像站构建并导出 base candidate；未设置变量时也使用该镜像：
+构建固定 Arch Build image 时可通过 `AURSMITH_ARCH_MIRROR` 选择无凭据、查询参数和片段的 HTTPS 镜像。先显式构建固定 tag，再启动 Worker：
 
 ```bash
 AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux \
-  docker compose -f deploy/builder/compose.yaml --profile profile-build build profile-builder
-docker compose -f deploy/builder/compose.yaml --profile profile-build run --rm profile-builder --name base
+  docker compose -f deploy/builder/compose.yaml --profile build-image build build-image
+docker compose -f deploy/builder/compose.yaml up -d worker
 ```
 
-导出卷包含 `profile-candidate.json` 以及三个固定二进制文件。候选清单中的 `repository_mirror` 属于 Profile 内容摘要和后续 provenance；修改镜像必须重新构建、授权和验证 Profile，不能只改 Guest 内的 mirrorlist。管理员可在 Web 的 Profile 页面选择该 JSON，也可以提交到 `POST /api/v1/profiles`；Controller 会忽略候选中自报的摘要、重新计算内容摘要并返回签名 Envelope。页面提供 `profile-envelope.json` 下载。Envelope 和三个文件必须放入 `/profiles/<profile_sha256>/`。Profile 未通过启动和固定 fixture build 前，激活 API 会返回 `PROFILE_NOT_VERIFIED`；不能用人工改数据库绕过。
-
-已验证的容器能力边界是：Builder 镜像在 `--device /dev/kvm --cap-drop ALL --security-opt no-new-privileges` 下可以初始化 `q35,accel=kvm`。实际生成的 base Profile 已通过 QEMU 内置 virtio-9p 完成签名 Fetch Job 和 Build Job，生成可由 `bsdtar` 读取的 Arch 软件包；容器没有 privileged、额外 capability 或宿主 Docker/libvirt Socket。输入 fsdev 固定只读，输出绑定 Attempt 独立目录，Worker 在接管结果前复验文件摘要并删除 overlay。
+不要对 `up` 添加 `--profile build-image`：该服务只给 Compose 提供可重复的 build/tag 入口，不是常驻进程。可信 Worker 挂载 Docker Socket；它创建的 Build 子容器只获得只读 snapshot input、可写 Attempt output 和普通 bridge 网络，不获得 Docker Socket、Controller/SSH/GPG secret。Build 使用镜像内标准 `makepkg --syncdeps`/pacman，Worker 在接管结果前复验输入和产物摘要。
 
 ## 告警通知
 

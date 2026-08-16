@@ -35,6 +35,8 @@ impl RunningWorker {
             .arg(&socket)
             .arg("--database")
             .arg(format!("sqlite://{}", database.display()))
+            .arg("--jobs-dir")
+            .arg(directory.path().join("jobs"))
             .arg("--controller-verifying-key-hex")
             .arg(hex::encode(key.verifying_key().to_bytes()))
             .stdout(Stdio::null())

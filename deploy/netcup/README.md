@@ -1,6 +1,6 @@
 # netcup 单机公网节点部署
 
-该拓扑把 Controller、Agent、Publisher 和 Signer 放在 `netcup`，Builder 保留在具有 KVM 的桌面机。第一版不部署独立 Archiver，历史版本由 Publisher 按保留策略管理。
+该拓扑把 Controller、Agent、Publisher 和 Signer 放在 `netcup`，Builder 保留在运行 Docker Engine 的可信桌面机。第一版不部署独立 Archiver，历史版本由 Publisher 按保留策略管理。
 
 ## 网络
 
@@ -33,4 +33,4 @@ docker compose --env-file runtime/deployment/publisher.env \
 
 Publisher 默认保留最近 30 天全部 Release，并为每个包至少保留最近 3 个不同版本。可通过 `AURSMITH_RELEASE_RETENTION_DAYS` 和 `AURSMITH_RELEASE_RETENTION_MIN_VERSIONS` 调整；两个值都必须大于零。
 
-Fetch VM 使用 QEMU user networking 直接访问公网，不部署或暴露 HTTP 代理。Builder 只通过 `netcup.shgao.top:12223` 主动推送 Artifact。
+Builder 先用 `docker compose -f deploy/builder/compose.yaml --profile build-image build build-image` 生成固定 Build image，再用不带该 profile 的 `up -d worker` 启动。Build 容器使用普通 bridge 网络；Builder 只通过 `netcup.shgao.top:12223` 主动推送 Artifact。

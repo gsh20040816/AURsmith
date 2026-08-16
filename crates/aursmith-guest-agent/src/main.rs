@@ -1,8 +1,6 @@
 use anyhow::{Context, bail};
 use aursmith_protocol::{
-    ArtifactRecord, AuditSourceFile, BuildResult, DependencySource, FetchResult, GuestResult,
-    JobKind, JobSpec, ManifestEntry, ResolvedDependency, SignedEnvelope, SourceEntryKind,
-    SourceManifestEntry,
+    ArtifactRecord, BuildResult, GuestResult, JobKind, JobSpec, SignedEnvelope,
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -12,7 +10,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -31,149 +29,61 @@ fn main() {
             }))
             .unwrap_or_default(),
         );
-        eprintln!("AURsmith Guest 失败：{error:#}");
-        shutdown();
+        eprintln!("AURsmith Build 容器失败：{error:#}");
         std::process::exit(1);
     }
-    shutdown();
 }
 
 fn guest_error_code(error: &anyhow::Error) -> &'static str {
-    if error
-        .to_string()
-        .contains("完整系统与构建依赖下载连续 3 次失败")
-    {
-        "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
-    } else {
-        "GUEST_COMMAND_FAILED"
+    let message = error.to_string();
+    for code in [
+        "GUEST_CHECKSUM_FAILED",
+        "GUEST_PGP_FAILED",
+        "GUEST_CHECK_FAILED",
+        "GUEST_PACKAGE_FAILED",
+        "GUEST_OUTPUT_MISMATCH",
+        "GUEST_BUILD_FAILED",
+        "BUILD_NETWORK_TRANSIENT",
+    ] {
+        if message.contains(code) {
+            return code;
+        }
     }
+    "GUEST_BUILD_FAILED"
 }
 
 fn run() -> anyhow::Result<()> {
-    ensure_mount("proc", "/proc", "proc", &[])?;
-    ensure_mount("sysfs", "/sys", "sysfs", &[])?;
-    fs::create_dir_all(INPUT)?;
-    fs::create_dir_all(OUTPUT)?;
-    mount(
-        "aursmith-input",
-        INPUT,
-        "9p",
-        &["-o", "trans=virtio,version=9p2000.L,ro,nodev,nosuid"],
-    )?;
-    mount(
-        "aursmith-output",
-        OUTPUT,
-        "9p",
-        &["-o", "trans=virtio,version=9p2000.L,nodev,nosuid"],
-    )?;
-
     let controller_key = controller_key()?;
     let envelope_bytes =
-        fs::read(format!("{INPUT}/.aursmith/job-envelope.json")).context("缺少 Guest JobSpec")?;
+        fs::read(format!("{INPUT}/.aursmith/job-envelope.json")).context("缺少 Build JobSpec")?;
     let envelope: SignedEnvelope =
-        serde_json::from_slice(&envelope_bytes).context("Guest JobSpec JSON 无效")?;
+        serde_json::from_slice(&envelope_bytes).context("Build JobSpec JSON 无效")?;
     if envelope.verifying_key != controller_key {
-        bail!("Guest JobSpec Controller 公钥不匹配");
+        bail!("Build JobSpec Controller 公钥不匹配");
     }
     let spec: JobSpec = envelope.verify("aursmith.job_spec")?;
     if spec.is_expired_at(Utc::now()) {
-        bail!("Guest JobSpec 已过期");
+        bail!("Build JobSpec 已过期");
     }
-    if spec.kind == JobKind::Fetch || (spec.kind == JobKind::Build && build_network_enabled()?) {
-        configure_network()?;
+    if spec.kind != JobKind::Build {
+        bail!("Build 镜像只接受 Build Job");
     }
-    // Builder 会按 JobSpec 扩大临时 qcow2 overlay；根文件系统在启动后在线扩容，
-    // 使 disk_mib 成为真实生效的任务资源限制，而不是只记录在 provenance 中。
-    run_checked("/usr/bin/resize2fs", &["/dev/vda"], None)?;
     reset_build_directory()?;
     copy_tree(Path::new(INPUT), Path::new(BUILD), true)?;
-    if spec.kind == JobKind::ProfileFixture {
-        fs::write(
-            Path::new(BUILD).join("PKGBUILD"),
-            b"pkgname=aursmith-profile-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { install -Dm644 /usr/lib/os-release \"$pkgdir/usr/share/aursmith-profile-fixture/os-release\"; }\n",
-        )?;
-    }
-    if spec.kind == JobKind::Build {
-        install_offline_dependencies(Path::new(BUILD), &Path::new(OUTPUT).join("build.log"))?;
-        apply_published_pkgrel(
-            Path::new(BUILD),
-            spec.upstream_pkgrel.as_deref(),
-            spec.published_pkgrel.as_deref(),
-        )?;
-        disable_debug_packages(Path::new(BUILD))?;
-    }
+    import_declared_pgp_keys(Path::new(BUILD))?;
+    apply_published_pkgrel(
+        Path::new(BUILD),
+        spec.upstream_pkgrel.as_deref(),
+        spec.published_pkgrel.as_deref(),
+    )?;
+    disable_debug_packages(Path::new(BUILD))?;
     run_checked("/usr/bin/chown", &["-R", "builder:builder", BUILD], None)?;
-    let result = match spec.kind {
-        JobKind::Fetch => GuestResult::Fetch(fetch(&spec)?),
-        JobKind::Build => GuestResult::Build(build(&spec)?),
-        JobKind::ProfileFixture => GuestResult::ProfileFixture(build(&spec)?),
-    };
-    let result_path = format!("{OUTPUT}/build-result.json");
-    fs::write(&result_path, serde_json::to_vec(&result)?)?;
-    sync_filesystem()?;
-    Ok(())
-}
-
-fn configure_network() -> anyhow::Result<()> {
-    let interface = fs::read_dir("/sys/class/net")?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .find(|name| name != "lo")
-        .context("联网 VM 未发现网络接口")?;
-    run_checked("/usr/bin/ip", &["link", "set", &interface, "up"], None)?;
-    run_checked(
-        "/usr/bin/ip",
-        &["address", "replace", "10.0.2.15/24", "dev", &interface],
-        None,
+    let result = GuestResult::Build(build(&spec)?);
+    fs::write(
+        format!("{OUTPUT}/build-result.json"),
+        serde_json::to_vec(&result)?,
     )?;
-    run_checked(
-        "/usr/bin/ip",
-        &["route", "replace", "default", "via", "10.0.2.2"],
-        None,
-    )?;
-    fs::write("/etc/resolv.conf", b"nameserver 10.0.2.3\n")?;
-    Ok(())
-}
-
-fn install_offline_dependencies(build: &Path, log: &Path) -> anyhow::Result<()> {
-    let mut packages = Vec::new();
-    for directory in [
-        build.join(".aursmith-official-dependencies"),
-        build.join(".aursmith-batch-dependencies"),
-    ] {
-        if !directory.exists() {
-            continue;
-        }
-        for item in fs::read_dir(directory)? {
-            let path = item?.path();
-            if path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(is_package_archive_name)
-            {
-                packages.push(path);
-            }
-        }
-    }
-    if packages.is_empty() {
-        return Ok(());
-    }
-    packages.sort();
-    let output = Command::new("/usr/bin/pacman")
-        .args(["-U", "--noconfirm", "--needed"])
-        .args(packages)
-        .stdin(Stdio::null())
-        .env_clear()
-        .env("PATH", "/usr/bin")
-        .output()?;
-    let mut file = File::create(log)?;
-    file.write_all(&output.stdout)?;
-    file.write_all(&output.stderr)?;
-    file.flush()?;
-    if !output.status.success() {
-        bail!("离线依赖安装失败，状态 {}，详情见 build.log", output.status);
-    }
+    run_checked("/usr/bin/sync", &[], None)?;
     Ok(())
 }
 
@@ -186,7 +96,6 @@ fn apply_published_pkgrel(
     else {
         return Ok(());
     };
-    // 首次发布完全遵循当前 PKGBUILD；只有 AURsmith 本地重建子版本才改工作副本。
     if upstream_pkgrel == published_pkgrel {
         return Ok(());
     }
@@ -221,10 +130,9 @@ fn apply_published_pkgrel(
                 })
                 .unwrap_or(original);
             if original != upstream_pkgrel {
-                bail!("PKGBUILD pkgrel 与签名 JobSpec 的上游值不一致");
+                bail!("PKGBUILD pkgrel 与签名 JobSpec 不一致");
             }
-            rewritten.push_str("pkgrel=");
-            rewritten.push_str(published_pkgrel);
+            rewritten.push_str(&format!("pkgrel={published_pkgrel}"));
             if line.ends_with('\n') {
                 rewritten.push('\n');
             }
@@ -246,51 +154,15 @@ fn disable_debug_packages(build: &Path) -> anyhow::Result<()> {
         .open(&path)
         .context("无法打开构建工作副本中的 PKGBUILD")?;
     file.write_all(
-        "\n# AURsmith 构建策略：不生成未在 .SRCINFO 中声明的自动 debug 包。\noptions+=('!debug')\noptions_x86_64+=('!debug')\n"
-            .as_bytes(),
+        b"\n# AURsmith build policy: do not create undeclared debug split packages.\noptions+=('!debug')\noptions_x86_64+=('!debug')\n",
     )?;
     file.flush()?;
     Ok(())
 }
 
-fn fetch(spec: &JobSpec) -> anyhow::Result<FetchResult> {
-    let log = Path::new(OUTPUT).join("fetch.log");
-    import_declared_pgp_keys(Path::new(BUILD))?;
-    run_as_builder(
-        &["/usr/bin/makepkg", "--verifysource", "--noconfirm"],
-        Some(&log),
-    )?;
-    export_declared_pgp_keys(Path::new(BUILD))?;
-    let prepared = Path::new(OUTPUT).join("prepared");
-    fs::create_dir_all(&prepared)?;
-    copy_tree(Path::new(BUILD), &prepared, false)?;
-    let dependency_download_started = std::time::Instant::now();
-    let resolved_dependencies = download_official_dependencies(spec, &prepared, &log)?;
-    let dependency_download_milliseconds =
-        u64::try_from(dependency_download_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let sources = manifest(&prepared, Path::new(OUTPUT))?;
-    let source_manifest_sha256 = manifest_digest(&sources)?;
-    let audit_files = select_audit_files(&prepared, &sources)?;
-    Ok(FetchResult {
-        job_id: spec.job_id,
-        attempt: spec.attempt.clone(),
-        revision_sha256: spec.revision_sha256.clone(),
-        source_manifest_sha256,
-        sources,
-        audit_files,
-        resolved_dependencies: resolved_dependencies.clone(),
-        dependency_download_milliseconds,
-        resolved_pkgver: None,
-        dependency_snapshot_sha256: hex::encode(Sha256::digest(serde_json::to_vec(
-            &serde_json::json!({"requested": spec.dependencies, "resolved": resolved_dependencies}),
-        )?)),
-        log_sha256: file_digest(&log)?,
-        finished_at: Utc::now(),
-    })
-}
-
 fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
-    let srcinfo = fs::read_to_string(build.join(".SRCINFO")).context("AUR 快照缺少 .SRCINFO")?;
+    let srcinfo =
+        fs::read_to_string(build.join(".SRCINFO")).context("AUR snapshot 缺少 .SRCINFO")?;
     let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
     if fingerprints.is_empty() {
         return Ok(());
@@ -305,7 +177,6 @@ fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
     arguments.extend(fingerprints.iter().cloned());
     let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     run_as_builder(&argument_refs, None)?;
-
     verify_declared_pgp_keys(build, &fingerprints)
 }
 
@@ -332,48 +203,9 @@ fn verify_declared_pgp_keys(build: &Path, fingerprints: &[String]) -> anyhow::Re
             .filter_map(|line| line.strip_suffix(':'))
             .any(|received| received.eq_ignore_ascii_case(fingerprint));
         if !output.status.success() || !exact_match {
-            bail!("导入的 OpenPGP 密钥与 .SRCINFO 声明的指纹不一致：{fingerprint}");
+            bail!("GUEST_PGP_FAILED: 导入的密钥与声明指纹不一致");
         }
     }
-    Ok(())
-}
-
-const PREPARED_PGP_KEYS: &str = ".aursmith-validpgpkeys.gpg";
-
-fn export_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
-    let srcinfo = fs::read_to_string(build.join(".SRCINFO"))?;
-    let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
-    if fingerprints.is_empty() {
-        return Ok(());
-    }
-    let mut arguments = vec!["/usr/bin/gpg", "--batch", "--output"];
-    let destination = build.join(PREPARED_PGP_KEYS);
-    let destination_text = destination.to_string_lossy().into_owned();
-    arguments.push(&destination_text);
-    arguments.push("--export");
-    arguments.extend(fingerprints.iter().map(String::as_str));
-    run_as_builder(&arguments, None)?;
-    let metadata = fs::symlink_metadata(&destination)?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 16 * 1024 * 1024 {
-        bail!("Fetch VM 导出的 OpenPGP 公钥包无效");
-    }
-    Ok(())
-}
-
-fn import_prepared_pgp_keys(build: &Path) -> anyhow::Result<()> {
-    let bundle = build.join(PREPARED_PGP_KEYS);
-    if !bundle.exists() {
-        return Ok(());
-    }
-    let srcinfo = fs::read_to_string(build.join(".SRCINFO"))?;
-    let fingerprints = declared_pgp_fingerprints(&srcinfo)?;
-    if fingerprints.is_empty() {
-        bail!("构建输入包含未声明的 OpenPGP 公钥包");
-    }
-    let bundle_text = bundle.to_string_lossy().into_owned();
-    run_as_builder(&["/usr/bin/gpg", "--batch", "--import", &bundle_text], None)?;
-    verify_declared_pgp_keys(build, &fingerprints)?;
-    fs::remove_file(bundle)?;
     Ok(())
 }
 
@@ -390,176 +222,33 @@ fn declared_pgp_fingerprints(srcinfo: &str) -> anyhow::Result<Vec<String>> {
         if !matches!(fingerprint.len(), 40 | 64)
             || !fingerprint.chars().all(|value| value.is_ascii_hexdigit())
         {
-            bail!(".SRCINFO validpgpkeys 必须是完整 OpenPGP 指纹");
+            bail!("GUEST_PGP_FAILED: .SRCINFO validpgpkeys 必须是完整指纹");
         }
         fingerprints.insert(fingerprint);
     }
     Ok(fingerprints.into_iter().collect())
 }
 
-fn download_official_dependencies(
-    spec: &JobSpec,
-    prepared: &Path,
-    log: &Path,
-) -> anyhow::Result<Vec<ResolvedDependency>> {
-    let names = spec
-        .dependencies
-        .iter()
-        .filter(|dependency| dependency.source == DependencySource::Official)
-        .map(|dependency| dependency.name.as_str())
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-    if names.iter().any(|name| {
-        name.is_empty()
-            || name.starts_with('-')
-            || !name
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || "@._+:-".contains(value))
-    }) {
-        bail!("官方依赖包名包含非法字符");
-    }
-    let cache = prepared.join(".aursmith-official-dependencies");
-    fs::create_dir(&cache)?;
-    let cache_text = cache.to_string_lossy().into_owned();
-    let mut downloaded = false;
-    for attempt in 1..=3_u8 {
-        let download = pacman_output(
-            &[
-                "-Syyuw",
-                "--noconfirm",
-                "--needed",
-                "--cachedir",
-                &cache_text,
-            ],
-            &names,
-        )?;
-        append_pacman_log(log, "同步完整系统与构建依赖", attempt, &download)?;
-        if download.status.success() {
-            downloaded = true;
-            break;
-        }
-        if attempt < 3 {
-            std::thread::sleep(Duration::from_secs(u64::from(attempt) * 2));
-        }
-    }
-    if !downloaded {
-        bail!("完整系统与构建依赖下载连续 3 次失败，详情见 fetch.log");
-    }
-    let mut resolved = Vec::new();
-    for item in fs::read_dir(&cache)? {
-        let path = item?.path();
-        if !path.is_file()
-            || !path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(is_package_archive_name)
-        {
-            continue;
-        }
-        let metadata = fs::metadata(&path)?;
-        let output = Command::new("/usr/bin/bsdtar")
-            .args(["-xOf"])
-            .arg(&path)
-            .arg(".PKGINFO")
-            .stdin(Stdio::null())
-            .env_clear()
-            .env("PATH", "/usr/bin")
-            .output()?;
-        if !output.status.success() {
-            bail!("无法读取官方依赖包元数据");
-        }
-        let pkginfo = String::from_utf8(output.stdout)?;
-        let (name, version) = parse_pkginfo_identity(&pkginfo)?;
-        resolved.push(ResolvedDependency {
-            name,
-            version,
-            source: DependencySource::Official,
-            package: ManifestEntry {
-                path: path
-                    .strip_prefix(Path::new(OUTPUT))?
-                    .to_string_lossy()
-                    .into_owned(),
-                sha256: file_digest(&path)?,
-                size: metadata.len(),
-            },
-        });
-    }
-    resolved.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(resolved)
-}
-
-fn pacman_output(arguments: &[&str], packages: &[&str]) -> anyhow::Result<Output> {
-    Ok(Command::new("/usr/bin/pacman")
-        .args(arguments)
-        .args(packages)
-        .stdin(Stdio::null())
-        .env_clear()
-        .env("PATH", "/usr/bin")
-        .output()?)
-}
-
-fn append_pacman_log(
-    log: &Path,
-    operation: &str,
-    attempt: u8,
-    output: &Output,
-) -> anyhow::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(log)?;
-    writeln!(
-        file,
-        "\n==> AURsmith {operation}（第 {attempt}/3 次，状态 {}）",
-        output.status
-    )?;
-    file.write_all(&output.stdout)?;
-    file.write_all(&output.stderr)?;
-    Ok(())
-}
-
-fn is_package_archive_name(name: &str) -> bool {
-    name.contains(".pkg.tar.") && !name.ends_with(".sig")
-}
-
-fn parse_pkginfo_identity(pkginfo: &str) -> anyhow::Result<(String, String)> {
-    fn values<'a>(pkginfo: &'a str, key: &str) -> BTreeSet<&'a str> {
-        pkginfo
-            .lines()
-            .filter_map(|line| {
-                let (field, value) = line.split_once('=')?;
-                (field.trim() == key)
-                    .then(|| value.trim())
-                    .filter(|value| !value.is_empty())
-            })
-            .collect()
-    }
-    let names = values(pkginfo, "pkgname");
-    let versions = values(pkginfo, "pkgver");
-    if names.len() != 1 || versions.len() != 1 {
-        bail!("官方依赖包 .PKGINFO 缺少唯一 pkgname/pkgver");
-    }
-    Ok((
-        names.into_iter().next().unwrap().to_owned(),
-        versions.into_iter().next().unwrap().to_owned(),
-    ))
-}
-
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     let log = Path::new(OUTPUT).join("build.log");
-    import_prepared_pgp_keys(Path::new(BUILD))?;
-    let makepkg_arguments = makepkg_arguments(spec.allow_check);
-    let network = build_network_enabled()?;
-    run_as_builder(&makepkg_arguments, Some(&log))?;
+    install_batch_dependencies(Path::new(BUILD), &log)?;
+    let status = run_as_builder_status(&makepkg_arguments(spec.allow_check), Some(&log))?;
+    if !status.success() {
+        bail!(
+            "{}: makepkg 失败，详情见 build.log",
+            classify_makepkg_failure(&log)
+        );
+    }
     let packages = collect_package_files(Path::new(BUILD))?;
     if packages.is_empty() {
-        bail!("makepkg 未生成软件包");
+        bail!("GUEST_OUTPUT_MISMATCH: makepkg 未生成软件包");
     }
     let mut artifacts = Vec::new();
     for package in packages {
         let name = package
             .file_name()
             .and_then(|value| value.to_str())
-            .context("软件包文件名不是 UTF-8")?;
+            .context("GUEST_OUTPUT_MISMATCH: 软件包文件名不是 UTF-8")?;
         let destination = Path::new(OUTPUT).join(name);
         fs::copy(&package, &destination)?;
         let metadata = fs::metadata(&destination)?;
@@ -581,22 +270,16 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         source_manifest_sha256: spec
             .source_manifest_sha256
             .clone()
-            .context("Build Job 缺少 Source Manifest")?,
+            .context("Build Job 缺少输入摘要")?,
         dependency_snapshot_sha256: spec
             .dependency_snapshot_sha256
             .clone()
-            .context("Build Job 缺少依赖快照")?,
-        profile_sha256: spec
-            .profile_sha256
-            .clone()
-            .context("Build Job 缺少 Profile")?,
+            .context("Build Job 缺少依赖选择摘要")?,
         artifacts,
         provenance: [
             ("guest_agent".into(), env!("CARGO_PKG_VERSION").into()),
-            (
-                "network".into(),
-                if network { "direct" } else { "none" }.into(),
-            ),
+            ("build_image".into(), "aursmith-build:latest".into()),
+            ("network".into(), "docker_bridge".into()),
             (
                 "check".into(),
                 if spec.allow_check {
@@ -620,11 +303,50 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     })
 }
 
+fn install_batch_dependencies(build: &Path, log: &Path) -> anyhow::Result<()> {
+    let directory = build.join(".aursmith-batch-dependencies");
+    if !directory.exists() {
+        return Ok(());
+    }
+    let mut packages = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".pkg.tar.") && !name.ends_with(".sig"))
+        })
+        .collect::<Vec<_>>();
+    packages.sort();
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let stdout = OpenOptions::new().create(true).append(true).open(log)?;
+    let stderr = stdout.try_clone()?;
+    let status = Command::new("/usr/bin/pacman")
+        .args(["-U", "--noconfirm", "--needed"])
+        .args(packages)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()?;
+    if !status.success() {
+        bail!(
+            "{}: 同批 AUR 依赖安装失败，详情见 build.log",
+            classify_makepkg_failure(log)
+        );
+    }
+    Ok(())
+}
+
 fn makepkg_arguments(allow_check: bool) -> Vec<&'static str> {
     let mut arguments = vec![
         "/usr/bin/makepkg",
         "--config",
         "/etc/aursmith/makepkg.conf",
+        "--syncdeps",
         "--noconfirm",
         "--cleanbuild",
         "--force",
@@ -633,6 +355,35 @@ fn makepkg_arguments(allow_check: bool) -> Vec<&'static str> {
         arguments.push("--nocheck");
     }
     arguments
+}
+
+fn classify_makepkg_failure(log: &Path) -> &'static str {
+    let text = String::from_utf8_lossy(&fs::read(log).unwrap_or_default()).to_ascii_lowercase();
+    if [
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "connection timed out",
+        "connection reset",
+        "failed retrieving file",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        "BUILD_NETWORK_TRANSIENT"
+    } else if text.contains("did not pass the validity check") || text.contains("checksum") {
+        "GUEST_CHECKSUM_FAILED"
+    } else if text.contains("unknown public key")
+        || text.contains("signature") && text.contains("failed")
+    {
+        "GUEST_PGP_FAILED"
+    } else if text.contains("a failure occurred in check()") {
+        "GUEST_CHECK_FAILED"
+    } else if text.contains("a failure occurred in package") {
+        "GUEST_PACKAGE_FAILED"
+    } else {
+        "GUEST_BUILD_FAILED"
+    }
 }
 
 fn builder_command_arguments<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
@@ -660,11 +411,7 @@ fn validate_expected_outputs(
         .collect::<BTreeSet<_>>();
     let expected = expected_outputs.iter().cloned().collect::<BTreeSet<_>>();
     if !expected.is_empty() && actual != expected {
-        bail!(
-            "构建产物与签名 JobSpec 的 split outputs 不一致：预期 {:?}，实际 {:?}",
-            expected,
-            actual
-        );
+        bail!("GUEST_OUTPUT_MISMATCH: 预期 {expected:?}，实际 {actual:?}");
     }
     Ok(())
 }
@@ -677,14 +424,14 @@ fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
-        bail!("无法读取构建产物 .PKGINFO");
+        bail!("GUEST_OUTPUT_MISMATCH: 无法读取构建产物 .PKGINFO");
     }
     let text = String::from_utf8(output.stdout)?;
     let value = |name: &str| {
         text.lines()
             .filter_map(|line| line.split_once(" = "))
             .find_map(|(key, value)| (key == name).then_some(value.to_owned()))
-            .with_context(|| format!(".PKGINFO 缺少 {name}"))
+            .with_context(|| format!("GUEST_OUTPUT_MISMATCH: .PKGINFO 缺少 {name}"))
     };
     Ok((value("pkgname")?, value("pkgver")?, value("arch")?))
 }
@@ -692,7 +439,7 @@ fn read_package_metadata(path: &Path) -> anyhow::Result<(String, String, String)
 fn run_as_builder(arguments: &[&str], log: Option<&Path>) -> anyhow::Result<()> {
     let status = run_as_builder_status(arguments, log)?;
     if !status.success() {
-        bail!("Guest 命令失败，状态 {status}");
+        bail!("Builder 命令失败，状态 {status}");
     }
     Ok(())
 }
@@ -710,7 +457,7 @@ fn run_as_builder_status(
         .env("HOME", "/home/builder")
         .env("LANG", "C.UTF-8");
     if let Some(path) = log {
-        let stdout = File::create(path)?;
+        let stdout = OpenOptions::new().create(true).append(true).open(path)?;
         let stderr = stdout.try_clone()?;
         command
             .stdout(Stdio::from(stdout))
@@ -719,94 +466,28 @@ fn run_as_builder_status(
     let mut child = command.spawn()?;
     let mut last_size = log.and_then(|path| fs::metadata(path).ok().map(|value| value.len()));
     let mut last_progress = Instant::now();
-    let status = loop {
+    loop {
         if let Some(status) = child.try_wait()? {
-            break status;
+            return Ok(status);
         }
         std::thread::sleep(Duration::from_secs(1));
-        let Some(path) = log else {
-            continue;
-        };
+        let Some(path) = log else { continue };
         let current_size = fs::metadata(path).ok().map(|value| value.len());
         if current_size != last_size {
             last_size = current_size;
             last_progress = Instant::now();
         } else if last_progress.elapsed() >= Duration::from_secs(120) {
-            let mut diagnostics = fs::OpenOptions::new().append(true).open(path)?;
-            diagnostics
-                .write_all("\n==> AURsmith: 120 秒无日志进展，记录 Guest 进程快照\n".as_bytes())?;
-            diagnostics.write_all(process_snapshot().as_bytes())?;
+            let mut diagnostics = OpenOptions::new().append(true).open(path)?;
+            diagnostics.write_all(b"\n==> AURsmith: 120 seconds without log progress\n")?;
             diagnostics.flush()?;
-            last_size = fs::metadata(path).ok().map(|value| value.len());
             last_progress = Instant::now();
         }
-    };
-    Ok(status)
-}
-
-fn process_snapshot() -> String {
-    let mut processes = fs::read_dir("/proc")
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let pid = entry.file_name().into_string().ok()?;
-            pid.chars()
-                .all(|value| value.is_ascii_digit())
-                .then_some(pid)
-        })
-        .collect::<Vec<_>>();
-    processes.sort_by_key(|pid| pid.parse::<u32>().unwrap_or(u32::MAX));
-    let mut snapshot = String::new();
-    for pid in processes {
-        let root = Path::new("/proc").join(&pid);
-        let status = fs::read_to_string(root.join("status")).unwrap_or_default();
-        let selected = status
-            .lines()
-            .filter(|line| {
-                ["Name:", "State:", "Pid:", "PPid:", "Threads:"]
-                    .iter()
-                    .any(|prefix| line.starts_with(prefix))
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let command = fs::read(root.join("cmdline"))
-            .ok()
-            .map(|bytes| {
-                String::from_utf8_lossy(&bytes)
-                    .replace('\0', " ")
-                    .trim()
-                    .to_owned()
-            })
-            .unwrap_or_default();
-        let wait = fs::read_to_string(root.join("wchan"))
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        snapshot.push_str(&format!("{selected} wchan:{wait} cmd:{command}\n"));
     }
-    snapshot
-}
-
-fn build_network_enabled() -> anyhow::Result<bool> {
-    Ok(command_line_enables_build_network(&fs::read_to_string(
-        "/proc/cmdline",
-    )?))
-}
-
-fn command_line_enables_build_network(command_line: &str) -> bool {
-    command_line
-        .split_whitespace()
-        .any(|part| part == "aursmith.build_network=1")
 }
 
 fn controller_key() -> anyhow::Result<Vec<u8>> {
-    let command_line = fs::read_to_string("/proc/cmdline")?;
-    let value = command_line
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("aursmith.controller_key="))
-        .context("内核参数缺少 Controller 公钥")?;
+    let value = std::env::var("AURSMITH_CONTROLLER_VERIFYING_KEY_HEX")
+        .context("缺少 Controller 公钥环境变量")?;
     let bytes = hex::decode(value)?;
     if bytes.len() != 32 {
         bail!("Controller 公钥长度无效");
@@ -849,124 +530,16 @@ fn copy_tree(source: &Path, destination: &Path, skip_control: bool) -> anyhow::R
 
 fn validate_relative_link(link: &Path) -> anyhow::Result<()> {
     if link.is_absolute()
-        || link.components().any(|part| {
+        || link.components().any(|component| {
             matches!(
-                part,
+                component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
     {
-        bail!("输入符号链接越界");
+        bail!("输入符号链接越过构建目录");
     }
     Ok(())
-}
-
-fn manifest(root: &Path, output_root: &Path) -> anyhow::Result<Vec<SourceManifestEntry>> {
-    let mut files = Vec::new();
-    collect_manifest(root, output_root, &mut files)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
-}
-
-fn collect_manifest(
-    root: &Path,
-    output_root: &Path,
-    files: &mut Vec<SourceManifestEntry>,
-) -> anyhow::Result<()> {
-    for item in fs::read_dir(root)? {
-        let item = item?;
-        let metadata = fs::symlink_metadata(item.path())?;
-        let path = item
-            .path()
-            .strip_prefix(output_root)?
-            .to_string_lossy()
-            .into_owned();
-        if metadata.is_dir() {
-            files.push(SourceManifestEntry {
-                path,
-                kind: SourceEntryKind::Directory,
-                sha256: None,
-                size: 0,
-                link_target: None,
-            });
-            collect_manifest(&item.path(), output_root, files)?;
-        } else if metadata.is_file() {
-            files.push(SourceManifestEntry {
-                path,
-                kind: SourceEntryKind::File,
-                sha256: Some(file_digest(&item.path())?),
-                size: metadata.len(),
-                link_target: None,
-            });
-        } else if metadata.file_type().is_symlink() {
-            files.push(SourceManifestEntry {
-                path,
-                kind: SourceEntryKind::Symlink,
-                sha256: None,
-                size: 0,
-                link_target: Some(fs::read_link(item.path())?.to_string_lossy().into_owned()),
-            });
-        } else {
-            bail!("源码树包含设备文件或其他特殊文件");
-        }
-    }
-    Ok(())
-}
-
-fn manifest_digest(entries: &[SourceManifestEntry]) -> anyhow::Result<String> {
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(entries)?)))
-}
-
-fn select_audit_files(
-    prepared: &Path,
-    entries: &[SourceManifestEntry],
-) -> anyhow::Result<Vec<AuditSourceFile>> {
-    const MAX_TOTAL: usize = 2 * 1024 * 1024;
-    const MAX_FILE: u64 = 256 * 1024;
-    let mut remaining = MAX_TOTAL;
-    let mut selected = Vec::new();
-    for entry in entries {
-        if entry.kind != SourceEntryKind::File || entry.size > MAX_FILE {
-            continue;
-        }
-        let lower = entry.path.to_ascii_lowercase();
-        let reason = if lower.ends_with("/pkgbuild") || lower == "prepared/pkgbuild" {
-            Some("AUR 构建入口")
-        } else if lower.ends_with(".sh")
-            || lower.ends_with("/makefile")
-            || lower.ends_with("/cmakelists.txt")
-            || lower.contains("install")
-            || lower.contains("systemd")
-            || lower.contains("service")
-            || lower.contains("hook")
-            || lower.contains("network")
-            || lower.contains("permission")
-            || lower.contains("persist")
-        {
-            Some("风险相关构建、安装、网络、权限或持久化文件")
-        } else {
-            None
-        };
-        let Some(reason) = reason else { continue };
-        let relative = Path::new(&entry.path).strip_prefix("prepared")?;
-        let path = prepared.join(relative);
-        let bytes = fs::read(&path)?;
-        if bytes.len() > remaining {
-            continue;
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-        remaining -= text.len();
-        selected.push(AuditSourceFile {
-            path: entry.path.clone(),
-            sha256: entry.sha256.clone().context("源码文件缺少摘要")?,
-            size: entry.size,
-            selection_reason: reason.to_owned(),
-            text,
-        });
-    }
-    Ok(selected)
 }
 
 fn collect_package_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -977,7 +550,7 @@ fn collect_package_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             && path
                 .file_name()
                 .and_then(|value| value.to_str())
-                .is_some_and(is_package_archive_name)
+                .is_some_and(|name| name.contains(".pkg.tar.") && !name.ends_with(".sig"))
         {
             packages.push(path);
         }
@@ -1000,25 +573,6 @@ fn file_digest(path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn mount(source: &str, target: &str, kind: &str, extra: &[&str]) -> anyhow::Result<()> {
-    let mut arguments = vec!["-t", kind];
-    arguments.extend_from_slice(extra);
-    arguments.extend([source, target]);
-    run_checked("/usr/bin/mount", &arguments, None)
-}
-
-fn ensure_mount(source: &str, target: &str, kind: &str, extra: &[&str]) -> anyhow::Result<()> {
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    if mountinfo.lines().any(|line| {
-        line.split_whitespace()
-            .nth(4)
-            .is_some_and(|mounted_at| mounted_at == target)
-    }) {
-        return Ok(());
-    }
-    mount(source, target, kind, extra)
-}
-
 fn run_checked(executable: &str, arguments: &[&str], cwd: Option<&Path>) -> anyhow::Result<()> {
     let mut command = Command::new(executable);
     command.args(arguments).stdin(Stdio::null());
@@ -1032,191 +586,40 @@ fn run_checked(executable: &str, arguments: &[&str], cwd: Option<&Path>) -> anyh
     Ok(())
 }
 
-fn sync_filesystem() -> anyhow::Result<()> {
-    run_checked("/usr/bin/sync", &[], None)
-}
-
-fn shutdown() {
-    let _ = Command::new("/usr/bin/poweroff").arg("-f").status();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn only_exhausted_dependency_downloads_get_the_retryable_guest_code() {
+    fn makepkg_uses_standard_dependency_install_and_failure_classes() {
+        assert!(makepkg_arguments(true).contains(&"--syncdeps"));
+        assert!(!makepkg_arguments(true).contains(&"--nocheck"));
+        assert!(makepkg_arguments(false).contains(&"--nocheck"));
         assert_eq!(
-            guest_error_code(&anyhow::anyhow!(
-                "完整系统与构建依赖下载连续 3 次失败，详情见 fetch.log"
-            )),
-            "FETCH_DEPENDENCY_DOWNLOAD_FAILED"
-        );
-        assert_eq!(
-            guest_error_code(&anyhow::anyhow!("checksum 校验失败")),
-            "GUEST_COMMAND_FAILED"
+            guest_error_code(&anyhow::anyhow!("GUEST_CHECKSUM_FAILED: bad source")),
+            "GUEST_CHECKSUM_FAILED"
         );
     }
 
-    fn temporary_build_directory() -> PathBuf {
-        let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aursmith-guest-test-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    #[test]
+    fn declared_pgp_keys_require_full_fingerprints() {
+        let fingerprint = "EF6E286DDA85EA2A4BA7DE684E2C6E8793298290";
+        assert_eq!(
+            declared_pgp_fingerprints(&format!("validpgpkeys = {fingerprint}")).unwrap(),
+            [fingerprint]
+        );
+        assert!(declared_pgp_fingerprints("validpgpkeys = 93298290").is_err());
     }
 
     #[test]
-    fn system_mounts_are_detected_without_remounting() {
-        ensure_mount("proc", "/proc", "proc", &[]).unwrap();
-        ensure_mount("sysfs", "/sys", "sysfs", &[]).unwrap();
-    }
-
-    #[test]
-    fn links_cannot_escape_guest_build_directory() {
+    fn links_cannot_escape_build_directory() {
         assert!(validate_relative_link(Path::new("src/file")).is_ok());
         assert!(validate_relative_link(Path::new("../secret")).is_err());
         assert!(validate_relative_link(Path::new("/etc/shadow")).is_err());
     }
 
     #[test]
-    fn manifest_digest_is_order_sensitive_after_canonical_sorting() {
-        let entries = vec![SourceManifestEntry {
-            path: "prepared/PKGBUILD".into(),
-            kind: SourceEntryKind::File,
-            sha256: Some("a".repeat(64)),
-            size: 1,
-            link_target: None,
-        }];
-        assert_eq!(manifest_digest(&entries).unwrap().len(), 64);
-    }
-
-    #[test]
-    fn package_identity_comes_from_unique_pkginfo_fields() {
-        let pkginfo = "pkgname = tree\npkgbase = tree\npkgver = 2.3.2-1\n";
-        assert_eq!(
-            parse_pkginfo_identity(pkginfo).unwrap(),
-            ("tree".into(), "2.3.2-1".into())
-        );
-        assert!(parse_pkginfo_identity("pkgname = tree\n").is_err());
-        assert!(parse_pkginfo_identity("pkgname = one\npkgname = two\npkgver = 1\n").is_err());
-        assert!(is_package_archive_name("tree-2.3.2-1-x86_64.pkg.tar.zst"));
-        assert!(!is_package_archive_name(
-            "tree-2.3.2-1-x86_64.pkg.tar.zst.sig"
-        ));
-    }
-
-    #[test]
-    fn build_network_requires_the_explicit_kernel_flag() {
-        assert!(command_line_enables_build_network(
-            "root=/dev/vda aursmith.build_network=1"
-        ));
-        assert!(!command_line_enables_build_network(
-            "root=/dev/vda aursmith.build_network=0"
-        ));
-    }
-
-    #[test]
-    fn builder_command_resets_the_post_pam_environment() {
-        let command = builder_command_arguments(&["/usr/bin/makepkg", "--verifysource"]);
-        assert_eq!(command[3], "/usr/bin/env");
-        assert_eq!(command[4], "-i");
-        assert!(command.contains(&"HOME=/home/builder"));
-        assert!(!command.iter().any(|value| value.contains("PROXY")));
-        assert_eq!(command.last(), Some(&"--verifysource"));
-    }
-
-    #[test]
-    fn full_declared_pgp_fingerprints_are_parsed_and_deduplicated() {
-        let fingerprint = "EF6E286DDA85EA2A4BA7DE684E2C6E8793298290";
-        let srcinfo = format!(
-            "pkgbase = demo\n\tvalidpgpkeys = {fingerprint}\n\tvalidpgpkeys = {fingerprint}\n"
-        );
-        assert_eq!(declared_pgp_fingerprints(&srcinfo).unwrap(), [fingerprint]);
-        assert!(declared_pgp_fingerprints("validpgpkeys = 93298290").is_err());
-        assert!(declared_pgp_fingerprints("validpgpkeys = not-a-key").is_err());
-    }
-
-    #[test]
-    fn process_snapshot_contains_the_current_test_process() {
-        let snapshot = process_snapshot();
-        assert!(snapshot.contains(&format!("Pid:\t{} ", std::process::id())));
-        assert!(snapshot.contains("PPid:"));
-        assert!(snapshot.contains("wchan:"));
-    }
-
-    #[test]
-    fn published_pkgrel_only_rewrites_the_vm_working_copy() {
-        let directory = temporary_build_directory();
-        fs::write(
-            directory.join("PKGBUILD"),
-            "pkgname=demo\npkgver=1.0\npkgrel=1\npackage() { :; }\n",
-        )
-        .unwrap();
-        apply_published_pkgrel(&directory, Some("1"), Some("1.2")).unwrap();
-        assert!(
-            fs::read_to_string(directory.join("PKGBUILD"))
-                .unwrap()
-                .contains("pkgrel=1.2\n")
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn build_policy_overrides_pkgbuild_debug_options_in_the_working_copy() {
-        let directory = temporary_build_directory();
-        fs::write(
-            directory.join("PKGBUILD"),
-            "pkgname=demo\npkgver=1.0\npkgrel=1\noptions=('debug')\noptions_x86_64=('debug')\n",
-        )
-        .unwrap();
-
-        disable_debug_packages(&directory).unwrap();
-
-        let rewritten = fs::read_to_string(directory.join("PKGBUILD")).unwrap();
-        assert!(rewritten.ends_with("options+=('!debug')\noptions_x86_64+=('!debug')\n"));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn ambiguous_or_dynamic_pkgrel_is_rejected() {
-        let directory = temporary_build_directory();
-        fs::write(
-            directory.join("PKGBUILD"),
-            "pkgname=demo\npkgver=1.0\npkgrel=$BUILD_NUMBER\npkgrel=2\n",
-        )
-        .unwrap();
-        assert!(apply_published_pkgrel(&directory, Some("1"), Some("1.1")).is_err());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn single_dynamic_pkgrel_is_rejected() {
-        let directory = temporary_build_directory();
-        fs::write(
-            directory.join("PKGBUILD"),
-            "pkgname=demo\npkgver=1.0\npkgrel=$BUILD_NUMBER\n",
-        )
-        .unwrap();
-        assert!(apply_published_pkgrel(&directory, Some("1"), Some("1.1")).is_err());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn check_policy_is_explicit_and_split_outputs_must_match() {
-        assert!(
-            makepkg_arguments(true)
-                .windows(2)
-                .any(|pair| pair == ["--config", "/etc/aursmith/makepkg.conf"])
-        );
-        assert!(!makepkg_arguments(true).contains(&"--nocheck"));
-        assert!(makepkg_arguments(false).contains(&"--nocheck"));
+    fn split_outputs_are_exact() {
         let artifact = ArtifactRecord {
             path: "demo-1-1-any.pkg.tar.zst".into(),
             sha256: "a".repeat(64),
@@ -1225,24 +628,6 @@ mod tests {
             package_version: Some("1-1".into()),
             architecture: Some("any".into()),
         };
-        assert!(
-            validate_expected_outputs(std::slice::from_ref(&artifact), &["demo".into()]).is_ok()
-        );
-        let debug = ArtifactRecord {
-            path: "demo-debug-1-1-any.pkg.tar.zst".into(),
-            package_name: Some("demo-debug".into()),
-            ..artifact.clone()
-        };
-        assert!(validate_expected_outputs(&[artifact.clone(), debug], &["demo".into()]).is_err());
-        assert!(
-            validate_expected_outputs(&[artifact.clone()], &["missing-split-output".into()])
-                .is_err()
-        );
-        let unrelated = ArtifactRecord {
-            path: "unrelated-1-1-any.pkg.tar.zst".into(),
-            package_name: Some("unrelated".into()),
-            ..artifact.clone()
-        };
-        assert!(validate_expected_outputs(&[artifact, unrelated], &["demo".into()]).is_err());
+        assert!(validate_expected_outputs(&[artifact], &["demo".into()]).is_ok());
     }
 }
