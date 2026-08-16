@@ -957,6 +957,7 @@ pub(crate) async fn schedule_rebuild_batch(
     )
     .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
+    schedule_ready_builds(database).await?;
     Ok(Some(batch_id))
 }
 
@@ -3006,9 +3007,17 @@ mod tests {
             .fetch_one(&database)
             .await
             .unwrap();
+        let build_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE revision_id = ? AND kind = 'build'",
+        )
+        .bind(&revision_id)
+        .fetch_one(&database)
+        .await
+        .unwrap();
         assert_eq!(agent_runs, 0, "固定内容不应再次调用 Agent");
         assert_eq!(reused, 1);
-        assert_eq!(state, "audit_approved");
+        assert_eq!(state, "build_pending");
+        assert_eq!(build_jobs, 1, "复用审计后必须立即进入现有 Build 调度");
     }
 
     #[tokio::test]
