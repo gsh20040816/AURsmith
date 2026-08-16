@@ -1,13 +1,20 @@
 # AURsmith 精简重构需求（草案）
 
+## 0. 重构执行原则
+
+本轮重构必须**原位简化并复用已经验证的实现**，不得借精简之名另起新核心、重建 Schema、重写 Web，或自制 Provider/Agent 协议。每一项都先删除已确认无用的旧抽象，再在现有调用链中做闭合需求所需的最小修改；禁止先造 v2、兼容双轨、通用适配平台或占位实现，再等待未来迁移。
+
+以下现有主路径是重构基线，不得替换：Controller 调度 3 个 low、按需 1 个 high Runner，Runner 经 credential gateway 调用 Codex CLI；现有 netcup 环境变量、secret、Codex argv、Dockerfile 和真实 Provider 验证方式继续复用。Agent 只允许在既有代码中补齐 diff-first 提示、严格结果、失败分类和重试，不得改成 Controller 内联 Codex、手写 Responses 客户端、新 profile 系统或新的 Runner/gateway 抽象。
+
 ## 1. 已确认的产品边界
 
 AURsmith 是单个管理员自用的 AUR 私有仓库打包器，不是通用供应链安全平台。
 
 本草案采用以下固定部署前提：
 
-- 公网设备运行 Web、调度、Agent 编排、Publisher、GPG/`repo-add` 和静态 pacman 仓库；
-- 另一台固定设备运行 Builder，使用 Docker 构建；
+- 公网 Controller 设备运行现有 Web、调度、3 个 low Runner、按需 high Runner 和 credential gateway；
+- 固定 Builder 设备使用普通联网 Docker 构建；
+- 公网 Publisher 分机运行 GPG/`repo-add` 和静态 pacman 仓库；
 - Builder 只主动连接公网设备，不开放 AURsmith 入站端口；
 - 第一版只有一个 Builder 和一个 Publisher，不考虑扩容、选主、故障转移或高可用。
 
@@ -15,23 +22,27 @@ AURsmith 是单个管理员自用的 AUR 私有仓库打包器，不是通用供
 
 **信任边界到审查批准为止。** 批准前，AUR 文件是不可信输入；批准后，同一 commit 的包进入 Build 时视为可信。Docker 只提供干净、可删除的构建环境，不承担 KVM 级强隔离，也不继续围绕“恶意 Build”扩建设施。
 
-项目明确接受：单 Builder/Publisher 是单点；Docker 与宿主共享内核；公网设备失陷可能导致仓库签名能力失陷；diff-first 审查会继承上一批准版本中未发现的问题。不得用这些已接受风险反向引入 HA、KVM、自动密钥管理或取证平台。
+项目明确接受：Controller、单 Builder 和单 Publisher 是单点；Docker 与宿主共享内核；Publisher 失陷可能导致仓库签名能力失陷；diff-first 审查会继承上一批准版本中未发现的问题。不得用这些已接受风险反向引入 HA、KVM、自动密钥管理或取证平台。
 
 审查目标只覆盖 AUR 包装层及其变更，不承诺完整审计所有上游源码、预编译二进制或安装后的行为。
 
 ## 2. 最小架构
 
 ```text
-浏览器 ──HTTPS──> 公网反向代理 ──> AURsmith Web/调度/Publisher
-pacman  ──HTTPS──> 公共只读仓库             │
-                                             ├──> 3 个 low Agent，按需 1 个 high
-固定 Builder ──HTTPS 轮询/下载/完成通知─────┤
-固定 Builder ──SSH + write-only rsync──────> incoming/
-      │
-      └──> 一次性 Docker Build（直接联网）
+浏览器 ──HTTPS──> 公网 Controller（React Web / 调度）
+                              │
+                              └──> 3 low + 按需 high Runner
+                                       │
+                                credential gateway
+                                       │
+                                   Codex CLI
+
+固定 Builder ──现有认证通道──> Controller ──现有发布通道──> 公网 Publisher
+      │                                                     │
+      └──> 一次性联网 Docker Build             GPG / repo-add / 公共只读仓库
 ```
 
-公网设备只运行一个 AURsmith 核心服务。Builder 设备只运行一个窄职责的 `aursmith-builder` 进程；它不是旧 Worker 角色的单实例兼容版。Agent 按任务调用，不注册为服务。反向代理和 write-only SSH 接收端是部署边界，不是 AURsmith 的通用 Worker 平台。
+部署继续保留现有 Controller、4 个固定 Runner、credential gateway、Builder 和 Publisher 服务边界；不得把它们折叠成一个新核心，也不得新建第二套并行拓扑。精简目标是删除这些服务内部及其协议中已经无用的通用 Worker、KVM、归档、能力协商和平台化逻辑，而不是重写已经通过真实环境验证的 Agent、认证、传输和发布路径。
 
 ## 3. 必须整簇删除的过度开发
 
@@ -45,18 +56,18 @@ pacman  ──HTTPS──> 公共只读仓库             │
 | Fetch/Build 强制分离、Source Manifest、Dependency Snapshot、source proxy | 审查 AUR tree；获批后 Build 直接联网下载 |
 | 离线 Build、出口代理、域名白名单、DNS rebinding、网络等级和流量 provenance | Docker 使用普通网络，不建设出口控制面 |
 | pacoloco、缓存指标和 Profile 依赖优化器 | Builder 直接使用配置的 Arch 镜像；缓存由部署环境决定 |
-| 常驻 Signer、轮询 inbox/outbox、ReleaseAuthorization、writer epoch | 公网设备在本地发布事务中直接调用 GPG 和 `repo-add` |
+| Signer 周边的通用 epoch、双重授权和无用 inbox/outbox 状态机 | 保留 Publisher 分机和现有签名隔离，在既有发布事务中收缩 |
 | 完整 ReleaseEvidence、日志摘要链、Archive receipt/inventory、长期历史 | 保存必要审查结果、日志、当前和上一个完整仓库 |
-| 四个常驻 Agent Runner、Runner 注册、Agent Doctor、成本预算、随机 high 抽查、独立凭据网关 | 四个固定逻辑槽位，按任务调用一个简单适配层 |
-| React/Vite 管理台、SSE、Worker/Profile/Archive/Settings 页面 | 服务端 HTML、少量 JavaScript 和轮询 |
+| Runner 动态注册、Agent Doctor、成本预算、随机 high 抽查和通用适配器注册表 | 保留现有 4 Runner 与 credential gateway，只删除这些外围抽象；固定 3 low + 按需 high |
+| React/Vite 中的 Worker/Profile/Archive/Settings 等无用页面、字段和 SSE 路径 | 保留现有 React 认证和管理界面，在原页面内删减 |
 | 多管理员、RBAC、OAuth/OIDC、JWT、PAT、注册、邮件找回 | 一个本地初始化的管理员和服务端 Cookie 会话 |
 | `aursmithctl` 的 Worker/Profile/Release/Archive/远程控制命令 | 只保留管理员初始化、改密和吊销 session 的本地命令 |
 | ABI/官方依赖重建建议、alerts/events/outbox、Webhook/ntfy、通用指标 | 在包、任务或 keyring 状态上直接显示最后错误 |
 | Archiver、控制面备份、恢复 API 和灾备协议 | SQLite、仓库、GPG key 交给普通宿主备份 |
-| 内部 CA、Cloudflare/netcup 专用逻辑和多套 Caddy 拓扑 | 一个通用 HTTPS 反向代理示例，环境细节外置 |
-| 旧迁移、旧协议兼容层和需求/ADR 总账 | 新建精简 Schema，只维护一份现行需求 |
+| 已废弃的部署栈、重复 Caddy 拓扑和不再使用的云厂商分支 | 保留当前真实 netcup 部署、环境变量、secret 和已验证入口，删除其余重复实现 |
+| 无调用的旧表、字段和迁移辅助抽象 | 保留现有迁移链和生产 Schema，在后续迁移中原位收缩 |
 
-删除必须覆盖代码、Compose 服务、配置、迁移、页面和测试中的旧假设，不能改成默认关闭的 feature、兼容层或“以后可能用”的抽象。
+删除必须覆盖对应代码、配置、页面和测试中的旧假设，不能改成默认关闭的 feature、兼容层或“以后可能用”的抽象。不得删除仍被真实部署使用的 Controller、Runner、gateway、Builder、Publisher、迁移链、React 认证界面或其测试。
 
 ## 4. 软件包主流程
 
@@ -66,8 +77,8 @@ pacman  ──HTTPS──> 公共只读仓库             │
 4. 三个 low 全部进入终态后，当前 commit 按固定 3+1 规则自动批准或进入人工审查；批准后生成一个 Build job 及其首个 attempt。
 5. Builder 使用专用 HTTPS credential 轮询任务，下载获批 tree 归档并核对摘要。
 6. Builder 在一次性 Docker 中直接联网构建，把预期 packages、Manifest 和日志留在任务目录。
-7. Builder 通过固定 SSH key 和严格 `known_hosts`，用 write-only rsync 上传到 `incoming/.<attempt>.partial/`，再通过 HTTPS 提交完成通知。
-8. 公网 AURsmith 收到通知后，先把 partial 原子移出 SSH 账户可写的 incoming，再在私有 received 目录中核对 Manifest、文件 SHA-256 和 `.PKGINFO` 的名称、版本、架构及 split outputs。校验失败的内容隔离且不得发布。
+7. Builder 沿用现有跨机认证和传输路径，把产物上传到 Publisher 分机的受限 incoming，并向 Controller 提交完成通知；精简时只删除通用能力协商和无用角色分支。
+8. Publisher 按 Controller 已批准的 attempt 接管 partial，在私有 received 目录中核对 Manifest、文件 SHA-256 和 `.PKGINFO` 的名称、版本、架构及 split outputs。校验失败的内容隔离且不得发布。
 9. Publisher 加入当前 `aursmith-keyring`，在 staging 中运行 GPG 和官方 `repo-add`，成功后原子切换 `current`；任意失败保持当前仓库不变。
 
 第一版只支持 `x86_64`。同一 `pkgbase` 的全部 split outputs 一起构建。AUR 依赖只解析当前显式加入的包集合，使用 `.SRCINFO` 和简单拓扑排序；缺失依赖、provider 歧义或环由管理员调整配置，不建设通用依赖平台。
@@ -78,25 +89,16 @@ pacman  ──HTTPS──> 公共只读仓库             │
 
 更新包的 Agent 必须先看相对最后批准版本的 diff，再按需要读取当前完整文件。第一次加入包，或无法生成完整 diff 时，执行全量审查。
 
-推荐工作区：
-
-```text
-package/              当前 AUR commit 的完整 tracked files，只读
-context/review.json   pkgbase、当前 commit、baseline commit、diff/full 模式
-context/changes.diff  完整 tree-to-tree diff；full 模式不提供
-context/findings.json 确定性提示
-context/schema.json   结果 Schema
-output/               Agent 可写目录
-```
+Agent 执行链完整保留重构前实现：Controller 创建 3 个 low 任务，必要时再创建 high 任务；固定 Runner 领取任务，经现有 credential gateway 获得对应 Provider 能力，并使用现有 Codex CLI argv、容器和结果文件约定完成审查。继续沿用旧 netcup 环境变量与四份 secret。不得改成 Controller 内联调用、手写 Provider HTTP、另一套工具协议、新 profile 或 adapter registry。
 
 - baseline 只能是同一 `pkgbase` 最后一次 3+1 或人工批准的 commit，不能使用最近抓取、失败或拒绝的版本。
-- diff 模式下 Agent 先读取 `review.json` 和完整 `changes.diff`，再直接使用文件工具查看变化文件及所需上下文；full 模式直接读取当前 tree。不得把整个包压成巨型纯文本请求。
+- diff 模式在既有任务工作区和 Codex 提示中强制先读取完整 diff，再按需查看当前文件；full 模式直接读取当前 tree。不得把整个包压成巨型纯文本请求，也不得改变既有工作区身份与结果协议。
 - baseline 不存在、无法恢复或 diff 不能完整生成时自动改为 full；不得截断 diff 后自动批准。Git 是否 fast-forward 不影响 tree-to-tree diff。
 - Agent 可以读、搜索、比较文件并写结果，但不能执行包内程序。包中的 `AGENTS.md`、注释和脚本都是待审数据，不是指令。
-- 包工作区不得包含数据库、Docker Socket、GPG/SSH key 或 Provider credential。
+- Runner/Codex 工作区不得包含数据库、Docker Socket、GPG/SSH key；Provider credential 只经现有 credential gateway 注入既有调用边界，不得进入提示、结果或日志。
 - 唯一权威输出是符合固定 Schema 的结果文件；自然语言、Markdown 和 stdout 不作 fallback。
 - 不建设文件访问取证或“模型理解了全部文件”的 coverage 证明；`files_read` 自报只能帮助排错。
-- 每个实际启用的适配器必须用真实 Provider 分别通过 diff 和 full 文件读写端到端测试。CLI 能启动或 Provider 可达不等于审查可用。
+- 每个实际启用的既有 Runner/Provider 配置必须分别通过 diff 和 full 真实端到端测试。CLI 能启动或 Provider 可达不等于审查可用；修复兼容问题只能改现有提示、argv、结果校验和失败分类，不得另造协议。
 
 投票规则保持简单：必须等待三个 low 全部终态；3/3 直接批准；恰好 2/3 调用一个 high；0–1/3 转人工。high 只有 `approve` 才批准，其余转人工。合法 `reject` 不重试但仍参与聚合；技术错误按重试规则处理。人工入口只在 low 聚合、high 非批准或技术错误耗尽后开放，不能在审查开始前直接绕过 3+1；人工决定绑定当前 commit 并填写理由。
 
@@ -118,9 +120,9 @@ CPU、内存和磁盘限制可以作为部署默认值，但不建设资源探�
 
 跨机接收只需要 `attempt ID + Manifest + 当前任务状态`。rsync 中断可继续同一 partial；完成通知后先把 partial 原子移出 SSH 可写目录，再执行校验。重复完成相同 Manifest 必须幂等成功，内容冲突必须停止。无需 TransferCapability、Controller Ed25519、writer epoch 或远程 ReleaseAuthorization。
 
-公网设备串行执行接收和发布：只接管预期普通包文件，重新计算 SHA-256 并核对包元数据；随后在同一文件系统 staging 中生成包签名、仓库数据库、数据库签名和一个小型 `repository-manifest.json`，最后只切换一个权威 `current` 指针。保留 `previous` 用于人工恢复，不建设完整 Release 历史或 Web 回滚平台。切换后，`current` 和 `previous` 数据库引用的包文件都必须继续通过原有公开 URL 读取，避免客户端先取得旧数据库、后下载旧包时失败。
+Publisher 分机串行执行接收和发布：只接管预期普通包文件，重新计算 SHA-256 并核对包元数据；随后在同一文件系统 staging 中生成包签名、仓库数据库、数据库签名和一个小型 `repository-manifest.json`，最后只切换一个权威 `current` 指针。保留 `previous` 用于人工恢复，不建设完整 Release 历史或 Web 回滚平台。切换后，`current` 和 `previous` 数据库引用的包文件都必须继续通过原有公开 URL 读取，避免客户端先取得旧数据库、后下载旧包时失败。
 
-仓库 GPG 私钥只存在于公网发布设备，不进入 Builder、Build 容器、incoming SSH 账户或 Agent。发布必须显式指定配置的签名主指纹，不能从 keyring 中任取“第一个 key”。本项目接受公网设备失陷后攻击者可能取得签名能力；不为此恢复独立常驻 Signer 和双重授权协议。
+仓库 GPG 私钥只存在于 Publisher 分机的既有签名隔离边界，不进入 Controller、Runner、gateway、Builder、Build 容器或 incoming 账户。发布必须显式指定配置的签名主指纹，不能从 keyring 中任取“第一个 key”。本项目接受 Publisher 失陷后攻击者可能取得签名能力；不得为了精简把签名合并进 Controller，也不恢复无用的双重授权平台。
 
 `aursmith-keyring` 是必须长期保留的系统包：
 
@@ -139,7 +141,7 @@ CPU、内存和磁盘限制可以作为部署默认值，但不建设资源探�
 
 ## 8. 公网 Web 与认证
 
-管理 Web 必须通过 HTTPS 公网访问。AURsmith 只监听 loopback 或受限内部网络，由一个通用反向代理终止 TLS；核心仓库不维护云厂商专用拓扑。
+管理 Web 必须通过 HTTPS 公网访问。保留当前 netcup Controller 入口、反向代理和已验证安全头边界；删除其他未使用或重复的部署拓扑，不为了“通用化”重写真实入口。
 
 只保留一个管理员：
 
@@ -152,7 +154,7 @@ CPU、内存和磁盘限制可以作为部署默认值，但不建设资源探�
 
 Builder 机器接口只接受独立的固定 Bearer secret，不接受浏览器 Cookie。公共 pacman 仓库、仓库公钥和签名只允许匿名 GET/HEAD；管理 API、Builder API 和仓库文件必须使用明确分离的路由边界。health、诊断和本机初始化不经公网代理。
 
-Web 使用服务端 HTML 和少量 JavaScript 轮询，只提供：登录/退出；包管理；完整 diff 与 3+1/人工决定；任务、Builder 最近联系、错误和日志；仓库与 keyring 状态。不保留 SPA、SSE、Worker/Profile/Archive/成本/备份/需求总账等页面。
+Web 保留现有 React/Vite 认证与管理界面，在原组件、API 和测试中删减。最终只提供：登录/退出；包管理；完整 diff 与 3+1/人工决定；任务、Builder 最近联系、错误和日志；仓库与 keyring 状态。删除 Worker/Profile/Archive/成本/备份/需求总账等无用页面、字段和 SSE 路径；不得另写 SSR、原生 HTML/JS 前端或第二套 UI。
 
 ## 9. 失败分类与重试
 
@@ -169,17 +171,17 @@ Web 使用服务端 HTML 和少量 JavaScript 轮询，只提供：登录/退出
 
 ## 10. 状态与迁移
 
-公网 SQLite 只保存恢复流程需要的包、AUR commit 与批准 baseline、3+1 结果、Build attempt、重试次数、最后错误、管理员 Argon2id 密码摘要与 session、Builder `last_poll_at`，以及仓库/keyring 的查询索引。文件系统 `current` 及其中的 `repository-manifest.json` 是已发布包集合和 keyring generation 的唯一权威；服务启动时由它对账 SQLite。Builder 本地只持久化当前 attempt、阶段和待上传 Manifest。
+保留现有生产 SQLite Schema、迁移链和已经验证的打开/升级流程；不得新建 fresh-only 数据库、另起 core Schema 或只导出少数字段后重建。包、AUR commit 与批准 baseline、3+1 结果、Build attempt、重试、管理员认证、Builder/Publisher 状态和 keyring 查询继续在现有表中原位演进。文件系统 `current` 及其中的仓库 Manifest 继续作为已发布集合的权威，Builder 本地状态继续按现有恢复路径持久化。
 
-日志、AUR tree、partial、verified packages 和仓库在文件系统中；数据库不复制大内容，也不建立 alerts、events、evidence、Capability、Worker、Profile、Archive 或备份模型。
+删除某项功能时，先删除其代码调用、API、页面和测试依赖，再用正常前向 migration 收缩已经确定无用的字段或表。不得为了让新代码看起来干净而跳过旧 migration、拒绝现有生产库或维护新旧双 Schema。暂时仍被现有 Controller/Runner/Builder/Publisher 路径引用的 Worker、Job、attempt 或发布数据必须保留，直到调用方完成原位简化。
 
-新版本使用全新的 Schema。迁移只导出显式包列表、暂停状态、可验证的最后批准 commit/tree baseline、当前/上一个仓库、现有 GPG key 和 keyring generation。baseline 无法核对时首次审查自动使用 full。管理员通过新本地 CLI 重新创建；活动任务、旧 session 和其余控制面状态不迁移。
+日志、AUR tree、partial、verified packages 和仓库仍放文件系统，数据库不新增大内容副本或新的 alerts/events/evidence 平台。现有数据升级必须保留显式包列表、暂停状态、批准 baseline、活动审查/任务、管理员与 session、当前仓库、GPG/keyring 以及恢复正在进行流程所需的状态；确实无法继续的状态必须通过明确 migration 或管理员可见错误处理，不能静默丢弃。
 
-现有仓库保持只读可用，直到新系统完成真实跨机 Build、传输、keyring、签名和客户端安装验证。
+现有仓库保持可用，所有收缩修改必须在 staging 或真实部署副本验证迁移、跨机 Build、传输、keyring、签名和客户端安装后再进入生产。
 
 ## 11. 最低验收
 
-1. 在真实两台设备上完成“新 commit → diff-first 3+1 → Builder HTTPS 领取 → 联网 Docker Build → write-only rsync → Publisher 校验 → keyring/GPG/repo-add → pacman 安装/升级”。
+1. 在真实 Controller、Builder 和 Publisher 部署上完成“新 commit → diff-first 3+1 → Builder 领取 → 联网 Docker Build → 既有传输路径 → Publisher 校验 → keyring/GPG/repo-add → pacman 安装/升级”。
 2. 覆盖首次 full、正常 diff、baseline 丢失回退 full，以及 3/3、2/3+high、0–1/3/人工结果。
 3. 每个启用 Agent 用真实 Provider 证明：diff 模式先读 diff 再读当前文件，full 模式直接读完整 tree，二者都写结果文件；纯文本、stdout-only、禁用文件读取和包内指令劫持不得成为有效审查。
 4. 未登录管理请求失败；Cookie、过期、logout、Origin/CSRF 和登录节流生效；公共仓库/公钥可匿名读取，管理与 Builder API 不能匿名访问。
@@ -193,13 +195,13 @@ Web 使用服务端 HTML 和少量 JavaScript 轮询，只提供：登录/退出
 
 ## 12. 防止再次过度开发
 
-- 固定一台 Builder 和一台 Publisher；配置使用单值，不设计数组、注册、角色、能力或调度抽象，也不把旧 Worker 表缩成单行继续使用。
+- 固定一套 Controller（含 4 Runner 与 gateway）、一台 Builder 和一台 Publisher；在现有配置和表中收缩动态注册、角色、能力和调度抽象，不新建平行的单值平台。
 - 跨机只解决认证、续传、内容完整性和幂等；不要把 attempt ID 重新包装成 Capability、证据链或签名控制协议。
 - 公网认证只服务一个管理员；不要因为 Web 公网化加入 IAM、IdP、PAT、MFA 生命周期或多前端 CORS。
 - keyring 只解决 pacman 信任分发、周期刷新和显式换钥；不要扩展成自动 KMS、客户端升级追踪或紧急恢复平台。
 - diff-first 依赖批准 baseline；不要为“证明 Agent 读过并理解全部文件”建设系统调用审计或 coverage 平台。
 - 部署选择不得升级为产品协议；性能优化不得成为正确性前提；日志和摘要不得升级为取证平台。
-- 新能力必须解决这个单管理员、固定两机项目已经出现的实际问题；“以后也许扩容”不是理由。
-- 优先删除旧抽象，不为旧 Worker、Migration、API、Compose 或数据库状态保留兼容层。
+- 新能力必须解决这个单管理员、固定 Controller/Builder/Publisher 部署已经出现的实际问题；“以后也许扩容”不是理由。
+- 优先删除已确认无用的旧抽象；同时保留真实部署仍在使用的 Migration、API、Compose 服务和数据库状态，调用方原位迁移完成后再删除，不加 v2 或双轨兼容层。
 
-完成重构意味着旧机制的代码、服务、配置、文档和测试已经删除，精简闭环已经通过验收；仅加禁用开关不算完成。
+完成重构意味着已确认删除的机制在代码、配置、页面、文档和测试中都不再存在，保留的 Controller→Runner→gateway→Codex、React Web、迁移链、Builder 和 Publisher 主路径已经通过真实验收；仅加禁用开关或用新实现包住旧实现都不算完成。
