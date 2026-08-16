@@ -10,7 +10,10 @@ FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0
 ARG AURSMITH_SOURCE_GIT_COMMIT
 ARG CODEX_CLI_VERSION=0.147.0
 ARG CLAUDE_CODE_VERSION=2.1.226
-RUN npm install --global --omit=dev \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends diffutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global --omit=dev \
       @openai/codex@${CODEX_CLI_VERSION} \
       @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
     && npm cache clean --force \
