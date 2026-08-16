@@ -100,6 +100,7 @@ fn run() -> anyhow::Result<()> {
             spec.upstream_pkgrel.as_deref(),
             spec.published_pkgrel.as_deref(),
         )?;
+        disable_debug_packages(Path::new(BUILD))?;
     }
     run_checked("/usr/bin/chown", &["-R", "builder:builder", BUILD], None)?;
     let result = match spec.kind {
@@ -235,6 +236,20 @@ fn apply_published_pkgrel(
         bail!("PKGBUILD 必须恰好包含一个顶层 pkgrel 赋值，实际为 {replacements}");
     }
     fs::write(path, rewritten)?;
+    Ok(())
+}
+
+fn disable_debug_packages(build: &Path) -> anyhow::Result<()> {
+    let path = build.join("PKGBUILD");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .context("无法打开构建工作副本中的 PKGBUILD")?;
+    file.write_all(
+        "\n# AURsmith 构建策略：不生成未在 .SRCINFO 中声明的自动 debug 包。\noptions+=('!debug')\noptions_x86_64+=('!debug')\n"
+            .as_bytes(),
+    )?;
+    file.flush()?;
     Ok(())
 }
 
@@ -644,23 +659,11 @@ fn validate_expected_outputs(
         .filter_map(|artifact| artifact.package_name.clone())
         .collect::<BTreeSet<_>>();
     let expected = expected_outputs.iter().cloned().collect::<BTreeSet<_>>();
-    let missing = expected
-        .difference(&actual)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let unexpected = actual
-        .difference(&expected)
-        .filter(|name| {
-            name.strip_suffix("-debug")
-                .is_none_or(|parent| !expected.contains(parent))
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if !expected.is_empty() && (!missing.is_empty() || !unexpected.is_empty()) {
+    if !expected.is_empty() && actual != expected {
         bail!(
-            "构建产物与签名 JobSpec 的 split outputs 不一致：缺少 {:?}，非 makepkg debug 产物 {:?}",
-            missing,
-            unexpected
+            "构建产物与签名 JobSpec 的 split outputs 不一致：预期 {:?}，实际 {:?}",
+            expected,
+            actual
         );
     }
     Ok(())
@@ -1166,6 +1169,22 @@ mod tests {
     }
 
     #[test]
+    fn build_policy_overrides_pkgbuild_debug_options_in_the_working_copy() {
+        let directory = temporary_build_directory();
+        fs::write(
+            directory.join("PKGBUILD"),
+            "pkgname=demo\npkgver=1.0\npkgrel=1\noptions=('debug')\noptions_x86_64=('debug')\n",
+        )
+        .unwrap();
+
+        disable_debug_packages(&directory).unwrap();
+
+        let rewritten = fs::read_to_string(directory.join("PKGBUILD")).unwrap();
+        assert!(rewritten.ends_with("options+=('!debug')\noptions_x86_64+=('!debug')\n"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn ambiguous_or_dynamic_pkgrel_is_rejected() {
         let directory = temporary_build_directory();
         fs::write(
@@ -1214,7 +1233,7 @@ mod tests {
             package_name: Some("demo-debug".into()),
             ..artifact.clone()
         };
-        assert!(validate_expected_outputs(&[artifact.clone(), debug], &["demo".into()]).is_ok());
+        assert!(validate_expected_outputs(&[artifact.clone(), debug], &["demo".into()]).is_err());
         assert!(
             validate_expected_outputs(&[artifact.clone()], &["missing-split-output".into()])
                 .is_err()
