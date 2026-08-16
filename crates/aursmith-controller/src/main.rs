@@ -26,7 +26,6 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve,
-    SetupToken,
     RestoreControlPlane {
         #[arg(long)]
         backup: std::path::PathBuf,
@@ -43,10 +42,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = Config::from_env()?;
-    if matches!(&cli.command, Some(Command::SetupToken)) {
-        println!("{}", config.setup_token);
-        return Ok(());
-    }
     if let Some(Command::RestoreControlPlane { backup }) = &cli.command {
         backups::restore(&config, &backup).await?;
         println!("控制面数据库已从签名备份恢复；原数据库保留在同目录的 recovery 子目录中");

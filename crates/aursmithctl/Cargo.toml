@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aursmith-domain = { path = "../aursmith-domain" }
 aursmith-protocol = { path = "../aursmith-protocol" }
 clap.workspace = true
 chrono.workspace = true
@@ -14,6 +15,7 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 

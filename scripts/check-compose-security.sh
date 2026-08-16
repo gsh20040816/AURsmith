@@ -4,6 +4,7 @@ set -euo pipefail
 # 仅给 Compose 渲染提供无权限测试值，不连接真实 Worker。
 export KVM_GID="${KVM_GID:-996}"
 export AURSMITH_SECRET_GID="${AURSMITH_SECRET_GID:-1000}"
+export AURSMITH_PUBLIC_ORIGIN="https://aursmith.example.test"
 export AURSMITH_CONTROLLER_VERIFYING_KEY_HEX="${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_TRANSFER_ENDPOINTS_JSON="${AURSMITH_TRANSFER_ENDPOINTS_JSON:-{\"00000000-0000-0000-0000-000000000001\":\"ssh://aursmith@192.0.2.10:2222\"}}"
 export AURSMITH_CONTROLLER_POLL_URL="${AURSMITH_CONTROLLER_POLL_URL:-https://controller.example.test/api/v1/reverse-workers/poll}"
@@ -39,6 +40,12 @@ while IFS= read -r from_line; do
     exit 1
   fi
 done < <(rg '^FROM ' deploy/images)
+
+if ! rg -q '^\s*respond @health 404$' deploy/netcup/Caddyfile.snippet \
+  || ! rg -q '^\s*header_up X-AURsmith-Client-IP \{remote_host\}$' deploy/netcup/Caddyfile.snippet; then
+  echo "公网管理反代必须隐藏 health 并覆盖可信客户端 IP header" >&2
+  exit 1
+fi
 
 builder_json="$(docker compose -f deploy/builder/compose.yaml config --format json)"
 if [[ "$(jq '[.services.worker.devices[]? | select(.source == "/dev/kvm")] | length' <<<"${builder_json}")" != "1" ]]; then

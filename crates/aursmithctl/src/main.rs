@@ -1,21 +1,28 @@
 use anyhow::{Context, bail};
+use aursmith_domain::credentials;
 use aursmith_protocol::{BuildProfileSpec, ManifestEntry};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use std::{
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    str::FromStr,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -32,6 +39,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 只在公网核心设备本地管理唯一管理员。
+    Admin {
+        #[arg(long, env = "AURSMITH_DATABASE_URL", value_name = "DATABASE_URL")]
+        database_url: String,
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     Worker {
         #[arg(long, default_value = "/run/aursmith/worker.sock")]
         socket: PathBuf,
@@ -79,6 +93,21 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    Init {
+        #[arg(long, default_value = "admin")]
+        username: String,
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+    },
+    ResetPassword {
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+    },
+    RevokeSessions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +175,27 @@ enum WorkerCommand {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Admin {
+            database_url,
+            command,
+        } => {
+            let database = connect_admin_database(&database_url).await?;
+            let result = match command {
+                AdminCommand::Init {
+                    username,
+                    password_file,
+                } => {
+                    let password = read_password(password_file.as_deref())?;
+                    initialize_administrator(&database, &username, &password).await?
+                }
+                AdminCommand::ResetPassword { password_file } => {
+                    let password = read_password(password_file.as_deref())?;
+                    reset_administrator_password(&database, &password).await?
+                }
+                AdminCommand::RevokeSessions => revoke_administrator_sessions(&database).await?,
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::Worker { socket, command } => {
             let request = match command {
                 WorkerCommand::Status => json!({"command": "status"}),
@@ -254,6 +304,159 @@ async fn main() -> anyhow::Result<()> {
         Command::RsyncSsh { arguments } => rsync_ssh(arguments)?,
     }
     Ok(())
+}
+
+async fn connect_admin_database(database_url: &str) -> anyhow::Result<SqlitePool> {
+    let options = SqliteConnectOptions::from_str(database_url)
+        .context("SQLite URL 无效")?
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(10));
+    let database = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .context("无法连接既有 AURsmith SQLite；本地管理员命令不会创建数据库")?;
+    let required_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('administrators', 'sessions')",
+    )
+    .fetch_one(&database)
+    .await
+    .context("无法检查 AURsmith 管理员 Schema")?;
+    if required_tables != 2 {
+        bail!("既有数据库缺少 administrators 或 sessions 表");
+    }
+    Ok(database)
+}
+
+fn read_password(password_file: Option<&Path>) -> anyhow::Result<String> {
+    const MAXIMUM_PASSWORD_BYTES: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    if let Some(path) = password_file {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("无法检查密码文件 {}", path.display()))?;
+        if !metadata.file_type().is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAXIMUM_PASSWORD_BYTES
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!("密码文件必须是仅属主可读的有界普通文件");
+        }
+        File::open(path)
+            .with_context(|| format!("无法打开密码文件 {}", path.display()))?
+            .take(MAXIMUM_PASSWORD_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+    } else {
+        let stdin = std::io::stdin();
+        reject_terminal_password_input(stdin.is_terminal())?;
+        stdin
+            .lock()
+            .take(MAXIMUM_PASSWORD_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("无法从标准输入读取密码")?;
+    }
+    if bytes.len() as u64 > MAXIMUM_PASSWORD_BYTES {
+        bail!("密码输入超过 64 KiB 上限");
+    }
+    let password = String::from_utf8(bytes)
+        .context("密码必须是 UTF-8")?
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    credentials::validate_password(&password).map_err(anyhow::Error::msg)?;
+    Ok(password)
+}
+
+fn reject_terminal_password_input(is_terminal: bool) -> anyhow::Result<()> {
+    if is_terminal {
+        bail!("拒绝从会回显的终端读取密码；请使用安全管道或权限为 0600 的密码文件");
+    }
+    Ok(())
+}
+
+async fn initialize_administrator(
+    database: &SqlitePool,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<Value> {
+    let username = username.trim();
+    if username.chars().count() < 3 {
+        bail!("管理员用户名至少需要 3 个字符");
+    }
+    credentials::validate_password(password).map_err(anyhow::Error::msg)?;
+    let password_hash = credentials::hash_password(password)
+        .map_err(|error| anyhow::anyhow!("无法计算密码摘要：{error}"))?;
+    let mut transaction = database.begin().await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM administrators")
+        .fetch_one(&mut *transaction)
+        .await?;
+    if count != 0 {
+        bail!("管理员已经初始化；请使用 reset-password 修改密码");
+    }
+    let administrator_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO administrators(id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&administrator_id)
+    .bind(username)
+    .bind(password_hash)
+    .bind(Utc::now())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(json!({
+        "action": "initialized",
+        "administrator_id": administrator_id,
+        "username": username,
+    }))
+}
+
+async fn reset_administrator_password(
+    database: &SqlitePool,
+    password: &str,
+) -> anyhow::Result<Value> {
+    credentials::validate_password(password).map_err(anyhow::Error::msg)?;
+    let password_hash = credentials::hash_password(password)
+        .map_err(|error| anyhow::anyhow!("无法计算密码摘要：{error}"))?;
+    let mut transaction = database.begin().await?;
+    let administrators: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, username FROM administrators ORDER BY created_at")
+            .fetch_all(&mut *transaction)
+            .await?;
+    let [(administrator_id, username)] = administrators.as_slice() else {
+        bail!("数据库必须且只能包含一个管理员");
+    };
+    sqlx::query("UPDATE administrators SET password_hash = ? WHERE id = ?")
+        .bind(password_hash)
+        .bind(administrator_id)
+        .execute(&mut *transaction)
+        .await?;
+    let revoked = sqlx::query("DELETE FROM sessions")
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+    transaction.commit().await?;
+    Ok(json!({
+        "action": "password_reset",
+        "administrator_id": administrator_id,
+        "username": username,
+        "revoked_sessions": revoked,
+    }))
+}
+
+async fn revoke_administrator_sessions(database: &SqlitePool) -> anyhow::Result<Value> {
+    let administrators: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM administrators")
+        .fetch_one(database)
+        .await?;
+    if administrators != 1 {
+        bail!("数据库必须且只能包含一个管理员");
+    }
+    let revoked = sqlx::query("DELETE FROM sessions")
+        .execute(database)
+        .await?
+        .rows_affected();
+    Ok(json!({
+        "action": "sessions_revoked",
+        "revoked_sessions": revoked,
+    }))
 }
 
 fn rsync_ssh(arguments: Vec<OsString>) -> anyhow::Result<()> {
@@ -549,6 +752,35 @@ fn materialize_private_file(source: &Path, target: &Path, maximum_size: u64) -> 
 mod tests {
     use super::*;
 
+    fn sqlite_url(path: &Path) -> String {
+        format!("sqlite://{}", path.display())
+    }
+
+    async fn create_test_admin_schema(path: &Path) {
+        let database = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&sqlite_url(path))
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE administrators(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)",
+        )
+        .execute(&database)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions(token_sha256 TEXT PRIMARY KEY, administrator_id TEXT NOT NULL REFERENCES administrators(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL)",
+        )
+        .execute(&database)
+        .await
+        .unwrap();
+        database.close().await;
+    }
+
     #[test]
     fn controller_key_can_be_written_without_printing_the_private_value() {
         let directory = tempfile::tempdir().unwrap();
@@ -564,6 +796,109 @@ mod tests {
             0o600
         );
         assert!(generate_controller_key(Some(&private), Some(&public)).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_admin_commands_enforce_one_administrator_and_revoke_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("controller.db");
+        create_test_admin_schema(&database_path).await;
+        let database = connect_admin_database(&sqlite_url(&database_path))
+            .await
+            .unwrap();
+        initialize_administrator(&database, "admin", "第一段足够长的密码-123456")
+            .await
+            .unwrap();
+        assert!(
+            initialize_administrator(&database, "other", "另一段足够长的密码-123456")
+                .await
+                .is_err()
+        );
+        let row: (String, String) = sqlx::query_as("SELECT id, password_hash FROM administrators")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert!(credentials::verify_password(
+            "第一段足够长的密码-123456",
+            &row.1
+        ));
+        sqlx::query("INSERT INTO sessions(token_sha256, administrator_id, created_at, expires_at, last_seen_at) VALUES ('token', ?, ?, ?, ?)")
+            .bind(&row.0)
+            .bind(Utc::now())
+            .bind(Utc::now() + chrono::Duration::hours(1))
+            .bind(Utc::now())
+            .execute(&database)
+            .await
+            .unwrap();
+
+        let reset = reset_administrator_password(&database, "重置后足够长的密码-123456")
+            .await
+            .unwrap();
+        assert_eq!(reset["revoked_sessions"], 1);
+        let password_hash: String = sqlx::query_scalar("SELECT password_hash FROM administrators")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert!(!credentials::verify_password(
+            "第一段足够长的密码-123456",
+            &password_hash
+        ));
+        assert!(credentials::verify_password(
+            "重置后足够长的密码-123456",
+            &password_hash
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+                .fetch_one(&database)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            revoke_administrator_sessions(&database).await.unwrap()["revoked_sessions"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn local_admin_commands_refuse_missing_database_or_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.db");
+        assert!(connect_admin_database(&sqlite_url(&missing)).await.is_err());
+        assert!(!missing.exists(), "管理员命令不得静默创建数据库");
+
+        let empty = directory.path().join("empty.db");
+        let database = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&sqlite_url(&empty))
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        database.close().await;
+        assert!(connect_admin_database(&sqlite_url(&empty)).await.is_err());
+    }
+
+    #[test]
+    fn password_files_must_be_private_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let password = directory.path().join("password");
+        fs::write(&password, "足够长的文件密码-123456\n").unwrap();
+        fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_password(Some(&password)).unwrap(),
+            "足够长的文件密码-123456"
+        );
+        fs::set_permissions(&password, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_password(Some(&password)).is_err());
+    }
+
+    #[test]
+    fn terminal_password_input_is_rejected_before_reading() {
+        assert!(reject_terminal_password_input(true).is_err());
+        assert!(reject_terminal_password_input(false).is_ok());
     }
 }
 

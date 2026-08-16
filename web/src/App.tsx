@@ -25,7 +25,7 @@ const navigation: Array<{ id: View; label: string; requirement: string }> = [
 ];
 
 export function App() {
-  const [boot, setBoot] = useState<"loading" | "setup" | "login" | "ready">("loading");
+  const [boot, setBoot] = useState<"loading" | "login" | "ready">("loading");
   const [session, setSession] = useState<Session | null>(null);
   const [view, setView] = useState<View>("dashboard");
   const [error, setError] = useState("");
@@ -34,22 +34,15 @@ export function App() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
 
   useEffect(() => {
-    void api.setupStatus()
-      .then(async ({ initialized }) => {
-        if (!initialized) {
-          setBoot("setup");
-          return;
-        }
-        try {
-          const current = await api.me();
-          setSession(current);
-          setBoot("ready");
-        } catch {
-          setBoot("login");
-        }
+    void api.me()
+      .then((current) => {
+        setSession(current);
+        setBoot("ready");
       })
       .catch((reason) => {
-        setError(messageOf(reason));
+        if (!(reason instanceof ApiError && reason.status === 401)) {
+          setError(messageOf(reason));
+        }
         setBoot("login");
       });
   }, []);
@@ -76,9 +69,6 @@ export function App() {
   if (boot === "loading") {
     return <LoadingScreen />;
   }
-  if (boot === "setup") {
-    return <SetupScreen onComplete={() => setBoot("login")} />;
-  }
   if (boot === "login") {
     return (
       <LoginScreen
@@ -86,6 +76,7 @@ export function App() {
         onLogin={async () => {
           const current = await api.me();
           setSession(current);
+          setError("");
           setBoot("ready");
         }}
       />
@@ -119,13 +110,29 @@ export function App() {
           <button
             aria-label="退出登录"
             className="text-button"
-            onClick={() => void api.logout().finally(() => setBoot("login"))}
+            onClick={() => {
+              setError("");
+              void api.logout()
+                .then(() => {
+                  setSession(null);
+                  setBoot("login");
+                })
+                .catch((reason) => {
+                  if (reason instanceof ApiError && reason.status === 401) {
+                    setSession(null);
+                    setBoot("login");
+                    return;
+                  }
+                  setError(messageOf(reason));
+                });
+            }}
           >
             退出
           </button>
         </div>
       </aside>
       <main className="workspace">
+        {error && <Notice kind="error">{error}</Notice>}
         {leadingAlert && view !== "alerts" && <section className={`global-alert ${leadingAlert.severity}`} role="alert"><div><strong>{leadingAlert.title}</strong><span>{lifecycleAlertSummary(leadingAlert)}</span></div><button className="secondary-button" onClick={() => setView("alerts")}>查看 {activeAlerts.length} 条待处理告警</button></section>}
         {view === "dashboard" && <Dashboard alerts={activeAlerts} onShowAlerts={() => setView("alerts")} />}
         {view === "workers" && <WorkersView />}
@@ -536,18 +543,6 @@ function PlannedView({ view }: { view: View }) {
   return (
     <><header className="page-header compact"><div><p className="eyebrow">{item.requirement}</p><h1>{item.label}</h1><p className="lede">{explanations[view]}</p></div></header><section className="work-panel"><div className="empty-state"><span className="empty-symbol">◇</span><div><strong>该纵向切片正在实现</strong><p>当前不会用静态假数据伪装功能完成；对应 API 和状态机落地后再开放操作。</p></div></div></section></>
   );
-}
-
-function SetupScreen({ onComplete }: { onComplete: () => void }) {
-  const [token, setToken] = useState("");
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const submit = async (event: FormEvent) => {
-    event.preventDefault(); setError("");
-    try { await api.setup({ token, username, password }); onComplete(); } catch (reason) { setError(messageOf(reason)); }
-  };
-  return <AuthFrame title="初始化锻造控制台" note="令牌只能通过 Controller 容器内命令读取。完成后它将失效。"><form onSubmit={(event) => void submit(event)}><Field label="初始化令牌" value={token} onChange={setToken} /><Field label="管理员名称" value={username} onChange={setUsername} /><Field label="密码" type="password" value={password} onChange={setPassword} hint="至少 12 个字符" />{error && <Notice kind="error">{error}</Notice>}<button className="primary-button" type="submit">创建管理员</button></form></AuthFrame>;
 }
 
 function LoginScreen({ initialError, onLogin }: { initialError: string; onLogin: () => Promise<void> }) {

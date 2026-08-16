@@ -150,7 +150,6 @@ name = "aursmith-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
  "aursmith-domain",
  "aursmith-protocol",
  "axum",
@@ -181,6 +180,7 @@ dependencies = [
 name = "aursmith-domain"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "chrono",
  "hex",
  "serde",
@@ -270,6 +270,7 @@ name = "aursmithctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aursmith-domain",
  "aursmith-protocol",
  "chrono",
  "clap",
@@ -277,6 +278,7 @@ dependencies = [
  "hex",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "tokio",
  "uuid",

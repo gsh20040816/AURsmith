@@ -9,16 +9,31 @@
 
 AURsmith 不安装裸机 daemon。文档中的所有管理命令都通过构建产物或 `docker compose exec` 运行。
 
-## 初始化密钥
+## 初始化密钥与管理员
 
 运行 `cargo run -p aursmithctl -- generate-controller-key` 生成 Controller Ed25519 密钥对。输出中的私钥十六进制值写入 Controller 的 `controller_signing_key` secret；公钥值写入每个 Worker 的 `AURSMITH_CONTROLLER_VERIFYING_KEY_HEX`。
 
-使用 `openssl rand -hex 32` 生成一次性设置令牌。使用 `ssh-keygen -t ed25519` 分别生成：
+使用 `ssh-keygen -t ed25519` 分别生成：
 
 - Controller 访问 Worker 的客户端密钥；
 - 每个 Worker 自己的 SSH host key。
 
 Controller 使用严格的 `known_hosts`，不能配置 `StrictHostKeyChecking=no`。Worker 的 `authorized_keys` 只允许 Controller 公钥，实际命令仍由 `sshd_config` 中的 forced command 二次限制。
+
+Controller 必须把 `AURSMITH_PUBLIC_ORIGIN` 配置为浏览器实际访问的固定 HTTPS Origin，例如 `https://aursmith.example.com`。该值不能包含凭据、路径、查询参数或片段。会话 Cookie 固定使用 `__Host-` 前缀和 Secure 属性，不提供 HTTP 或不安全 Cookie 降级开关。`AURSMITH_SESSION_IDLE_MINUTES` 与 `AURSMITH_SESSION_ABSOLUTE_HOURS` 分别控制服务端空闲和绝对过期时间；前者允许 1 分钟至 7 天，后者允许 1 小时至 365 天，非法配置会拒绝启动，且空闲期限不能长于绝对期限。
+
+反向代理必须删除客户端传入的 `X-AURsmith-Client-IP`，再用当前 TCP 连接的真实客户端 IP 覆盖该请求头；禁止直接透传同名 header 或从任意 `X-Forwarded-For` 链猜测来源。Controller 只接受该 header 中的单个合法 IP，缺失或无效时统一进入 `direct` 登录节流桶。登录同时受每来源小桶和较高的全局硬上限约束。
+
+管理员只能在公网核心设备本地创建。Controller 启动并完成数据库迁移后，通过安全管道向标准输入传入密码；密码不得作为命令行参数。CLI 会拒绝直接从可能回显的 TTY 读取密码，也可以改用权限为 `0600` 的 `--password-file`：
+
+```bash
+read -rs AURSMITH_ADMIN_PASSWORD
+printf '%s\n' "${AURSMITH_ADMIN_PASSWORD}" | docker compose -f deploy/controller/compose.yaml exec -T controller \
+  aursmithctl admin init --username admin
+unset AURSMITH_ADMIN_PASSWORD
+```
+
+`reset-password` 同样从标准输入读取新密码，并在同一事务中吊销全部已有会话。只吊销会话而不改密时使用 `aursmithctl admin revoke-sessions`。这三个命令都直接访问本机 SQLite，不存在公网 setup/status 或 setup token。
 
 Worker 账户的 `/bin/sh` 只用于 OpenSSH 按其协议执行服务端 forced command；客户端提交的原始命令不会直接交给该 shell。控制命令由 `aursmithctl ssh-gateway` 按固定语法解析；Publisher 的 rsync 收件命令则直接交给 rsync 官方随包提供的 `rrsync -wo /landing`，不由 AURsmith 解析 rsync 的内部参数。PTY、转发、密码登录和交互会话均被禁用。
 
@@ -59,9 +74,9 @@ Controller 自行提供 Web/API，Publisher 自行提供仓库 HTTP；两者默�
 
 1. 启动 Publisher Stack。
 2. 启动至少一个 Builder Stack。真实公网拓扑下 Builder 不启动 SSH sidecar，也不映射入站端口；它通过 `AURSMITH_CONTROLLER_POLL_URL` 主动领取任务。
-3. 启动 Controller Stack。
-4. 通过 `docker compose exec controller aursmith-controller setup-token` 读取初始化令牌。
-5. 在 Web 设置页创建管理员。
+3. 配置固定的 `AURSMITH_PUBLIC_ORIGIN` 后启动 Controller Stack。
+4. 在公网核心设备本地执行 `aursmithctl admin init`；已存在管理员时不得重复初始化。
+5. 通过 HTTPS Web 登录。
 6. 注册 Builder 和 Publisher，并执行“探测”。
 7. 运行 Doctor，确认 KVM、SSH、协议、仓库和保留策略状态。
 8. 在订阅真实软件包前，确认四个 Agent Runner 都能返回符合 Schema 的测试报告，且报告与容器日志中不含 API key。

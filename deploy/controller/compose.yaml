@@ -13,12 +13,13 @@ services:
     environment:
       AURSMITH_BIND: 0.0.0.0:8080
       AURSMITH_DATABASE_URL: sqlite:///var/lib/aursmith/controller.db
-      AURSMITH_SETUP_TOKEN_FILE: /run/secrets/setup_token
+      AURSMITH_PUBLIC_ORIGIN: ${AURSMITH_PUBLIC_ORIGIN:?必须设置管理站点的固定 HTTPS Origin}
+      AURSMITH_SESSION_IDLE_MINUTES: ${AURSMITH_SESSION_IDLE_MINUTES:-60}
+      AURSMITH_SESSION_ABSOLUTE_HOURS: ${AURSMITH_SESSION_ABSOLUTE_HOURS:-168}
       AURSMITH_SIGNING_KEY_FILE: /run/secrets/controller_signing_key
       AURSMITH_SSH_IDENTITY_SOURCE_FILE: /run/secrets/worker_ssh_key
       AURSMITH_SSH_IDENTITY_FILE: /run/aursmith-private/worker_ssh_key
       AURSMITH_SSH_KNOWN_HOSTS_FILE: /run/secrets/worker_known_hosts
-      AURSMITH_SECURE_COOKIES: ${AURSMITH_SECURE_COOKIES:-true}
       AURSMITH_LOW_AGENT_ENDPOINTS: http://agent-low-1:8090,http://agent-low-2:8090,http://agent-low-3:8090
       AURSMITH_HIGH_AGENT_ENDPOINT: http://agent-high:8090
       AURSMITH_AGENT_DAILY_CALL_LIMIT: ${AURSMITH_AGENT_DAILY_CALL_LIMIT:-300}
@@ -37,7 +38,6 @@ services:
       AURSMITH_BACKUP_EXPORT_SOCKET: /run/aursmith/worker.sock
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
-      - setup_token
       - controller_signing_key
       - worker_ssh_key
       - worker_known_hosts
@@ -179,8 +179,6 @@ services:
     restart: unless-stopped
 
 secrets:
-  setup_token:
-    file: ${AURSMITH_SETUP_TOKEN_FILE:-./secrets/setup_token}
   controller_signing_key:
     file: ${AURSMITH_SIGNING_KEY_FILE:-./secrets/controller_signing_key}
   worker_ssh_key:

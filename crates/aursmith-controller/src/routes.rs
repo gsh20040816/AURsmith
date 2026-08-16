@@ -1,5 +1,5 @@
 use crate::{auth, config::Config, error::ApiError, transport};
-use aursmith_domain::{REQUIREMENTS, WorkerRole, WorkerState};
+use aursmith_domain::{REQUIREMENTS, WorkerRole, WorkerState, credentials};
 use aursmith_protocol::{
     InlineInput, JobKind, ManifestEntry, ResourceLimits, ReverseWorkerLease, ReverseWorkerPoll,
     SignedEnvelope,
@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
+    middleware,
     response::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
@@ -23,12 +24,15 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     convert::Infallible,
     fs,
+    net::IpAddr,
     process::Command,
     sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
+use tokio::sync::Mutex;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
@@ -41,6 +45,7 @@ pub struct AppState {
     pub database: SqlitePool,
     pub config: Arc<Config>,
     pub signing_key: Arc<SigningKey>,
+    login_throttle: Arc<Mutex<LoginThrottle>>,
 }
 
 impl AppState {
@@ -49,15 +54,103 @@ impl AppState {
             database,
             config: Arc::new(config),
             signing_key: Arc::new(signing_key),
+            login_throttle: Arc::new(Mutex::new(LoginThrottle::default())),
         }
     }
 }
 
+#[derive(Default)]
+struct LoginThrottle {
+    global_attempts: VecDeque<Instant>,
+    attempts_by_source: BTreeMap<String, VecDeque<Instant>>,
+}
+
+impl LoginThrottle {
+    const SOURCE_LIMIT: usize = 5;
+    const GLOBAL_LIMIT: usize = 100;
+    const MAX_TRACKED_SOURCES: usize = 64;
+    const WINDOW: StdDuration = StdDuration::from_secs(60);
+    const OVERFLOW_SOURCE: &'static str = "overflow";
+
+    fn accept(&mut self, now: Instant, source: String) -> Result<LoginReservation, ApiError> {
+        retain_recent(&mut self.global_attempts, now, Self::WINDOW);
+        self.attempts_by_source.retain(|_, attempts| {
+            retain_recent(attempts, now, Self::WINDOW);
+            !attempts.is_empty()
+        });
+        if self.global_attempts.len() >= Self::GLOBAL_LIMIT {
+            return Err(ApiError::too_many_requests(
+                "全局登录尝试过于频繁，请稍后重试",
+            ));
+        }
+        let source = if self.attempts_by_source.contains_key(&source)
+            || self.attempts_by_source.len() < Self::MAX_TRACKED_SOURCES - 1
+        {
+            source
+        } else {
+            Self::OVERFLOW_SOURCE.to_owned()
+        };
+        let attempts = self.attempts_by_source.entry(source.clone()).or_default();
+        if attempts.len() >= Self::SOURCE_LIMIT {
+            return Err(ApiError::too_many_requests("登录尝试过于频繁，请稍后重试"));
+        }
+        attempts.push_back(now);
+        self.global_attempts.push_back(now);
+        Ok(LoginReservation {
+            source,
+            recorded_at: now,
+        })
+    }
+
+    fn release(&mut self, reservation: LoginReservation) {
+        if let Some(attempts) = self.attempts_by_source.get_mut(&reservation.source) {
+            if let Some(index) = attempts
+                .iter()
+                .position(|attempt| *attempt == reservation.recorded_at)
+            {
+                attempts.remove(index);
+            }
+            if attempts.is_empty() {
+                self.attempts_by_source.remove(&reservation.source);
+            }
+        }
+        if let Some(index) = self
+            .global_attempts
+            .iter()
+            .position(|attempt| *attempt == reservation.recorded_at)
+        {
+            self.global_attempts.remove(index);
+        }
+    }
+}
+
+struct LoginReservation {
+    source: String,
+    recorded_at: Instant,
+}
+
+fn retain_recent(attempts: &mut VecDeque<Instant>, now: Instant, window: StdDuration) {
+    while attempts
+        .front()
+        .is_some_and(|attempt| now.duration_since(*attempt) >= window)
+    {
+        attempts.pop_front();
+    }
+}
+
+fn login_source(headers: &HeaderMap) -> String {
+    headers
+        .get(auth::TRUSTED_CLIENT_IP_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .map(|address| address.to_string())
+        .unwrap_or_else(|| "direct".into())
+}
+
 pub fn router(state: AppState) -> Router {
+    let authentication_state = state.clone();
     Router::new()
         .route("/healthz", get(health))
-        .route("/api/v1/setup/status", get(setup_status))
-        .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
@@ -184,6 +277,10 @@ pub fn router(state: AppState) -> Router {
             MakeRequestUuid,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            authentication_state,
+            auth::authorize_management_request,
+        ))
 }
 
 async fn api_not_found() -> StatusCode {
@@ -894,74 +991,6 @@ async fn manual_rebuild_package(
     })))
 }
 
-async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM administrators")
-        .fetch_one(&state.database)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({"initialized": count > 0})))
-}
-
-#[derive(Deserialize)]
-struct SetupRequest {
-    token: String,
-    username: String,
-    password: String,
-}
-
-async fn setup(
-    State(state): State<AppState>,
-    Json(request): Json<SetupRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    if request.username.trim().len() < 3 || request.password.len() < 12 {
-        return Err(ApiError::bad_request(
-            "INVALID_CREDENTIALS",
-            "用户名至少 3 个字符，密码至少 12 个字符",
-        ));
-    }
-    let expected = Sha256::digest(state.config.setup_token.as_bytes());
-    let actual = Sha256::digest(request.token.as_bytes());
-    if expected.as_slice() != actual.as_slice() {
-        return Err(ApiError::unauthorized("初始化令牌无效"));
-    }
-
-    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM administrators")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(ApiError::internal)?;
-    if count != 0 {
-        return Err(ApiError::conflict(
-            "ALREADY_INITIALIZED",
-            "系统已经完成初始化",
-        ));
-    }
-    let administrator_id = Uuid::new_v4().to_string();
-    let password_hash = auth::hash_password(&request.password)?;
-    let now = Utc::now();
-    sqlx::query(
-        "INSERT INTO administrators(id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&administrator_id)
-    .bind(request.username.trim())
-    .bind(password_hash)
-    .bind(now)
-    .execute(&mut *transaction)
-    .await
-    .map_err(ApiError::internal)?;
-    append_event_in_transaction(
-        &mut transaction,
-        "system",
-        "singleton",
-        "administrator_initialized",
-        json!({"administrator_id": administrator_id}),
-        "setup",
-    )
-    .await?;
-    transaction.commit().await.map_err(ApiError::internal)?;
-    Ok((StatusCode::CREATED, Json(json!({"initialized": true}))))
-}
-
 #[derive(Deserialize)]
 struct LoginRequest {
     username: String,
@@ -970,8 +999,15 @@ struct LoginRequest {
 
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    auth::require_origin(&state, &headers)?;
+    let reservation = state
+        .login_throttle
+        .lock()
+        .await
+        .accept(Instant::now(), login_source(&headers))?;
     let row =
         sqlx::query("SELECT id, username, password_hash FROM administrators WHERE username = ?")
             .bind(request.username.trim())
@@ -980,16 +1016,18 @@ async fn login(
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::unauthorized("用户名或密码错误"))?;
     let password_hash: String = row.get("password_hash");
-    if !auth::verify_password(&request.password, &password_hash) {
+    if !credentials::verify_password(&request.password, &password_hash) {
         return Err(ApiError::unauthorized("用户名或密码错误"));
     }
+    state.login_throttle.lock().await.release(reservation);
     let administrator_id: String = row.get("id");
     let token = auth::create_session(&state, &administrator_id).await?;
-    let cookie = auth::session_cookie(
-        &token,
-        state.config.secure_cookies,
-        state.config.session_hours * 3600,
-    );
+    let maximum_age_seconds = state
+        .config
+        .session_absolute_hours
+        .checked_mul(3600)
+        .ok_or_else(|| ApiError::internal("绝对会话期限换算溢出"))?;
+    let cookie = auth::session_cookie(&token, maximum_age_seconds);
     let mut headers = HeaderMap::new();
     headers.insert(
         SET_COOKIE,
@@ -1005,27 +1043,11 @@ async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(cookie) = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-    {
-        if let Some(token) = cookie
-            .split(';')
-            .filter_map(|part| part.trim().split_once('='))
-            .find_map(|(key, value)| (key == "aursmith_session").then_some(value))
-        {
-            sqlx::query("DELETE FROM sessions WHERE token_sha256 = ?")
-                .bind(auth::sha256(token))
-                .execute(&state.database)
-                .await
-                .map_err(ApiError::internal)?;
-        }
-    }
+    auth::delete_session(&state, &headers).await?;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         SET_COOKIE,
-        HeaderValue::from_str(&auth::expired_session_cookie(state.config.secure_cookies))
-            .map_err(ApiError::internal)?,
+        HeaderValue::from_str(&auth::expired_session_cookie()).map_err(ApiError::internal)?,
     );
     Ok((response_headers, StatusCode::NO_CONTENT))
 }
@@ -1775,16 +1797,25 @@ mod tests {
 
     async fn test_router_with_client_ca(client_ca_certificate_file: Option<String>) -> Router {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
-        let config = Config {
+        insert_test_administrator(&database).await;
+        router(AppState::new(
+            database,
+            test_config(client_ca_certificate_file),
+            SigningKey::from_bytes(&[9_u8; 32]),
+        ))
+    }
+
+    fn test_config(client_ca_certificate_file: Option<String>) -> Config {
+        Config {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
-            setup_token: "测试初始化令牌-至少二十个字符".into(),
+            public_origin: "https://aursmith.test".into(),
             signing_key_file: "/不存在".into(),
             ssh_identity_source_file: "/不存在".into(),
             ssh_identity_file: "/不存在".into(),
             ssh_known_hosts_file: "/不存在".into(),
-            secure_cookies: false,
-            session_hours: 1,
+            session_idle_minutes: 30,
+            session_absolute_hours: 1,
             low_agent_endpoints: vec![],
             high_agent_endpoint: String::new(),
             agent_daily_call_limit: 300,
@@ -1802,12 +1833,48 @@ mod tests {
             backup_export_dir: "/不存在".into(),
             backup_export_socket: "/不存在".into(),
             external_archiver_enabled: false,
-        };
-        router(AppState::new(
-            database,
-            config,
-            SigningKey::from_bytes(&[9_u8; 32]),
-        ))
+        }
+    }
+
+    async fn insert_test_administrator(database: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO administrators(id, username, password_hash, created_at) VALUES ('admin-id', 'admin', ?, ?)",
+        )
+        .bind(credentials::hash_password("足够长的测试密码-123456").unwrap())
+        .bind(Utc::now())
+        .execute(database)
+        .await
+        .unwrap();
+    }
+
+    async fn login_cookie(app: &Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("origin", "https://aursmith.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"username": "admin", "password": "足够长的测试密码-123456"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
     }
 
     #[tokio::test]
@@ -1830,37 +1897,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let setup = Request::builder()
-            .method("POST")
-            .uri("/api/v1/setup")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"token": "测试初始化令牌-至少二十个字符", "username": "admin", "password": "足够长的测试密码-123456"}).to_string(),
-            ))
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(setup).await.unwrap().status(),
-            StatusCode::CREATED
-        );
-        let login = Request::builder()
-            .method("POST")
-            .uri("/api/v1/auth/login")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"username": "admin", "password": "足够长的测试密码-123456"}).to_string(),
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(login).await.unwrap();
-        let cookie = response
-            .headers()
-            .get(SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
+        let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -1883,44 +1920,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_login_and_authenticated_requirements_flow() {
+    async fn login_and_authenticated_management_flow() {
         let app = test_router().await;
-        let setup = Request::builder()
-            .method("POST")
-            .uri("/api/v1/setup")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "token": "测试初始化令牌-至少二十个字符",
-                    "username": "admin",
-                    "password": "足够长的测试密码-123456"
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(setup).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-
-        let login = Request::builder()
-            .method("POST")
-            .uri("/api/v1/auth/login")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"username": "admin", "password": "足够长的测试密码-123456"}).to_string(),
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(login).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
-            .headers()
-            .get(SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
+        let cookie = login_cookie(&app).await;
 
         let requirements = Request::builder()
             .uri("/api/v1/requirements")
@@ -1934,6 +1936,8 @@ mod tests {
             .method("PUT")
             .uri("/api/v1/settings")
             .header("cookie", &cookie)
+            .header("origin", "https://aursmith.test")
+            .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
@@ -1961,6 +1965,8 @@ mod tests {
             .method("POST")
             .uri("/api/v1/profiles")
             .header("cookie", &cookie)
+            .header("origin", "https://aursmith.test")
+            .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
             .header("content-type", "application/json")
             .body(Body::from(json!({
                 "name": "base",
@@ -1989,10 +1995,349 @@ mod tests {
                 body["id"].as_str().unwrap()
             ))
             .header("cookie", cookie)
+            .header("origin", "https://aursmith.test")
+            .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(activate).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn removed_setup_routes_are_not_reachable_after_authentication() {
+        let app = test_router().await;
+        let cookie = login_cookie(&app).await;
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/setup/status")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::NOT_FOUND);
+
+        let setup = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/setup")
+                    .header("cookie", cookie)
+                    .header("origin", "https://aursmith.test")
+                    .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn login_throttle_isolated_sources_and_still_requires_fixed_origin() {
+        let app = test_router().await;
+        let body = || {
+            Body::from(
+                json!({"username": "admin", "password": "错误但足够长的密码-123456"}).to_string(),
+            )
+        };
+        for origin in [None, Some("https://other.test")] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json");
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        for _ in 0..LoginThrottle::SOURCE_LIMIT {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/auth/login")
+                        .header("origin", "https://aursmith.test")
+                        .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.10")
+                        .header("content-type", "application/json")
+                        .body(body())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("origin", "https://aursmith.test")
+                    .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.10")
+                    .header("content-type", "application/json")
+                    .body(body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers()[axum::http::header::RETRY_AFTER], "60");
+
+        let other_source = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("origin", "https://aursmith.test")
+                    .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.11")
+                    .header("content-type", "application/json")
+                    .body(body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_source.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn successful_logins_release_their_throttle_reservations() {
+        let app = test_router().await;
+        for _ in 0..LoginThrottle::SOURCE_LIMIT + 2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/auth/login")
+                        .header("origin", "https://aursmith.test")
+                        .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.20")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"username": "admin", "password": "足够长的测试密码-123456"})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let failed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("origin", "https://aursmith.test")
+                    .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.20")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"username": "admin", "password": "错误但足够长的密码-123456"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn login_throttle_has_bounded_source_state_and_a_global_hard_limit() {
+        let now = Instant::now();
+        let mut bounded = LoginThrottle::default();
+        for index in 0..1_000 {
+            let _ = bounded.accept(now, format!("source-{index}"));
+        }
+        assert!(bounded.attempts_by_source.len() <= LoginThrottle::MAX_TRACKED_SOURCES);
+        assert!(bounded.global_attempts.len() <= LoginThrottle::GLOBAL_LIMIT);
+
+        let mut globally_limited = LoginThrottle::default();
+        for source in 0..20 {
+            for _ in 0..LoginThrottle::SOURCE_LIMIT {
+                globally_limited
+                    .accept(now, format!("source-{source}"))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            globally_limited.global_attempts.len(),
+            LoginThrottle::GLOBAL_LIMIT
+        );
+        assert!(
+            globally_limited
+                .accept(now, "one-more-source".into())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn management_writes_require_origin_and_csrf_but_get_does_not_touch_session() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        insert_test_administrator(&database).await;
+        let app = router(AppState::new(
+            database.clone(),
+            test_config(None),
+            SigningKey::from_bytes(&[9_u8; 32]),
+        ));
+        let cookie = login_cookie(&app).await;
+        let before: String = sqlx::query_scalar("SELECT last_seen_at FROM sessions")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/requirements")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let after: String = sqlx::query_scalar("SELECT last_seen_at FROM sessions")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "GET 不得刷新会话活动时间");
+
+        for (origin, csrf) in [
+            (None, None),
+            (Some("https://other.test"), Some(auth::CSRF_HEADER_VALUE)),
+            (Some("https://aursmith.test"), None),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header("cookie", &cookie);
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            if let Some(csrf) = csrf {
+                request = request.header(auth::CSRF_HEADER_NAME, csrf);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .header("cookie", cookie)
+                    .header("origin", "https://aursmith.test")
+                    .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn idle_and_absolute_session_expiry_are_both_enforced() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        insert_test_administrator(&database).await;
+        let app = router(AppState::new(
+            database.clone(),
+            test_config(None),
+            SigningKey::from_bytes(&[9_u8; 32]),
+        ));
+        let idle_cookie = login_cookie(&app).await;
+        sqlx::query("UPDATE sessions SET last_seen_at = ?")
+            .bind(Utc::now() - chrono::Duration::minutes(31))
+            .execute(&database)
+            .await
+            .unwrap();
+        let idle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header("cookie", idle_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(idle.status(), StatusCode::UNAUTHORIZED);
+
+        sqlx::query("DELETE FROM sessions")
+            .execute(&database)
+            .await
+            .unwrap();
+        let absolute_cookie = login_cookie(&app).await;
+        sqlx::query("UPDATE sessions SET expires_at = ?")
+            .bind(Utc::now() - chrono::Duration::seconds(1))
+            .execute(&database)
+            .await
+            .unwrap();
+        let absolute = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .header("cookie", absolute_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(absolute.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn browser_session_does_not_authorize_the_reverse_builder_api() {
+        let app = test_router().await;
+        let cookie = login_cookie(&app).await;
+        let worker_id = Uuid::new_v4();
+        let poll = ReverseWorkerPoll {
+            worker_id,
+            nonce: Uuid::new_v4(),
+            status: json!({
+                "instance_id": worker_id,
+                "role": "builder",
+                "protocol_major": aursmith_protocol::PROTOCOL_MAJOR,
+                "profiles": [],
+            }),
+            attempts: Vec::new(),
+            completed_transfers: Vec::new(),
+            sent_at: Utc::now(),
+        };
+        let envelope = SignedEnvelope::sign(
+            "aursmith.reverse_worker_poll",
+            &poll,
+            &SigningKey::from_bytes(&[42_u8; 32]),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/reverse-workers/poll")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2001,13 +2346,13 @@ mod tests {
         let config = Config {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
-            setup_token: "测试初始化令牌-至少二十个字符".into(),
+            public_origin: "https://aursmith.test".into(),
             signing_key_file: "/不存在".into(),
             ssh_identity_source_file: "/不存在".into(),
             ssh_identity_file: "/不存在".into(),
             ssh_known_hosts_file: "/不存在".into(),
-            secure_cookies: false,
-            session_hours: 1,
+            session_idle_minutes: 30,
+            session_absolute_hours: 1,
             low_agent_endpoints: vec![],
             high_agent_endpoint: String::new(),
             agent_daily_call_limit: 300,

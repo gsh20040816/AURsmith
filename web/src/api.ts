@@ -9,13 +9,16 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const headers = new Headers(init?.headers);
+  headers.set("Content-Type", "application/json");
+  if (method !== "GET" && method !== "HEAD") {
+    headers.set("X-AURsmith-CSRF", "1");
+  }
   const response = await fetch(path, {
     ...init,
     credentials: "same-origin",
-    headers: {
-      "Content-Type": "application/json",
-      ...init?.headers
-    }
+    headers
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({
@@ -263,12 +266,6 @@ export type Settings = {
   repository: { name: string; base_url: string; publisher_compatibility_days: number };
 };
 export const api = {
-  setupStatus: () => request<{ initialized: boolean }>("/api/v1/setup/status"),
-  setup: (input: { token: string; username: string; password: string }) =>
-    request<{ initialized: boolean }>("/api/v1/setup", {
-      method: "POST",
-      body: JSON.stringify(input)
-    }),
   login: (input: { username: string; password: string }) =>
     request<{ username: string }>("/api/v1/auth/login", {
       method: "POST",

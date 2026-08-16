@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod audit_scan;
+pub mod credentials;
 pub mod dependency;
 pub mod model;
 pub mod profile;
