@@ -1,19 +1,15 @@
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    net::{IpAddr, Ipv4Addr},
-    path::Path,
-    process::Stdio,
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, process::Stdio, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, sync::Semaphore, time::timeout};
 
 const MAXIMUM_RPC_RESULTS: usize = 200;
+const MAXIMUM_CONCURRENT_UPSTREAM_REQUESTS: usize = 2;
+const MAXIMUM_TRANSPORT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -101,6 +97,7 @@ pub struct SnapshotFile {
 pub struct AurClient {
     http: Client,
     base: Url,
+    upstream_gate: Arc<Semaphore>,
 }
 
 impl AurClient {
@@ -113,10 +110,13 @@ impl AurClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
-            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self { http, base })
+        Ok(Self {
+            http,
+            base,
+            upstream_gate: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_UPSTREAM_REQUESTS)),
+        })
     }
 
     pub async fn search(&self, query: &str) -> anyhow::Result<Vec<AurPackage>> {
@@ -152,12 +152,17 @@ impl AurClient {
     }
 
     pub async fn official(&self, name: &str) -> anyhow::Result<Vec<OfficialPackage>> {
+        let _permit = self
+            .upstream_gate
+            .acquire()
+            .await
+            .context("Publisher 上游并发闸门已关闭")?;
         let name = validate_package_base(name)?;
         let mut url = Url::parse("https://archlinux.org/packages/search/json/")?;
         url.query_pairs_mut().append_pair("q", name);
         let mut delay = Duration::from_millis(500);
         let payload = loop {
-            let response = self.http.get(url.clone()).send().await?;
+            let response = self.send_with_retry(url.clone()).await?;
             if response.status().is_success() {
                 break response
                     .json::<OfficialSearchResponse>()
@@ -185,7 +190,12 @@ impl AurClient {
     }
 
     async fn rpc(&self, url: Url, expected_type: &str) -> anyhow::Result<Vec<AurPackage>> {
-        let response = self.http.get(url).send().await?.error_for_status()?;
+        let _permit = self
+            .upstream_gate
+            .acquire()
+            .await
+            .context("Publisher 上游并发闸门已关闭")?;
+        let response = self.send_with_retry(url).await?.error_for_status()?;
         let payload: RpcResponse = response.json().await.context("AUR RPC 返回无效 JSON")?;
         if payload.version != 5 || payload.response_type != expected_type {
             bail!("AUR RPC 返回类型不符合预期");
@@ -201,6 +211,11 @@ impl AurClient {
         package_base: &str,
         previous_vcs_commit: Option<&str>,
     ) -> anyhow::Result<AurSnapshot> {
+        let _permit = self
+            .upstream_gate
+            .acquire()
+            .await
+            .context("Publisher 上游并发闸门已关闭")?;
         let package_base = validate_package_base(package_base)?;
         let repository = self.base.join(&format!("{package_base}.git"))?;
         let temporary = TempDir::new().context("无法创建 AUR 快照临时目录")?;
@@ -223,6 +238,21 @@ impl AurClient {
             snapshot.vcs_ancestor_of_current = ancestor;
         }
         Ok(snapshot)
+    }
+
+    async fn send_with_retry(&self, url: Url) -> anyhow::Result<Response> {
+        let mut delay = Duration::from_millis(500);
+        for attempt in 1..=MAXIMUM_TRANSPORT_ATTEMPTS {
+            match self.http.get(url.clone()).send().await {
+                Ok(response) => return Ok(response),
+                Err(_) if attempt < MAXIMUM_TRANSPORT_ATTEMPTS => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("固定次数的上游请求循环必须返回结果")
     }
 }
 
@@ -321,7 +351,6 @@ async fn run_git_clone(repository: &str, directory: &Path) -> anyhow::Result<()>
                 "-c",
                 "core.hooksPath=/dev/null",
                 "clone",
-                "--ipv4",
                 "--depth",
                 "1",
                 "--no-tags",
@@ -428,14 +457,7 @@ async fn resolve_git_vcs_commit(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(
-            host,
-            addresses
-                .iter()
-                .find(|address| address.is_ipv4())
-                .copied()
-                .unwrap_or(addresses[0]),
-        )
+        .resolve(host, addresses[0])
         .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let response = client
@@ -792,6 +814,20 @@ fn validate_package_base(value: &str) -> anyhow::Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cloned_clients_share_the_upstream_concurrency_limit() {
+        let client = AurClient::new("https://aur.archlinux.org/").unwrap();
+        let cloned = client.clone();
+        let first = client.upstream_gate.acquire().await.unwrap();
+        let second = cloned.upstream_gate.acquire().await.unwrap();
+
+        assert!(client.upstream_gate.try_acquire().is_err());
+
+        drop(first);
+        assert!(cloned.upstream_gate.try_acquire().is_ok());
+        drop(second);
+    }
 
     #[test]
     fn srcinfo_folds_split_outputs_and_dependency_kinds() {
