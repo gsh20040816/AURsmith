@@ -12,7 +12,6 @@ use uuid::Uuid;
 pub const SESSION_COOKIE_NAME: &str = "__Host-aursmith_session";
 pub const CSRF_HEADER_NAME: &str = "x-aursmith-csrf";
 pub const CSRF_HEADER_VALUE: &str = "1";
-pub const TRUSTED_CLIENT_IP_HEADER_NAME: &str = "x-aursmith-client-ip";
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))

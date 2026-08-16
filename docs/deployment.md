@@ -21,8 +21,6 @@ Controller 使用严格的 `known_hosts`，不能配置 `StrictHostKeyChecking=n
 
 Controller 必须把 `AURSMITH_PUBLIC_ORIGIN` 配置为浏览器实际访问的固定 HTTPS Origin，例如 `https://aursmith.example.com`。该值不能包含凭据、路径、查询参数或片段。会话 Cookie 固定使用 `__Host-` 前缀和 Secure 属性，不提供 HTTP 或不安全 Cookie 降级开关。`AURSMITH_SESSION_IDLE_MINUTES` 与 `AURSMITH_SESSION_ABSOLUTE_HOURS` 分别控制服务端空闲和绝对过期时间；前者允许 1 分钟至 7 天，后者允许 1 小时至 365 天，非法配置会拒绝启动，且空闲期限不能长于绝对期限。
 
-反向代理必须删除客户端传入的 `X-AURsmith-Client-IP`，再用当前 TCP 连接的真实客户端 IP 覆盖该请求头；禁止直接透传同名 header 或从任意 `X-Forwarded-For` 链猜测来源。Controller 只接受该 header 中的单个合法 IP，缺失或无效时统一进入 `direct` 登录节流桶。登录同时受每来源小桶和较高的全局硬上限约束。
-
 管理员只能在公网核心设备本地创建。Controller 启动并完成数据库迁移后，通过安全管道向标准输入传入密码；密码不得作为命令行参数。CLI 会拒绝直接从可能回显的 TTY 读取密码，也可以改用权限为 `0600` 的 `--password-file`：
 
 ```bash

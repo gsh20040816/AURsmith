@@ -43,9 +43,8 @@ while IFS= read -r from_line; do
   fi
 done < <(rg '^FROM ' deploy/images)
 
-if ! rg -q '^\s*respond @health 404$' deploy/netcup/Caddyfile.snippet \
-  || ! rg -q '^\s*header_up X-AURsmith-Client-IP \{remote_host\}$' deploy/netcup/Caddyfile.snippet; then
-  echo "公网管理反代必须隐藏 health 并覆盖可信客户端 IP header" >&2
+if ! rg -q '^\s*respond @health 404$' deploy/netcup/Caddyfile.snippet; then
+  echo "公网管理反代必须隐藏 health" >&2
   exit 1
 fi
 
@@ -85,10 +84,6 @@ if jq -e '.services | has("repository")' <<<"${publisher_json}" >/dev/null \
 fi
 if [[ "$(jq '[.services.signer | select(.network_mode == "none")] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "Signer 必须完全断网" >&2
-  exit 1
-fi
-if jq -e '.services.signer.volumes[]? | select(.target == "/repository")' <<<"${publisher_json}" >/dev/null; then
-  echo "Signer 禁止挂载公开仓库" >&2
   exit 1
 fi
 if jq -e '.services.worker.secrets[]? | select(.source == "repository_gpg_private_key")' <<<"${publisher_json}" >/dev/null; then

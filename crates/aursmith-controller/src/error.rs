@@ -1,8 +1,4 @@
-use axum::{
-    Json,
-    http::{HeaderValue, StatusCode, header::RETRY_AFTER},
-    response::IntoResponse,
-};
+use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -51,14 +47,6 @@ impl ApiError {
         }
     }
 
-    pub fn too_many_requests(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: "TOO_MANY_REQUESTS",
-            message: message.into(),
-        }
-    }
-
     pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -87,17 +75,10 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let retry_after = self.status == StatusCode::TOO_MANY_REQUESTS;
         let body = Json(ErrorBody {
             code: self.code,
             message: &self.message,
         });
-        let mut response = (self.status, body).into_response();
-        if retry_after {
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("60"));
-        }
-        response
+        (self.status, body).into_response()
     }
 }

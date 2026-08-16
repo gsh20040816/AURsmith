@@ -24,15 +24,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fs,
-    net::IpAddr,
     process::Command,
     sync::Arc,
-    time::{Duration as StdDuration, Instant},
 };
-use tokio::sync::Mutex;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
@@ -45,7 +42,6 @@ pub struct AppState {
     pub database: SqlitePool,
     pub config: Arc<Config>,
     pub signing_key: Arc<SigningKey>,
-    login_throttle: Arc<Mutex<LoginThrottle>>,
 }
 
 impl AppState {
@@ -54,97 +50,8 @@ impl AppState {
             database,
             config: Arc::new(config),
             signing_key: Arc::new(signing_key),
-            login_throttle: Arc::new(Mutex::new(LoginThrottle::default())),
         }
     }
-}
-
-#[derive(Default)]
-struct LoginThrottle {
-    global_attempts: VecDeque<Instant>,
-    attempts_by_source: BTreeMap<String, VecDeque<Instant>>,
-}
-
-impl LoginThrottle {
-    const SOURCE_LIMIT: usize = 5;
-    const GLOBAL_LIMIT: usize = 100;
-    const MAX_TRACKED_SOURCES: usize = 64;
-    const WINDOW: StdDuration = StdDuration::from_secs(60);
-    const OVERFLOW_SOURCE: &'static str = "overflow";
-
-    fn accept(&mut self, now: Instant, source: String) -> Result<LoginReservation, ApiError> {
-        retain_recent(&mut self.global_attempts, now, Self::WINDOW);
-        self.attempts_by_source.retain(|_, attempts| {
-            retain_recent(attempts, now, Self::WINDOW);
-            !attempts.is_empty()
-        });
-        if self.global_attempts.len() >= Self::GLOBAL_LIMIT {
-            return Err(ApiError::too_many_requests(
-                "全局登录尝试过于频繁，请稍后重试",
-            ));
-        }
-        let source = if self.attempts_by_source.contains_key(&source)
-            || self.attempts_by_source.len() < Self::MAX_TRACKED_SOURCES - 1
-        {
-            source
-        } else {
-            Self::OVERFLOW_SOURCE.to_owned()
-        };
-        let attempts = self.attempts_by_source.entry(source.clone()).or_default();
-        if attempts.len() >= Self::SOURCE_LIMIT {
-            return Err(ApiError::too_many_requests("登录尝试过于频繁，请稍后重试"));
-        }
-        attempts.push_back(now);
-        self.global_attempts.push_back(now);
-        Ok(LoginReservation {
-            source,
-            recorded_at: now,
-        })
-    }
-
-    fn release(&mut self, reservation: LoginReservation) {
-        if let Some(attempts) = self.attempts_by_source.get_mut(&reservation.source) {
-            if let Some(index) = attempts
-                .iter()
-                .position(|attempt| *attempt == reservation.recorded_at)
-            {
-                attempts.remove(index);
-            }
-            if attempts.is_empty() {
-                self.attempts_by_source.remove(&reservation.source);
-            }
-        }
-        if let Some(index) = self
-            .global_attempts
-            .iter()
-            .position(|attempt| *attempt == reservation.recorded_at)
-        {
-            self.global_attempts.remove(index);
-        }
-    }
-}
-
-struct LoginReservation {
-    source: String,
-    recorded_at: Instant,
-}
-
-fn retain_recent(attempts: &mut VecDeque<Instant>, now: Instant, window: StdDuration) {
-    while attempts
-        .front()
-        .is_some_and(|attempt| now.duration_since(*attempt) >= window)
-    {
-        attempts.pop_front();
-    }
-}
-
-fn login_source(headers: &HeaderMap) -> String {
-    headers
-        .get(auth::TRUSTED_CLIENT_IP_HEADER_NAME)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<IpAddr>().ok())
-        .map(|address| address.to_string())
-        .unwrap_or_else(|| "direct".into())
 }
 
 pub fn router(state: AppState) -> Router {
@@ -963,11 +870,6 @@ async fn login(
     Json(request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     auth::require_origin(&state, &headers)?;
-    let reservation = state
-        .login_throttle
-        .lock()
-        .await
-        .accept(Instant::now(), login_source(&headers))?;
     let row =
         sqlx::query("SELECT id, username, password_hash FROM administrators WHERE username = ?")
             .bind(request.username.trim())
@@ -979,7 +881,6 @@ async fn login(
     if !credentials::verify_password(&request.password, &password_hash) {
         return Err(ApiError::unauthorized("用户名或密码错误"));
     }
-    state.login_throttle.lock().await.release(reservation);
     let administrator_id: String = row.get("id");
     let token = auth::create_session(&state, &administrator_id).await?;
     let maximum_age_seconds = state
@@ -1941,7 +1842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_throttle_isolated_sources_and_still_requires_fixed_origin() {
+    async fn login_requires_fixed_origin() {
         let app = test_router().await;
         let body = || {
             Body::from(
@@ -1963,125 +1864,19 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
-        for _ in 0..LoginThrottle::SOURCE_LIMIT {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/auth/login")
-                        .header("origin", "https://aursmith.test")
-                        .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.10")
-                        .header("content-type", "application/json")
-                        .body(body())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-        let limited = app
-            .clone()
+        let valid_origin = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/auth/login")
                     .header("origin", "https://aursmith.test")
-                    .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.10")
                     .header("content-type", "application/json")
                     .body(body())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(limited.headers()[axum::http::header::RETRY_AFTER], "60");
-
-        let other_source = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/login")
-                    .header("origin", "https://aursmith.test")
-                    .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.11")
-                    .header("content-type", "application/json")
-                    .body(body())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(other_source.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn successful_logins_release_their_throttle_reservations() {
-        let app = test_router().await;
-        for _ in 0..LoginThrottle::SOURCE_LIMIT + 2 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/auth/login")
-                        .header("origin", "https://aursmith.test")
-                        .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.20")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            json!({"username": "admin", "password": "足够长的测试密码-123456"})
-                                .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-        let failed = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/auth/login")
-                    .header("origin", "https://aursmith.test")
-                    .header(auth::TRUSTED_CLIENT_IP_HEADER_NAME, "192.0.2.20")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"username": "admin", "password": "错误但足够长的密码-123456"})
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(failed.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn login_throttle_has_bounded_source_state_and_a_global_hard_limit() {
-        let now = Instant::now();
-        let mut bounded = LoginThrottle::default();
-        for index in 0..1_000 {
-            let _ = bounded.accept(now, format!("source-{index}"));
-        }
-        assert!(bounded.attempts_by_source.len() <= LoginThrottle::MAX_TRACKED_SOURCES);
-        assert!(bounded.global_attempts.len() <= LoginThrottle::GLOBAL_LIMIT);
-
-        let mut globally_limited = LoginThrottle::default();
-        for source in 0..20 {
-            for _ in 0..LoginThrottle::SOURCE_LIMIT {
-                globally_limited
-                    .accept(now, format!("source-{source}"))
-                    .unwrap();
-            }
-        }
-        assert_eq!(
-            globally_limited.global_attempts.len(),
-            LoginThrottle::GLOBAL_LIMIT
-        );
-        assert!(
-            globally_limited
-                .accept(now, "one-more-source".into())
-                .is_err()
-        );
+        assert_eq!(valid_origin.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
