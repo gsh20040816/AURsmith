@@ -16,6 +16,7 @@ RUN pacman -Syu --noconfirm --needed \
       /landing /staging /repository /archive
 COPY --from=builder /src/target/release/aursmith-worker /usr/local/bin/aursmith-worker
 COPY --from=builder /src/target/release/aursmithctl /usr/local/bin/aursmithctl
+COPY deploy/images/gai.conf /etc/gai.conf
 USER 10001:10001
 WORKDIR /var/lib/aursmith
 ENTRYPOINT ["/usr/local/bin/aursmith-worker"]
