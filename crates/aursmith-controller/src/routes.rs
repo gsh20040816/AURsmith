@@ -185,22 +185,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs", get(list_jobs).post(create_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/jobs/{id}/evidence", get(job_evidence))
-        .route(
-            "/api/v1/profiles",
-            get(crate::profiles::list).post(crate::profiles::authorize),
-        )
-        .route(
-            "/api/v1/profiles/{id}/activate",
-            post(crate::profiles::activate),
-        )
-        .route(
-            "/api/v1/profiles/{id}/deactivate",
-            post(crate::profiles::deactivate),
-        )
-        .route(
-            "/api/v1/profile-recommendations",
-            get(crate::profiles::recommendations),
-        )
         .route("/api/v1/audits", get(crate::audits::list))
         .route("/api/v1/audits/{bundle}/retry", post(crate::audits::retry))
         .route(
@@ -622,30 +606,6 @@ async fn doctor_status(
             "message": format!("{}：状态 {}，可用空间 {}%，时钟偏差 {} 秒", row.get::<String,_>("name"), row.get::<String,_>("state"), available.map(|value| value.to_string()).unwrap_or_else(|| "未知".into()), skew.map(|value| value.to_string()).unwrap_or_else(|| "未知".into())),
         }));
     }
-    let profile_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM build_profiles WHERE state = 'active' AND last_verified_at IS NOT NULL")
-        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
-    checks.push(json!({"id": "active-profile", "ok": profile_count > 0, "message": format!("已验证活跃 Profile：{profile_count}")}));
-    let reported_profiles = workers
-        .iter()
-        .filter(|row| row.get::<String, _>("role") == "builder")
-        .filter_map(|row| row.get::<Option<String>, _>("status_json"))
-        .filter_map(|value| serde_json::from_str::<Value>(&value).ok())
-        .flat_map(|status| status["profiles"].as_array().cloned().unwrap_or_default())
-        .filter_map(|profile| profile.as_str().map(ToOwned::to_owned))
-        .collect::<BTreeSet<_>>();
-    let authorized_profiles =
-        sqlx::query_scalar::<_, String>("SELECT manifest_sha256 FROM build_profiles")
-            .fetch_all(&state.database)
-            .await
-            .map_err(ApiError::internal)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-    let unregistered_profiles = reported_profiles.difference(&authorized_profiles).count();
-    checks.push(json!({
-        "id": "builder-profile-registration",
-        "ok": unregistered_profiles == 0,
-        "message": format!("Builder 已存在但 Controller 未登记的 Profile：{unregistered_profiles}"),
-    }));
     let fingerprint_ready: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM system_settings WHERE key = 'repository_gpg_fingerprint'",
     )
@@ -1325,8 +1285,8 @@ async fn reverse_worker_poll(
             "Builder 状态身份或协议不匹配",
         ));
     }
-    sqlx::query("UPDATE workers SET state = 'online', profiles_json = ?, status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ? AND state != 'draining'")
-        .bind(status["profiles"].to_string()).bind(status.to_string())
+    sqlx::query("UPDATE workers SET state = 'online', status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ? AND state != 'draining'")
+        .bind(status.to_string())
         .bind(Utc::now()).bind(Utc::now()).bind(poll.worker_id.to_string())
         .execute(&state.database).await.map_err(ApiError::internal)?;
     let releasable_attempts = releasable_reverse_attempts(&state.database, poll.worker_id).await?;
@@ -1348,7 +1308,7 @@ async fn releasable_reverse_attempts(
     worker_id: Uuid,
 ) -> Result<Vec<Uuid>, ApiError> {
     Ok(sqlx::query_scalar::<_, String>(
-        "SELECT attempts.id FROM attempts JOIN jobs ON jobs.id = attempts.job_id LEFT JOIN release_batches ON release_batches.id = jobs.batch_id WHERE jobs.worker_id = ? AND attempts.status IN ('succeeded', 'failed', 'cancelled') AND (jobs.kind = 'profile_fixture' OR jobs.status IN ('failed', 'cancelled') OR release_batches.state IN ('published', 'fetch_failed', 'build_failed', 'publish_failed', 'transfer_failed', 'superseded')) ORDER BY attempts.finished_at, attempts.id LIMIT 256",
+        "SELECT attempts.id FROM attempts JOIN jobs ON jobs.id = attempts.job_id LEFT JOIN release_batches ON release_batches.id = jobs.batch_id WHERE jobs.worker_id = ? AND attempts.status IN ('succeeded', 'failed', 'cancelled') AND (jobs.status IN ('failed', 'cancelled') OR release_batches.state IN ('published', 'build_failed', 'publish_failed', 'transfer_failed', 'superseded')) ORDER BY attempts.finished_at, attempts.id LIMIT 256",
     )
     .bind(worker_id.to_string())
     .fetch_all(database)
@@ -1443,11 +1403,9 @@ struct CreateJobRequest {
     revision_sha256: String,
     #[serde(default)]
     kind: JobKind,
-    profile_sha256: Option<String>,
     source_manifest_sha256: Option<String>,
     dependency_snapshot_sha256: Option<String>,
     preferred_worker_id: Option<Uuid>,
-    source_attempt_id: Option<Uuid>,
     #[serde(default)]
     inputs: Vec<ManifestEntry>,
     #[serde(default)]
@@ -1480,7 +1438,6 @@ async fn create_job(
         ));
     }
     for (name, digest) in [
-        ("profile_sha256", request.profile_sha256.as_deref()),
         (
             "source_manifest_sha256",
             request.source_manifest_sha256.as_deref(),
@@ -1547,14 +1504,6 @@ async fn create_job(
             ));
         }
     }
-    if matches!(request.kind, JobKind::Build | JobKind::ProfileFixture)
-        && request.profile_sha256.is_none()
-    {
-        return Err(ApiError::bad_request(
-            "PROFILE_REQUIRED",
-            "Build Job 必须固定 Profile",
-        ));
-    }
     let limits = request.limits.unwrap_or(ResourceLimits {
         cpu_count: 1,
         memory_mib: 1024,
@@ -1574,18 +1523,16 @@ async fn create_job(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, profile_sha256, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO jobs(id, required_role, status, priority, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(role_name(request.required_role))
     .bind(request.priority)
     .bind(request.revision_sha256.to_ascii_lowercase())
     .bind(job_kind_name(request.kind))
-    .bind(request.profile_sha256)
     .bind(request.source_manifest_sha256)
     .bind(request.dependency_snapshot_sha256)
     .bind(request.preferred_worker_id.map(|value| value.to_string()))
-    .bind(request.source_attempt_id.map(|value| value.to_string()))
     .bind(serde_json::to_string(&request.inputs).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&request.inline_inputs).map_err(ApiError::internal)?)
     .bind(serde_json::to_string(&request.expected_outputs).map_err(ApiError::internal)?)
@@ -1718,9 +1665,7 @@ fn role_name(role: WorkerRole) -> &'static str {
 
 fn job_kind_name(kind: JobKind) -> &'static str {
     match kind {
-        JobKind::Fetch => "fetch",
         JobKind::Build => "build",
-        JobKind::ProfileFixture => "profile_fixture",
     }
 }
 
@@ -1960,47 +1905,6 @@ mod tests {
             250
         );
         assert_eq!(body["agents"]["api_keys_exposed"], false);
-
-        let profile = Request::builder()
-            .method("POST")
-            .uri("/api/v1/profiles")
-            .header("cookie", &cookie)
-            .header("origin", "https://aursmith.test")
-            .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
-            .header("content-type", "application/json")
-            .body(Body::from(json!({
-                "name": "base",
-                "spec": {
-                    "profile_sha256": "untrusted-candidate-value",
-                    "root_image": {"path": "root.qcow2", "sha256": "a".repeat(64), "size": 10},
-                    "kernel": {"path": "vmlinuz-linux", "sha256": "b".repeat(64), "size": 10},
-                    "initramfs": {"path": "initramfs-linux.img", "sha256": "c".repeat(64), "size": 10},
-                    "installed_packages": ["base 3-3"],
-                    "created_at": Utc::now()
-                }
-            }).to_string()))
-            .unwrap();
-        let response = app.clone().oneshot(profile).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(body["profile_sha256"].as_str().unwrap().len(), 64);
-        assert_ne!(body["profile_sha256"], "untrusted-candidate-value");
-
-        let activate = Request::builder()
-            .method("POST")
-            .uri(format!(
-                "/api/v1/profiles/{}/activate",
-                body["id"].as_str().unwrap()
-            ))
-            .header("cookie", cookie)
-            .header("origin", "https://aursmith.test")
-            .header(auth::CSRF_HEADER_NAME, auth::CSRF_HEADER_VALUE)
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(activate).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -2313,7 +2217,6 @@ mod tests {
                 "instance_id": worker_id,
                 "role": "builder",
                 "protocol_major": aursmith_protocol::PROTOCOL_MAJOR,
-                "profiles": [],
             }),
             attempts: Vec::new(),
             completed_transfers: Vec::new(),
@@ -2374,7 +2277,7 @@ mod tests {
         let worker_key = SigningKey::from_bytes(&[17_u8; 32]);
         let worker_id = Uuid::new_v4();
         let now = Utc::now();
-        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, profiles_json, identity_signing_key_hex, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'degraded', '', '', 1, '[]', '[]', ?, 'reverse', ?, ?)")
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, identity_signing_key_hex, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'degraded', '', '', 1, '[]', ?, 'reverse', ?, ?)")
             .bind(worker_id.to_string())
             .bind(hex::encode(worker_key.verifying_key().as_bytes()))
             .bind(now)
@@ -2394,7 +2297,6 @@ mod tests {
                 "instance_id": worker_id,
                 "role": "builder",
                 "protocol_major": 1,
-                "profiles": [],
             }),
             attempts: vec![aursmith_protocol::ReverseAttemptReport {
                 job_id: Uuid::new_v4(),
@@ -2427,7 +2329,7 @@ mod tests {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         let worker_id = Uuid::new_v4();
         let now = Utc::now();
-        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, profiles_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', '[]', 'reverse', ?, ?)")
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', 'reverse', ?, ?)")
             .bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
         let active_batch = Uuid::new_v4();
         let published_batch = Uuid::new_v4();
@@ -2438,7 +2340,6 @@ mod tests {
         let active_attempt = Uuid::new_v4();
         let published_attempt = Uuid::new_v4();
         let failed_attempt = Uuid::new_v4();
-        let fixture_attempt = Uuid::new_v4();
         for (batch, job_status, kind, attempt) in [
             (Some(active_batch), "succeeded", "build", active_attempt),
             (
@@ -2448,7 +2349,6 @@ mod tests {
                 published_attempt,
             ),
             (Some(active_batch), "failed", "build", failed_attempt),
-            (None, "succeeded", "profile_fixture", fixture_attempt),
         ] {
             let job_id = Uuid::new_v4();
             sqlx::query("INSERT INTO jobs(id, batch_id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', ?, ?, 1, ?, '[]', '[]', '[]', ?, ?)")
@@ -2465,7 +2365,6 @@ mod tests {
         assert!(!releasable.contains(&active_attempt));
         assert!(releasable.contains(&published_attempt));
         assert!(releasable.contains(&failed_attempt));
-        assert!(releasable.contains(&fixture_attempt));
     }
 
     #[tokio::test]
@@ -2473,7 +2372,7 @@ mod tests {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         let before = live_snapshot(&database).await.unwrap();
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, required_role, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', 'queued', 1, 'fetch', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, required_role, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', 'queued', 1, 'build', '[]', '[]', '[]', ?, ?)")
             .bind(Uuid::new_v4().to_string()).bind(now).bind(now).execute(&database).await.unwrap();
         sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, 'live-test', 'warning', 'open', '测试', '{}', ?)")
             .bind(Uuid::new_v4().to_string()).bind(now).execute(&database).await.unwrap();

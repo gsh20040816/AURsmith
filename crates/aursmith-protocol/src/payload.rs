@@ -2,17 +2,14 @@ use crate::SignedEnvelope;
 use aursmith_domain::{ArchiveState, AttemptRef, WorkerRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
-    Fetch,
     #[default]
     Build,
-    ProfileFixture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,32 +50,6 @@ pub struct ManifestEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceEntryKind {
-    File,
-    Directory,
-    Symlink,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceManifestEntry {
-    pub path: String,
-    pub kind: SourceEntryKind,
-    pub sha256: Option<String>,
-    pub size: u64,
-    pub link_target: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuditSourceFile {
-    pub path: String,
-    pub sha256: String,
-    pub size: u64,
-    pub selection_reason: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineInput {
     pub entry: ManifestEntry,
     pub content_base64: String,
@@ -94,13 +65,10 @@ pub struct JobSpec {
     pub revision_sha256: String,
     pub source_manifest_sha256: Option<String>,
     pub dependency_snapshot_sha256: Option<String>,
-    pub profile_sha256: Option<String>,
     #[serde(default)]
     pub upstream_pkgrel: Option<String>,
     #[serde(default)]
     pub published_pkgrel: Option<String>,
-    #[serde(default)]
-    pub source_attempt_id: Option<Uuid>,
     #[serde(default)]
     pub dependency_attempt_ids: Vec<Uuid>,
     #[serde(default)]
@@ -119,34 +87,6 @@ pub struct JobSpec {
 
 fn default_allow_check() -> bool {
     true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildProfileSpec {
-    pub profile_sha256: String,
-    pub root_image: ManifestEntry,
-    pub kernel: ManifestEntry,
-    pub initramfs: ManifestEntry,
-    pub installed_packages: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository_mirror: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-impl BuildProfileSpec {
-    pub fn content_sha256(&self) -> Result<String, serde_json::Error> {
-        let mut content = serde_json::json!({
-            "root_image": self.root_image,
-            "kernel": self.kernel,
-            "initramfs": self.initramfs,
-            "installed_packages": self.installed_packages,
-            "created_at": self.created_at,
-        });
-        if let Some(repository_mirror) = &self.repository_mirror {
-            content["repository_mirror"] = serde_json::json!(repository_mirror);
-        }
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&content)?)))
-    }
 }
 
 impl JobSpec {
@@ -179,27 +119,9 @@ pub struct BuildResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FetchResult {
-    pub job_id: Uuid,
-    pub attempt: AttemptRef,
-    pub revision_sha256: String,
-    pub source_manifest_sha256: String,
-    pub sources: Vec<SourceManifestEntry>,
-    pub audit_files: Vec<AuditSourceFile>,
-    pub resolved_dependencies: Vec<ResolvedDependency>,
-    pub dependency_download_milliseconds: u64,
-    pub resolved_pkgver: Option<String>,
-    pub dependency_snapshot_sha256: String,
-    pub log_sha256: String,
-    pub finished_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "result", rename_all = "snake_case")]
 pub enum GuestResult {
-    Fetch(FetchResult),
     Build(BuildResult),
-    ProfileFixture(BuildResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,10 +299,8 @@ mod tests {
             revision_sha256: "a".repeat(64),
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
-            profile_sha256: None,
             upstream_pkgrel: None,
             published_pkgrel: None,
-            source_attempt_id: None,
             dependency_attempt_ids: Vec::new(),
             dependencies: Vec::new(),
             inputs: Vec::new(),
@@ -438,35 +358,5 @@ mod tests {
         let decoded: ReverseWorkerLease = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.worker_id, worker_id);
         assert_eq!(decoded.job.unwrap().payload_sha256, envelope.payload_sha256);
-    }
-
-    #[test]
-    fn profile_mirror_is_part_of_new_digest_without_breaking_legacy_payloads() {
-        let created_at = Utc::now();
-        let entry = |path: &str| ManifestEntry {
-            path: path.into(),
-            sha256: "a".repeat(64),
-            size: 1,
-        };
-        let mut profile = BuildProfileSpec {
-            profile_sha256: String::new(),
-            root_image: entry("root.qcow2"),
-            kernel: entry("vmlinuz-linux"),
-            initramfs: entry("initramfs-linux.img"),
-            installed_packages: vec!["base 3-3".into()],
-            repository_mirror: None,
-            created_at,
-        };
-        let legacy_digest = profile.content_sha256().unwrap();
-        profile.repository_mirror = Some("https://geo.mirror.pkgbuild.com".into());
-        assert_ne!(legacy_digest, profile.content_sha256().unwrap());
-        let mut value = serde_json::to_value(&profile).unwrap();
-        value.as_object_mut().unwrap().remove("repository_mirror");
-        assert_eq!(
-            serde_json::from_value::<BuildProfileSpec>(value)
-                .unwrap()
-                .repository_mirror,
-            None
-        );
     }
 }

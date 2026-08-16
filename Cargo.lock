@@ -277,7 +277,6 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "serde_json",
- "sha2",
  "sqlx",
  "tempfile",
  "tokio",

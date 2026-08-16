@@ -6,7 +6,6 @@ mod db;
 mod error;
 mod notifications;
 mod packages;
-mod profiles;
 mod routes;
 mod scheduler;
 mod transport;

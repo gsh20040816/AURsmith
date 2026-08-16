@@ -157,9 +157,7 @@ impl BuilderRuntime {
                         .join(dependency_attempt.to_string())
                         .join("output");
                     let raw = fs::read(dependency_output.join("build-result.json"))?;
-                    let GuestResult::Build(result) = serde_json::from_slice(&raw)? else {
-                        bail!("DEPENDENCY_ATTEMPT_NOT_BUILD");
-                    };
+                    let GuestResult::Build(result) = serde_json::from_slice(&raw)?;
                     let entries = result
                         .artifacts
                         .iter()
@@ -380,9 +378,7 @@ fn validate_guest_result(
     spec: &JobSpec,
     output: &Path,
 ) -> anyhow::Result<()> {
-    let GuestResult::Build(value) = result else {
-        bail!("GUEST_RESULT_KIND_MISMATCH");
-    };
+    let GuestResult::Build(value) = result;
     if value.job_id != spec.job_id
         || value.attempt != spec.attempt
         || value.revision_sha256 != spec.revision_sha256

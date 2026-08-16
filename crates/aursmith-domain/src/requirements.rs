@@ -57,19 +57,15 @@ pub const REQUIREMENTS: &[Requirement] = &[
     },
     Requirement {
         id: "B01",
-        title: "KVM 隔离构建",
+        title: "普通联网 Docker 构建",
     },
     Requirement {
         id: "B02",
-        title: "Fetch 受限联网与 Build 断网",
+        title: "批准 AUR snapshot 直接构建",
     },
     Requirement {
         id: "B03",
         title: "完整构建 provenance",
-    },
-    Requirement {
-        id: "B04",
-        title: "动态依赖 Profile",
     },
     Requirement {
         id: "B05",

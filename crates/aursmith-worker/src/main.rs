@@ -3416,7 +3416,6 @@ async fn status(worker: &Worker) -> WorkerResponse {
                     "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
                     "storage": disk_usage(storage_path),
                     "cgroup_v2": Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
-                    "profiles": [],
                     "pacoloco": pacoloco,
                     "time": Utc::now(),
                 }),
@@ -3529,12 +3528,6 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
         }
     }
 
-    if spec.source_attempt_id.is_some() {
-        return WorkerResponse::error(
-            "SOURCE_ATTEMPT_UNSUPPORTED",
-            "Builder 只接受当前 AUR snapshot 的内联构建输入",
-        );
-    }
     let needs_materialization = !spec.inline_inputs.is_empty();
     let initial_status = if !needs_materialization {
         "queued"

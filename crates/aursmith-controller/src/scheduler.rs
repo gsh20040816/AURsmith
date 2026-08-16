@@ -60,19 +60,6 @@ pub fn spawn(state: AppState) {
             });
         }
     });
-    let profile_state = state.clone();
-    tokio::spawn(async move {
-        let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
-        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            timer.tick().await;
-            if let Err(error) =
-                crate::profiles::evaluate_dependencies(&profile_state.database).await
-            {
-                tracing::warn!(%error, "依赖 Profile 统计评估失败");
-            }
-        }
-    });
     let dependency_state = state.clone();
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
@@ -1123,30 +1110,7 @@ async fn build_release_evidence(
             }),
         )?;
     }
-    let profiles = sqlx::query("SELECT DISTINCT build_profiles.id, build_profiles.name, build_profiles.architecture, build_profiles.runner, build_profiles.manifest_sha256, build_profiles.state, build_profiles.package_manifest_json, build_profiles.envelope_json, build_profiles.created_at, build_profiles.activated_at, build_profiles.last_verified_at FROM build_profiles JOIN jobs ON jobs.profile_sha256 = build_profiles.manifest_sha256 WHERE jobs.batch_id = ? ORDER BY build_profiles.manifest_sha256")
-        .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
-    for row in profiles {
-        let identity: String = row.get("manifest_sha256");
-        push_evidence(
-            &mut records,
-            "build_profile",
-            &identity,
-            json!({
-                "id": row.get::<String, _>("id"),
-                "name": row.get::<String, _>("name"),
-                "architecture": row.get::<String, _>("architecture"),
-                "runner": row.get::<String, _>("runner"),
-                "manifest_sha256": &identity,
-                "state": row.get::<String, _>("state"),
-                "package_manifest": serde_json::from_str::<serde_json::Value>(row.get("package_manifest_json")).map_err(ApiError::internal)?,
-                "profile_envelope": row.get::<Option<String>, _>("envelope_json").map(|value| serde_json::from_str::<serde_json::Value>(&value)).transpose().map_err(ApiError::internal)?,
-                "created_at": row.get::<String, _>("created_at"),
-                "activated_at": row.get::<Option<String>, _>("activated_at"),
-                "last_verified_at": row.get::<Option<String>, _>("last_verified_at")
-            }),
-        )?;
-    }
-    let jobs = sqlx::query("SELECT job_evidence.job_id, job_evidence.kind, job_evidence.document_json, job_evidence.sha256, jobs.profile_sha256 FROM job_evidence JOIN jobs ON jobs.id = job_evidence.job_id WHERE jobs.batch_id = ? ORDER BY jobs.created_at")
+    let jobs = sqlx::query("SELECT job_evidence.job_id, job_evidence.kind, job_evidence.document_json, job_evidence.sha256 FROM job_evidence JOIN jobs ON jobs.id = job_evidence.job_id WHERE jobs.batch_id = ? ORDER BY jobs.created_at")
         .bind(batch_id).fetch_all(database).await.map_err(ApiError::internal)?;
     for row in jobs {
         let identity: String = row.get("job_id");
@@ -1157,7 +1121,6 @@ async fn build_release_evidence(
             json!({
                 "job_id": &identity,
                 "kind": row.get::<String, _>("kind"),
-                "profile_sha256": row.get::<Option<String>, _>("profile_sha256"),
                 "stored_sha256": row.get::<String, _>("sha256"),
                 "result": serde_json::from_str::<serde_json::Value>(row.get("document_json")).map_err(ApiError::internal)?
             }),
@@ -1396,10 +1359,9 @@ pub async fn probe_worker(state: &AppState, worker_id: &str) -> Result<String, A
                 .and_then(|value| value.parse::<chrono::DateTime<Utc>>().ok());
             let clock_skew_seconds = remote_time.map(|value| (Utc::now() - value).num_seconds());
             sqlx::query(
-                "UPDATE workers SET state = ?, profiles_json = ?, status_json = ?, clock_skew_seconds = ?, last_seen_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE workers SET state = ?, status_json = ?, clock_skew_seconds = ?, last_seen_at = ?, updated_at = ? WHERE id = ?",
             )
             .bind(new_state)
-            .bind(reply.data["profiles"].to_string())
             .bind(reply.data.to_string())
             .bind(clock_skew_seconds)
             .bind(Utc::now())
@@ -1568,7 +1530,7 @@ pub(crate) async fn lease_reverse_job(
         return Ok(None);
     }
     let worker = sqlx::query(
-        "SELECT labels_json, profiles_json FROM workers WHERE id = ? AND role = 'builder' AND connection_mode = 'reverse' AND state = 'online'",
+        "SELECT labels_json FROM workers WHERE id = ? AND role = 'builder' AND connection_mode = 'reverse' AND state = 'online'",
     )
     .bind(worker_id.to_string())
     .fetch_optional(&state.database)
@@ -1580,12 +1542,10 @@ pub(crate) async fn lease_reverse_job(
     if reverse_worker_has_active_job(&state.database, worker_id).await? {
         return Ok(None);
     }
-    let profiles: BTreeSet<String> =
-        serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
     let labels: BTreeSet<String> =
         serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
     let rows = sqlx::query(
-        "SELECT id, batch_id, profile_sha256, preferred_worker_id, required_labels_json FROM jobs WHERE required_role = 'builder' AND status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at",
+        "SELECT id, batch_id, preferred_worker_id, required_labels_json FROM jobs WHERE required_role = 'builder' AND status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at",
     )
     .bind(Utc::now())
     .fetch_all(&state.database)
@@ -1603,13 +1563,10 @@ pub(crate) async fn lease_reverse_job(
             None
         };
         let preferred_worker = explicit_preference.or(batch_preference);
-        let required_profile: Option<String> = row.get("profile_sha256");
         let eligible = worker_matches_job(
             &worker_id.to_string(),
             &labels,
-            &profiles,
             &required_labels,
-            required_profile.as_deref(),
             preferred_worker.as_deref(),
         );
         if eligible {
@@ -1696,7 +1653,7 @@ async fn dispatch_job_to_worker(
     worker_id: Uuid,
 ) -> Result<SignedEnvelope, ApiError> {
     let job = sqlx::query(
-        "SELECT required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
+        "SELECT required_role, revision_sha256, kind, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
     )
     .bind(job_id)
     .fetch_optional(&state.database)
@@ -1736,14 +1693,8 @@ async fn dispatch_job_to_worker(
             .unwrap_or_else(|| "0".repeat(64)),
         source_manifest_sha256: job.get("source_manifest_sha256"),
         dependency_snapshot_sha256: job.get("dependency_snapshot_sha256"),
-        profile_sha256: job.get("profile_sha256"),
         upstream_pkgrel: job.get("upstream_pkgrel"),
         published_pkgrel: job.get("published_pkgrel"),
-        source_attempt_id: job
-            .get::<Option<String>, _>("source_attempt_id")
-            .map(|value| Uuid::parse_str(&value))
-            .transpose()
-            .map_err(ApiError::internal)?,
         dependency_attempt_ids: load_batch_dependency_attempts(state, job_id).await?,
         dependencies: load_job_dependencies(state, job_id).await?,
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
@@ -1790,7 +1741,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
     let job = sqlx::query(
-        "SELECT id, batch_id, required_role, revision_sha256, kind, profile_sha256, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, source_attempt_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
+        "SELECT id, batch_id, required_role, revision_sha256, kind, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
     )
     .bind(Utc::now())
     .fetch_optional(&state.database)
@@ -1802,14 +1753,13 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     let required_labels: BTreeSet<String> =
         serde_json::from_str(job.get("required_labels_json")).map_err(ApiError::internal)?;
     let workers = sqlx::query(
-        "SELECT id, endpoint, labels_json, profiles_json FROM workers WHERE role = ? AND state = 'online' AND protocol_version = ? AND connection_mode = 'direct' ORDER BY name",
+        "SELECT id, endpoint, labels_json FROM workers WHERE role = ? AND state = 'online' AND protocol_version = ? AND connection_mode = 'direct' ORDER BY name",
     )
     .bind(&role)
     .bind(i64::from(aursmith_protocol::PROTOCOL_MAJOR))
     .fetch_all(&state.database)
     .await
     .map_err(ApiError::internal)?;
-    let required_profile: Option<String> = job.get("profile_sha256");
     let mut preferred_worker_id: Option<String> = job.get("preferred_worker_id");
     if preferred_worker_id.is_none()
         && let Some(batch_id) = job.get::<Option<String>, _>("batch_id")
@@ -1820,20 +1770,16 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     let selected = workers.into_iter().find(|worker| {
         let labels: BTreeSet<String> =
             serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
-        let profiles: BTreeSet<String> =
-            serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
         worker_matches_job(
             worker.get::<String, _>("id").as_str(),
             &labels,
-            &profiles,
             &required_labels,
-            required_profile.as_deref(),
             preferred_worker_id.as_deref(),
         )
     });
     let Some(worker) = selected else {
         let reverse_workers = if role == "builder" {
-            sqlx::query("SELECT id, labels_json, profiles_json FROM workers WHERE role = 'builder' AND state = 'online' AND protocol_version = ? AND connection_mode = 'reverse'")
+            sqlx::query("SELECT id, labels_json FROM workers WHERE role = 'builder' AND state = 'online' AND protocol_version = ? AND connection_mode = 'reverse'")
                 .bind(i64::from(aursmith_protocol::PROTOCOL_MAJOR))
                 .fetch_all(&state.database)
                 .await
@@ -1844,14 +1790,10 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         let reverse_eligible = reverse_workers.iter().any(|worker| {
             let labels: BTreeSet<String> =
                 serde_json::from_str(worker.get("labels_json")).unwrap_or_default();
-            let profiles: BTreeSet<String> =
-                serde_json::from_str(worker.get("profiles_json")).unwrap_or_default();
             worker_matches_job(
                 worker.get::<String, _>("id").as_str(),
                 &labels,
-                &profiles,
                 &required_labels,
-                required_profile.as_deref(),
                 preferred_worker_id.as_deref(),
             )
         });
@@ -1903,14 +1845,8 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
             .unwrap_or_else(|| "0".repeat(64)),
         source_manifest_sha256: job.get("source_manifest_sha256"),
         dependency_snapshot_sha256: job.get("dependency_snapshot_sha256"),
-        profile_sha256: job.get("profile_sha256"),
         upstream_pkgrel: job.get("upstream_pkgrel"),
         published_pkgrel: job.get("published_pkgrel"),
-        source_attempt_id: job
-            .get::<Option<String>, _>("source_attempt_id")
-            .map(|value| Uuid::parse_str(&value))
-            .transpose()
-            .map_err(ApiError::internal)?,
         dependency_attempt_ids: load_batch_dependency_attempts(state, &job_id).await?,
         dependencies: load_job_dependencies(state, &job_id).await?,
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
@@ -1963,14 +1899,11 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
 fn worker_matches_job(
     worker_id: &str,
     worker_labels: &BTreeSet<String>,
-    worker_profiles: &BTreeSet<String>,
     required_labels: &BTreeSet<String>,
-    required_profile: Option<&str>,
     preferred_worker_id: Option<&str>,
 ) -> bool {
     required_labels.is_subset(worker_labels)
         && preferred_worker_id.is_none_or(|preferred| preferred == worker_id)
-        && required_profile.is_none_or(|profile| worker_profiles.contains(profile))
 }
 
 async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, ApiError> {
@@ -1987,7 +1920,7 @@ async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, A
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.profile_sha256, jobs.upstream_pkgrel, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.upstream_pkgrel, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
     )
     .bind(Utc::now() - Duration::minutes(30))
     .fetch_optional(&state.database)
@@ -2017,7 +1950,6 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
             handle_uncertain_timeout(
                 state,
                 &job_id,
-                &row.get::<String, _>("kind"),
                 row.get::<Option<String>, _>("batch_id"),
                 &error.to_string(),
             )
@@ -2143,18 +2075,6 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
                 .bind(&job_id).bind(&entry.path).bind(&entry.sha256)
                 .bind(i64::try_from(entry.size).map_err(ApiError::internal)?)
                 .bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        }
-    }
-    if row.get::<String, _>("kind") == "profile_fixture" {
-        let profile_sha: Option<String> = row.get("profile_sha256");
-        if let Some(profile_sha) = profile_sha {
-            if status == "succeeded" {
-                sqlx::query("UPDATE build_profiles SET last_verified_at = ?, failure_reason = NULL WHERE manifest_sha256 = ?")
-                    .bind(Utc::now()).bind(profile_sha).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-            } else if status == "failed" && !retry_scheduled {
-                sqlx::query("UPDATE build_profiles SET state = 'failed', failure_reason = ? WHERE manifest_sha256 = ?")
-                    .bind(failure).bind(profile_sha).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-            }
         }
     }
     if row.get::<String, _>("kind") == "build" && status == "succeeded" {
@@ -2426,7 +2346,6 @@ fn validate_evidence_files(
 async fn handle_uncertain_timeout(
     state: &AppState,
     job_id: &str,
-    kind: &str,
     batch_id: Option<String>,
     error: &str,
 ) -> Result<(), ApiError> {
@@ -2450,13 +2369,8 @@ async fn handle_uncertain_timeout(
         .bind(retry.then(|| Utc::now() + Duration::seconds(if generation == 0 { 5 } else { 10 })))
         .bind(Utc::now()).bind(job_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     if !retry && let Some(batch_id) = batch_id {
-        let state_name = if kind == "fetch" {
-            "fetch_failed"
-        } else {
-            "build_failed"
-        };
-        sqlx::query("UPDATE release_batches SET state = ?, failure_reason = 'WORKER_UNREACHABLE', updated_at = ? WHERE id = ?")
-            .bind(state_name).bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("UPDATE release_batches SET state = 'build_failed', failure_reason = 'WORKER_UNREACHABLE', updated_at = ? WHERE id = ?")
+            .bind(Utc::now()).bind(batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     }
     if !retry {
         sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', 'Worker 任务状态无法确认', ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
@@ -2510,9 +2424,7 @@ fn parse_role(value: &str) -> Result<aursmith_domain::WorkerRole, ApiError> {
 
 fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
     match value {
-        "fetch" => Ok(JobKind::Fetch),
         "build" => Ok(JobKind::Build),
-        "profile_fixture" => Ok(JobKind::ProfileFixture),
         _ => Err(ApiError::internal("数据库包含未知 Job 类型")),
     }
 }
@@ -2574,31 +2486,18 @@ mod release_tests {
     #[test]
     fn worker_eligibility_is_shared_by_direct_and_reverse_dispatch() {
         let labels = BTreeSet::from(["fast".to_string(), "x86_64".to_string()]);
-        let profiles = BTreeSet::from(["profile-a".to_string()]);
         let required = BTreeSet::from(["x86_64".to_string()]);
 
         assert!(worker_matches_job(
             "builder-1",
             &labels,
-            &profiles,
             &required,
-            Some("profile-a"),
             Some("builder-1"),
         ));
         assert!(!worker_matches_job(
             "builder-1",
             &labels,
-            &profiles,
             &required,
-            Some("profile-b"),
-            None,
-        ));
-        assert!(!worker_matches_job(
-            "builder-1",
-            &labels,
-            &profiles,
-            &required,
-            None,
             Some("builder-2"),
         ));
     }
@@ -2609,9 +2508,9 @@ mod release_tests {
         let worker_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let now = Utc::now();
-        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, profiles_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', '[]', 'reverse', ?, ?)")
+        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', 'reverse', ?, ?)")
             .bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
-        sqlx::query("INSERT INTO jobs(id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', ?, 'dispatched', 1, 'fetch', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', ?, 'dispatched', 1, 'build', '[]', '[]', '[]', ?, ?)")
             .bind(job_id.to_string()).bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
 
         assert!(
@@ -2881,7 +2780,7 @@ mod release_tests {
             .execute(&database)
             .await
             .unwrap();
-            handle_uncertain_timeout(&state, &job_id, "build", None, "ssh timeout")
+            handle_uncertain_timeout(&state, &job_id, None, "ssh timeout")
                 .await
                 .unwrap();
             let row = sqlx::query("SELECT status, next_attempt_at FROM jobs WHERE id = ?")

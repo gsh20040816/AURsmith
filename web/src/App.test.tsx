@@ -102,14 +102,6 @@ describe("AURsmith 控制台", () => {
     expect(screen.getByRole("button", { name: "探测并注册" })).toBeInTheDocument();
   });
 
-  it("Profile 页面可以提交构建候选", async () => {
-    render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Profile/ }));
-    expect(await screen.findByText("授权 Profile candidate")).toBeInTheDocument();
-    expect(screen.getByLabelText("profile-candidate.json")).toHaveAttribute("type", "file");
-    expect(screen.getByRole("button", { name: "提交并创建 fixture" })).toBeInTheDocument();
-  });
-
   it("软件包详情可以显式禁用 check", async () => {
     let allowCheck = true;
     let csrfHeader: string | null = null;

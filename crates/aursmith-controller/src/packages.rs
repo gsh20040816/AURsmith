@@ -501,7 +501,7 @@ async fn apply_snapshot(
     .await
     .map_err(ApiError::internal)?;
 
-    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND aur_commit != ? AND state IN ('discovered', 'fetching', 'audit_pending', 'build_pending')")
+    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND aur_commit != ? AND state IN ('discovered', 'audit_pending', 'build_pending')")
         .bind(&snapshot.package_base)
         .bind(&snapshot.aur_commit)
         .execute(&mut *transaction)
@@ -883,7 +883,7 @@ pub(crate) async fn schedule_rebuild_batch(
         .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     let mut superseded_batches = BTreeSet::new();
     for package_base in &packages {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT release_batches.id FROM release_batches JOIN release_batch_revisions ON release_batch_revisions.batch_id = release_batches.id JOIN revisions ON revisions.id = release_batch_revisions.revision_id WHERE release_batches.id != ? AND revisions.package_base = ? AND release_batches.state IN ('awaiting_profile', 'awaiting_fetch', 'fetching', 'awaiting_audit', 'building', 'fetch_failed', 'build_failed', 'ready_to_publish', 'artifacts_ready')")
+        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT release_batches.id FROM release_batches JOIN release_batch_revisions ON release_batch_revisions.batch_id = release_batches.id JOIN revisions ON revisions.id = release_batch_revisions.revision_id WHERE release_batches.id != ? AND revisions.package_base = ? AND release_batches.state IN ('awaiting_audit', 'building', 'build_failed', 'ready_to_publish', 'artifacts_ready')")
             .bind(&batch_id).bind(package_base).fetch_all(&mut *transaction).await.map_err(ApiError::internal)?;
         superseded_batches.extend(ids);
     }
@@ -938,7 +938,7 @@ pub(crate) async fn schedule_rebuild_batch(
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("INSERT INTO revision_dependencies(revision_id, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json) SELECT ?, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json FROM revision_dependencies WHERE revision_id = ?")
             .bind(&revision_id).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'SUPERSEDED_REBUILD', updated_at = ? WHERE revision_id = ? AND kind IN ('fetch', 'build') AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
+        sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'SUPERSEDED_REBUILD', updated_at = ? WHERE revision_id = ? AND kind = 'build' AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
             .bind(now).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE revision_id = ? AND failure_code = 'SUPERSEDED_REBUILD') AND status NOT IN ('succeeded', 'failed', 'cancelled')")
             .bind(now).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
@@ -1843,7 +1843,7 @@ async fn supersede_other_revisions(
     snapshot: &UpstreamSnapshot,
     provider_selection_sha256: &str,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND state IN ('discovered', 'fetching', 'audit_pending', 'build_pending') AND (aur_commit != ? OR COALESCE(vcs_commit, '') != COALESCE(?, '') OR provider_selection_sha256 != ?)")
+    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND state IN ('discovered', 'audit_pending', 'build_pending') AND (aur_commit != ? OR COALESCE(vcs_commit, '') != COALESCE(?, '') OR provider_selection_sha256 != ?)")
         .bind(&snapshot.package_base)
         .bind(&snapshot.aur_commit)
         .bind(&snapshot.vcs_commit)
@@ -2049,7 +2049,7 @@ async fn upsert_implicit_node(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND aur_commit != ? AND state IN ('discovered', 'fetching', 'audit_pending', 'build_pending')")
+    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND aur_commit != ? AND state IN ('discovered', 'audit_pending', 'build_pending')")
         .bind(&snapshot.package_base)
         .bind(&snapshot.aur_commit)
         .execute(&mut **transaction)
@@ -3047,7 +3047,7 @@ mod tests {
 
         schedule_ready_builds(&database).await.unwrap();
 
-        let row = sqlx::query("SELECT expected_outputs_json, allow_check, limits_json, profile_sha256, source_attempt_id, inputs_json, inline_inputs_json FROM jobs WHERE batch_id = ? AND kind = 'build'")
+        let row = sqlx::query("SELECT expected_outputs_json, allow_check, limits_json, inputs_json, inline_inputs_json FROM jobs WHERE batch_id = ? AND kind = 'build'")
             .bind(batch_id).fetch_one(&database).await.unwrap();
         let outputs: Vec<String> = serde_json::from_str(row.get("expected_outputs_json")).unwrap();
         let limits: aursmith_protocol::ResourceLimits =
@@ -3056,8 +3056,6 @@ mod tests {
         assert_eq!(row.get::<i64, _>("allow_check"), 0);
         assert_eq!(limits.cpu_count, 4);
         assert_eq!(limits.memory_mib, 8192);
-        assert_eq!(row.get::<Option<String>, _>("profile_sha256"), None);
-        assert_eq!(row.get::<Option<String>, _>("source_attempt_id"), None);
         let inputs: Vec<aursmith_protocol::ManifestEntry> =
             serde_json::from_str(row.get("inputs_json")).unwrap();
         let inline: Vec<aursmith_protocol::InlineInput> =

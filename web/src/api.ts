@@ -50,7 +50,7 @@ export type Worker = {
 };
 export type Job = {
   id: string;
-  kind: "fetch" | "build" | "profile_fixture";
+  kind: "build";
   required_role: Worker["role"];
   status: string;
   priority: number;
@@ -130,41 +130,6 @@ export type Audit = {
     upstream_source?: { mode: string; statement: string };
   };
   created_at: string;
-};
-export type BuildProfile = {
-  id: string;
-  name: string;
-  architecture: string;
-  profile_sha256: string;
-  state: string;
-  packages: string[];
-  created_at: string;
-  activated_at: string | null;
-  last_verified_at: string | null;
-  failure_reason: string | null;
-};
-export type AuthorizedProfile = {
-  id: string;
-  profile_sha256: string;
-  fixture_job_id: string;
-  envelope: unknown;
-};
-export type ProfileRecommendation = {
-  package_name: string;
-  action: string;
-  stats: {
-    successful_builds: number;
-    uses_recent: number;
-    uses_this_month: number;
-    download_bytes: number;
-    average_saved_seconds: number;
-    cache_hits: number;
-    days_since_last_use: number;
-    currently_baked: boolean;
-  };
-  consecutive_hot_periods: number;
-  consecutive_low_periods: number;
-  evaluated_at: string;
 };
 export type Release = {
   id: string;
@@ -298,12 +263,6 @@ export const api = {
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
-  profiles: () => request<{ items: BuildProfile[] }>("/api/v1/profiles"),
-  authorizeProfile: (candidate: unknown) => request<AuthorizedProfile>("/api/v1/profiles", {
-    method: "POST",
-    body: JSON.stringify(candidate)
-  }),
-  profileRecommendations: () => request<{ items: ProfileRecommendation[] }>("/api/v1/profile-recommendations"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
   releaseEvidence: (id: string) => request<ReleaseEvidence>(`/api/v1/releases/${encodeURIComponent(id)}/evidence`),
   rollbackRelease: (id: string) => request<{
@@ -321,8 +280,6 @@ export const api = {
   backups: () => request<{ items: ControlPlaneBackup[] }>("/api/v1/backups"),
   createBackup: () => request<ControlPlaneBackup>("/api/v1/backups", { method: "POST" }),
   verifyBackup: (id: string) => request<ControlPlaneBackup>(`/api/v1/backups/${encodeURIComponent(id)}/verify`, { method: "POST" }),
-  activateProfile: (id: string) =>
-    request<{ id: string; state: string }>(`/api/v1/profiles/${encodeURIComponent(id)}/activate`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>
     request<{ bundle_sha256: string; decision: string }>(
       `/api/v1/audits/${encodeURIComponent(bundle)}/manual-decision`,
