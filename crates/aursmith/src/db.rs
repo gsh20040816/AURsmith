@@ -13,7 +13,7 @@ use std::{
 };
 
 const APPLICATION_ID: i64 = 0x4155_5253;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const CORE_MIGRATION: &str = include_str!("../../../migrations/0001_core.sql");
 
 pub async fn open_or_create(path: &Path) -> anyhow::Result<SqlitePool> {
@@ -125,13 +125,39 @@ async fn validate_schema(database: &SqlitePool) -> anyhow::Result<()> {
     )
     .fetch_all(database)
     .await?;
-    if tables != ["administrators", "sessions", "tracked_packages"] {
+    if tables
+        != [
+            "administrators",
+            "aur_reviews",
+            "sessions",
+            "tracked_packages",
+        ]
+    {
         bail!("AURsmith core Schema 表集合不匹配");
     }
     for (table, expected) in [
         (
             "administrators",
             &["id", "username", "password_hash", "created_at"][..],
+        ),
+        (
+            "aur_reviews",
+            &[
+                "pkgbase",
+                "aur_commit",
+                "tree_sha256",
+                "comparison_kind",
+                "baseline_aur_commit",
+                "baseline_tree_sha256",
+                "full_reason",
+                "status",
+                "blocker",
+                "review_json_sha256",
+                "changes_diff_sha256",
+                "findings_json_sha256",
+                "created_at",
+                "updated_at",
+            ][..],
         ),
         (
             "sessions",
@@ -151,6 +177,7 @@ async fn validate_schema(database: &SqlitePool) -> anyhow::Result<()> {
                 "approved_aur_commit",
                 "approved_tree_sha256",
                 "approved_at",
+                "last_checked_at",
                 "last_error",
                 "created_at",
                 "updated_at",
@@ -168,7 +195,29 @@ async fn validate_schema(database: &SqlitePool) -> anyhow::Result<()> {
             bail!("AURsmith core Schema 的 {table} 列集合不匹配");
         }
     }
+    let current_index_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'aur_reviews_one_current_per_package' AND tbl_name = 'aur_reviews'",
+    )
+    .fetch_optional(database)
+    .await?;
+    let normalized = current_index_sql
+        .as_deref()
+        .map(normalize_schema_sql)
+        .unwrap_or_default();
+    let expected = normalize_schema_sql(
+        "CREATE UNIQUE INDEX aur_reviews_one_current_per_package ON aur_reviews(pkgbase) WHERE status IN ('prepared', 'input_blocked')",
+    );
+    if normalized != expected {
+        bail!("AURsmith core Schema 缺少精确的单 current 审查 partial unique index");
+    }
     Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -176,7 +225,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn fresh_database_has_exactly_three_tables_and_reopens() {
+    async fn fresh_database_has_exactly_four_tables_and_reopens() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("aursmith.db");
         let database = open_or_create(&path).await.unwrap();
@@ -186,7 +235,15 @@ mod tests {
         .fetch_all(&database)
         .await
         .unwrap();
-        assert_eq!(tables, ["administrators", "sessions", "tracked_packages"]);
+        assert_eq!(
+            tables,
+            [
+                "administrators",
+                "aur_reviews",
+                "sessions",
+                "tracked_packages"
+            ]
+        );
         database.close().await;
         open_or_create(&path).await.unwrap().close().await;
         open_existing(&path, 1).await.unwrap().close().await;
@@ -229,7 +286,7 @@ mod tests {
         let path = directory.path().join("aursmith.db");
         let wrong_schema = r#"
             PRAGMA application_id = 0x41555253;
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             CREATE TABLE wrong_table(id INTEGER PRIMARY KEY) STRICT;
         "#;
         assert!(
@@ -303,6 +360,102 @@ mod tests {
             assert!(sqlx::query("INSERT INTO tracked_packages(pkgbase, state, approved_aur_commit, approved_tree_sha256, approved_at, created_at, updated_at) VALUES (?, 'active', ?, ?, ?, ?, ?)")
                 .bind(pkgbase).bind(commit).bind(tree).bind(approved_at).bind(now).bind(now)
                 .execute(&database).await.is_err(), "{pkgbase}");
+        }
+    }
+
+    #[tokio::test]
+    async fn version_one_intermediate_database_is_rejected_without_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("intermediate.db");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let database = connect(&path, 1).await.unwrap();
+        sqlx::raw_sql(
+            "PRAGMA application_id = 0x41555253; PRAGMA user_version = 1; \
+             CREATE TABLE administrators(id INTEGER PRIMARY KEY) STRICT;",
+        )
+        .execute(&database)
+        .await
+        .unwrap();
+        database.close().await;
+
+        assert!(open_or_create(&path).await.is_err());
+        assert!(path.is_file(), "既有中间数据库不得被删除或迁移");
+    }
+
+    #[tokio::test]
+    async fn database_enforces_one_current_review_per_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = open_or_create(&directory.path().join("aursmith.db"))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        sqlx::query("INSERT INTO tracked_packages(pkgbase, state, created_at, updated_at) VALUES ('paru', 'active', ?, ?)")
+            .bind(now)
+            .bind(now)
+            .execute(&database)
+            .await
+            .unwrap();
+        for commit in ["a", "b"] {
+            let result = sqlx::query(
+                "INSERT INTO aur_reviews(pkgbase, aur_commit, tree_sha256, comparison_kind, full_reason, status, review_json_sha256, findings_json_sha256, created_at, updated_at) VALUES ('paru', ?, ?, 'full', 'initial', 'prepared', ?, ?, ?, ?)",
+            )
+            .bind(commit.repeat(40))
+            .bind("c".repeat(64))
+            .bind("d".repeat(64))
+            .bind("e".repeat(64))
+            .bind(now)
+            .bind(now)
+            .execute(&database)
+            .await;
+            if commit == "a" {
+                result.unwrap();
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let invalid_superseded = sqlx::query(
+            "INSERT INTO aur_reviews(pkgbase, aur_commit, comparison_kind, full_reason, status, review_json_sha256, findings_json_sha256, created_at, updated_at) VALUES ('paru', ?, 'full', 'initial', 'superseded', ?, ?, ?, ?)",
+        )
+        .bind("f".repeat(40))
+        .bind("d".repeat(64))
+        .bind("e".repeat(64))
+        .bind(now)
+        .bind(now)
+        .execute(&database)
+        .await;
+        assert!(
+            invalid_superseded.is_err(),
+            "superseded 不得绕过 prepared/input_blocked 数据形状"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_or_weakened_current_review_index_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        for weakened in [false, true] {
+            let path = directory.path().join(format!("index-{weakened}.db"));
+            let database = open_or_create(&path).await.unwrap();
+            let mut connection = database.acquire().await.unwrap();
+            sqlx::query("DROP INDEX aur_reviews_one_current_per_package")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            if weakened {
+                sqlx::query(
+                    "CREATE INDEX aur_reviews_one_current_per_package ON aur_reviews(pkgbase)",
+                )
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            }
+            drop(connection);
+            database.close().await;
+            assert!(open_existing(&path, 1).await.is_err());
         }
     }
 }

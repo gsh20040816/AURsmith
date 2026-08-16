@@ -131,7 +131,7 @@ pub async fn authorize_management_request(
         Err(error)
             if error.status == StatusCode::UNAUTHORIZED
                 && matches!(method, Method::GET | Method::HEAD)
-                && path == "/manage" =>
+                && is_management_html_path(&path) =>
         {
             return Ok(Redirect::to("/login").into_response());
         }
@@ -327,6 +327,14 @@ fn is_state_changing(method: &Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD)
 }
 
+fn is_management_html_path(path: &str) -> bool {
+    if path == "/manage" {
+        return true;
+    }
+    let segments = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
+    matches!(segments.as_slice(), ["manage", "packages", _, "reviews", _])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +387,15 @@ mod tests {
                 .accept(now, "one-more-source".into())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_management_html_paths_use_login_redirects() {
+        assert!(is_management_html_path("/manage"));
+        assert!(is_management_html_path(
+            "/manage/packages/paru/reviews/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(!is_management_html_path("/manage/packages"));
+        assert!(!is_management_html_path("/manage/packages/paru/refresh"));
     }
 }

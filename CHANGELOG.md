@@ -3,8 +3,10 @@
 ## Unreleased（0.2.0-dev）
 
 - 删除旧的多角色控制面、虚拟机构建、通用远程协议、独立前端和多栈部署源码。
-- 建立单 `aursmith` 二进制和 fresh-only 三表 SQLite。
+- 建立单 `aursmith` 二进制和 fresh-only 四表 SQLite。
 - 保留并收紧单管理员认证安全边界。
-- 提供服务端 HTML 的显式 pkgbase 目录管理。
+- 提供服务端 HTML 的显式 pkgbase 目录管理、手工 AUR 刷新与完整输入证据页。
+- 固定 AUR HTTPS Git 输入，安全物化普通 tracked tree，并生成受边界约束的 full/diff。
+- 输入只进入 `prepared` / `input_blocked`；仍不提供 Agent 审查、批准、构建或发布。
 
 这是重构中的中间版本，不提供构建或仓库发布能力，也不宣称可以替换现有生产部署。旧版本历史保留在 Git 中，不继续作为当前架构说明。

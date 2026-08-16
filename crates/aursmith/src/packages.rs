@@ -10,13 +10,18 @@ pub struct TrackedPackage {
     pub approved_aur_commit: Option<String>,
     pub approved_tree_sha256: Option<String>,
     pub approved_at: Option<DateTime<Utc>>,
+    pub last_checked_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    pub current_review_commit: Option<String>,
+    pub current_review_tree_sha256: Option<String>,
+    pub current_review_status: Option<String>,
+    pub current_review_comparison: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 pub async fn list(database: &SqlitePool) -> Result<Vec<TrackedPackage>, ApiError> {
-    let rows = sqlx::query("SELECT pkgbase, state, approved_aur_commit, approved_tree_sha256, approved_at, last_error, created_at, updated_at FROM tracked_packages ORDER BY pkgbase")
+    let rows = sqlx::query("SELECT p.pkgbase, p.state, p.approved_aur_commit, p.approved_tree_sha256, p.approved_at, p.last_checked_at, p.last_error, p.created_at, p.updated_at, r.aur_commit AS current_review_commit, r.tree_sha256 AS current_review_tree_sha256, r.status AS current_review_status, r.comparison_kind AS current_review_comparison FROM tracked_packages p LEFT JOIN aur_reviews r ON r.pkgbase = p.pkgbase AND r.status IN ('prepared', 'input_blocked') ORDER BY p.pkgbase")
         .fetch_all(database)
         .await
         .map_err(ApiError::internal)?;
@@ -32,7 +37,20 @@ pub async fn list(database: &SqlitePool) -> Result<Vec<TrackedPackage>, ApiError
                     .try_get("approved_tree_sha256")
                     .map_err(ApiError::internal)?,
                 approved_at: row.try_get("approved_at").map_err(ApiError::internal)?,
+                last_checked_at: row.try_get("last_checked_at").map_err(ApiError::internal)?,
                 last_error: row.try_get("last_error").map_err(ApiError::internal)?,
+                current_review_commit: row
+                    .try_get("current_review_commit")
+                    .map_err(ApiError::internal)?,
+                current_review_tree_sha256: row
+                    .try_get("current_review_tree_sha256")
+                    .map_err(ApiError::internal)?,
+                current_review_status: row
+                    .try_get("current_review_status")
+                    .map_err(ApiError::internal)?,
+                current_review_comparison: row
+                    .try_get("current_review_comparison")
+                    .map_err(ApiError::internal)?,
                 created_at: row.try_get("created_at").map_err(ApiError::internal)?,
                 updated_at: row.try_get("updated_at").map_err(ApiError::internal)?,
             })
@@ -56,6 +74,9 @@ pub async fn add(database: &SqlitePool, pkgbase: &str) -> Result<(), ApiError> {
             "该 pkgbase 已经在跟踪列表中",
         ));
     }
+    if inserted.rows_affected() != 1 {
+        return Err(ApiError::internal("添加 pkgbase 影响行数不是 1"));
+    }
     Ok(())
 }
 
@@ -75,6 +96,9 @@ pub async fn set_state(database: &SqlitePool, pkgbase: &str, state: &str) -> Res
     if updated.rows_affected() == 0 {
         return Err(ApiError::not_found("pkgbase 不在跟踪列表中"));
     }
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::internal("修改 pkgbase 状态影响行数不是 1"));
+    }
     Ok(())
 }
 
@@ -87,6 +111,9 @@ pub async fn delete(database: &SqlitePool, pkgbase: &str) -> Result<(), ApiError
         .map_err(ApiError::internal)?;
     if deleted.rows_affected() == 0 {
         return Err(ApiError::not_found("pkgbase 不在跟踪列表中"));
+    }
+    if deleted.rows_affected() != 1 {
+        return Err(ApiError::internal("删除 pkgbase 影响行数不是 1"));
     }
     Ok(())
 }

@@ -62,6 +62,11 @@ if ! rg -q '^USER 10001:10001$' deploy/Dockerfile; then
   echo "运行镜像必须固定使用 USER 10001:10001" >&2
   exit 1
 fi
+if ! rg -q 'apt-get install -y --no-install-recommends ca-certificates curl git' deploy/Dockerfile \
+  || ! rg -q 'const GIT_BINARY: &str = "/usr/bin/git";' crates/aursmith/src/aur.rs; then
+  echo "运行镜像必须安装 Git，生产代码必须调用固定 /usr/bin/git" >&2
+  exit 1
+fi
 
 if ! rg -q '^\s*respond @health 404$' deploy/Caddyfile.example \
   || ! rg -q '^\s*header_up X-AURsmith-Client-IP \{remote_host\}$' deploy/Caddyfile.example; then

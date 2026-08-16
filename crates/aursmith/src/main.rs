@@ -1,10 +1,12 @@
 mod admin;
+mod aur;
 mod auth;
 mod config;
 mod credentials;
 mod db;
 mod error;
 mod packages;
+mod reviews;
 mod web;
 
 use anyhow::Context;

@@ -49,6 +49,13 @@ impl Config {
             .checked_mul(3600)
             .context("绝对会话期限换算溢出")
     }
+
+    pub fn aur_state_directory(&self) -> PathBuf {
+        self.database_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join("aur")
+    }
 }
 
 fn validate_public_origin(value: &str) -> anyhow::Result<String> {
@@ -130,6 +137,16 @@ mod tests {
                 MAXIMUM_SESSION_ABSOLUTE_HOURS + 1
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn aur_state_is_derived_from_the_database_parent() {
+        assert_eq!(
+            config("https://aursmith.example", 60, 1)
+                .unwrap()
+                .aur_state_directory(),
+            std::path::Path::new("/tmp/aur")
         );
     }
 }
