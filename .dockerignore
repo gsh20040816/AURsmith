@@ -1,9 +1,7 @@
 .git
 .gitignore
 target
-web/node_modules
-web/dist
-web/*.tsbuildinfo
+web
 runtime
 deploy/*/secrets
 *.db

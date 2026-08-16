@@ -1,0 +1,8 @@
+aursmith.example.com {
+	@health path /healthz
+	respond @health 404
+
+	reverse_proxy 127.0.0.1:18443 {
+		header_up X-AURsmith-Client-IP {remote_host}
+	}
+}

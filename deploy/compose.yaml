@@ -1,0 +1,35 @@
+name: aursmith
+
+services:
+  aursmith:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      AURSMITH_BIND: 0.0.0.0:8080
+      AURSMITH_DATABASE_PATH: /var/lib/aursmith/aursmith.db
+      AURSMITH_PUBLIC_ORIGIN: ${AURSMITH_PUBLIC_ORIGIN:?必须设置管理站点的固定 HTTPS Origin}
+      AURSMITH_SESSION_IDLE_MINUTES: ${AURSMITH_SESSION_IDLE_MINUTES:-60}
+      AURSMITH_SESSION_ABSOLUTE_HOURS: ${AURSMITH_SESSION_ABSOLUTE_HOURS:-168}
+      RUST_LOG: ${RUST_LOG:-aursmith=info}
+    volumes:
+      - aursmith-data:/var/lib/aursmith
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - ${AURSMITH_WEB_BIND:-127.0.0.1:18443}:8080
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, http://127.0.0.1:8080/healthz]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  aursmith-data:
