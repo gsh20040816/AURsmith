@@ -3,7 +3,13 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeSet,
+    net::{IpAddr, Ipv4Addr},
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 use tempfile::TempDir;
 use tokio::{process::Command, time::timeout};
 
@@ -107,6 +113,7 @@ impl AurClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { http, base })
@@ -314,6 +321,7 @@ async fn run_git_clone(repository: &str, directory: &Path) -> anyhow::Result<()>
                 "-c",
                 "core.hooksPath=/dev/null",
                 "clone",
+                "--ipv4",
                 "--depth",
                 "1",
                 "--no-tags",
@@ -420,7 +428,14 @@ async fn resolve_git_vcs_commit(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(host, addresses[0])
+        .resolve(
+            host,
+            addresses
+                .iter()
+                .find(|address| address.is_ipv4())
+                .copied()
+                .unwrap_or(addresses[0]),
+        )
         .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let response = client
