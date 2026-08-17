@@ -863,7 +863,6 @@ pub(crate) async fn schedule_rebuild_batch(
                                 | "GUEST_PGP_FAILED"
                                 | "GUEST_CHECK_FAILED"
                                 | "GUEST_PACKAGE_FAILED"
-                                | "GUEST_BUILD_FAILED"
                                 | "GUEST_OUTPUT_MISMATCH"
                         )
                     })
@@ -2540,6 +2539,42 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert!(
+            schedule_rebuild_batch(
+                &database,
+                BTreeSet::from(["demo".into()]),
+                "tester",
+                "manual_rebuild",
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_build_failure_can_be_retried_after_environment_fix() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let created = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO jobs(id, revision_id, required_role, status, priority, kind, failure_code, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', 'failed', 1, 'build', 'GUEST_BUILD_FAILED', '[]', '[]', '[]', ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(created["revision_id"].as_str().unwrap())
+            .bind(now)
+            .bind(now)
+            .execute(&database)
+            .await
+            .unwrap();
 
         assert!(
             schedule_rebuild_batch(

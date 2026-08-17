@@ -2840,23 +2840,20 @@ fn activate_committed_release(
             size: artifact.size,
         };
         verify_signed_entry(worker, committed, &entry)?;
-        copy_new_or_verify(
+        copy_or_replace_regular(
             &committed.join(&artifact.path),
             &arch_root.join(&artifact.path),
         )?;
         let hot_signature = arch_root.join(format!("{}.sig", artifact.path));
-        if hot_signature.exists() {
-            verify_gpg_signature(
-                &worker.publisher_gpg_home,
-                &arch_root.join(&artifact.path),
-                &hot_signature,
-            )?;
-        } else {
-            copy_regular_synced(
-                &committed.join(format!("{}.sig", artifact.path)),
-                &hot_signature,
-            )?;
-        }
+        copy_or_replace_regular(
+            &committed.join(format!("{}.sig", artifact.path)),
+            &hot_signature,
+        )?;
+        verify_gpg_signature(
+            &worker.publisher_gpg_home,
+            &arch_root.join(&artifact.path),
+            &hot_signature,
+        )?;
     }
     activate_repository_database_links(worker, &manifest)
 }
@@ -2882,8 +2879,8 @@ fn activate_incremental_release(
         let hot_package = arch_root.join(&artifact.path);
         let hot_signature = arch_root.join(format!("{}.sig", artifact.path));
         if changed_artifact_paths.contains(&artifact.path) {
-            copy_new_or_verify(&committed_package, &hot_package)?;
-            copy_new_or_verify(&committed_signature, &hot_signature)?;
+            copy_or_replace_regular(&committed_package, &hot_package)?;
+            copy_or_replace_regular(&committed_signature, &hot_signature)?;
         } else if !hot_package.is_file() || !hot_signature.is_file() {
             bail!("增量 Release 缺少已提交的复用 Artifact：{}", artifact.path);
         }
@@ -3089,16 +3086,26 @@ fn link_or_copy_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn copy_new_or_verify(source: &Path, target: &Path) -> anyhow::Result<()> {
+fn copy_or_replace_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
     if target.exists() {
-        if file_sha256(source)? != file_sha256(target)? {
-            bail!("公开 hot set 存在同名不同内容：{}", target.display());
+        if file_sha256(source)? == file_sha256(target)? {
+            return Ok(());
         }
-        return Ok(());
     }
-    link_or_copy_regular(source, target)?;
-    std::fs::File::open(target)?.sync_all()?;
-    Ok(())
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("发布目标没有父目录：{}", target.display()))?;
+    let temporary = parent.join(format!(".aursmith-publish-{}", Uuid::new_v4()));
+    let result = (|| {
+        link_or_copy_regular(source, &temporary)?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::rename(&temporary, target)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn atomic_release_link(root: &Path, name: &str, target: &str) -> anyhow::Result<()> {
@@ -3782,6 +3789,27 @@ mod transfer_tests {
             size: entry.size,
         };
         assert!(materialize_export(&source, &root.path().join("bad"), &[traversal]).is_err());
+    }
+
+    #[test]
+    fn publishing_replaces_same_name_with_new_content_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("new.pkg.tar.zst");
+        let target = root.path().join("package.pkg.tar.zst");
+        std::fs::write(&source, b"new package").unwrap();
+        std::fs::write(&target, b"old package").unwrap();
+
+        copy_or_replace_regular(&source, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new package");
+        assert_eq!(std::fs::read(&source).unwrap(), b"new package");
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            2
+        );
     }
 
     #[test]

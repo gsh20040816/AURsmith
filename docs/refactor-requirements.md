@@ -122,6 +122,8 @@ CPU、内存和磁盘限制可以作为部署默认值，但不建设资源探�
 
 Publisher 分机串行执行接收和发布：只接管预期普通包文件，重新计算 SHA-256 并核对包元数据；随后在同一文件系统 staging 中生成包签名、仓库数据库、数据库签名和一个小型 `repository-manifest.json`，最后只切换一个权威 `current` 指针。保留 `previous` 用于人工恢复，不建设完整 Release 历史或 Web 回滚平台。切换后，`current` 和 `previous` 数据库引用的包文件都必须继续通过原有公开 URL 读取，避免客户端先取得旧数据库、后下载旧包时失败。
 
+已通过构建、签名和 Release 校验的新 Artifact 可以原子替换公开 hot store 中的同名旧文件，即使两者 SHA-256 不同；同名不同摘要本身不是发布冲突。替换必须使用同目录临时文件和原子 rename，随后再切换仓库数据库链接，不能原地截断或覆写公开文件。
+
 仓库 GPG 私钥只存在于 Publisher 分机的既有签名隔离边界，不进入 Controller、Runner、gateway、Builder、Build 容器或 incoming 账户。发布必须显式指定配置的签名主指纹，不能从 keyring 中任取“第一个 key”。本项目接受 Publisher 失陷后攻击者可能取得签名能力；不得为了精简把签名合并进 Controller，也不恢复无用的双重授权平台。
 
 `aursmith-keyring` 是必须长期保留的系统包：

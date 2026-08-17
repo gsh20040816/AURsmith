@@ -29,7 +29,7 @@ Publisher 的稳态存储以公开 hot store 为唯一包内容存储。Release 
 
 没有进入 Release 的 TransferCapability 在过期后自动回收。Publisher 清理前会读取所有 `queued` 和 `awaiting_signer` 授权，仍被活动 Release 完整引用的 transfer 即使已到期也暂不删除；其余 `receiving` 或 `verified` 工作区删除后在 Journal 标记为 `expired`，避免失败、被替代版本或早期部署遗留的传输永久占用磁盘。
 
-ReleaseAuthorization 始终描述目标 Release 的完整最终 Artifact 清单，但 Publisher 只把经 TransferCapability 验证的变化包送入 Signer；未变化包只引用上一已提交 hot set。Signer 先验证当前仓库 db/files 的 GPG 签名并复制这两个小型数据库，再用官方 `repo-remove` 删除目标清单中已不存在的包，用官方 `repo-add` 只加入本批次变化包。首次发布才从空数据库加入全部包。Signer 最后只读取新数据库中的小型 `desc` 元数据，要求包名、版本和文件名与完整 ReleaseAuthorization 精确一致，然后重新签署 db/files 和 Manifest。Publisher 仅持公钥，复验变化包与新数据库签名后，先提交不可变 Release 目录和变化包，再更新签名与 files 链接，最后原子替换仓库 DB 链接。相同包名、版本但摘要不同仍在 hot set 接管时失败关闭。
+ReleaseAuthorization 始终描述目标 Release 的完整最终 Artifact 清单，但 Publisher 只把经 TransferCapability 验证的变化包送入 Signer；未变化包只引用上一已提交 hot set。Signer 先验证当前仓库 db/files 的 GPG 签名并复制这两个小型数据库，再用官方 `repo-remove` 删除目标清单中已不存在的包，用官方 `repo-add` 只加入本批次变化包。首次发布才从空数据库加入全部包。Signer 最后只读取新数据库中的小型 `desc` 元数据，要求包名、版本和文件名与完整 ReleaseAuthorization 精确一致，然后重新签署 db/files 和 Manifest。Publisher 仅持公钥，复验变化包与新数据库签名后，先提交不可变 Release 目录和变化包，再更新签名与 files 链接，最后原子替换仓库 DB 链接。已经通过这些校验的新 Artifact 可以用同目录临时文件和 rename 原子替换 hot set 中同名但摘要不同的旧文件；同名不同摘要本身不是发布冲突。
 
 清除操作同样创建不可变 Release，而不是删除当前仓库中的文件。Controller 汇总目标 pkgbase 全部历史 Revision 声明过的 split outputs，再从当前激活的 Release 移除这些名称，把清除清单写入 ReleaseAuthorization 和签名 Manifest；这样 output 改名后旧名称也不会残留。当前 Release 由控制面显式指针确定，服务端回滚后不会错误地以时间上更新但已停用的 Release 为基线。Signer 根据当前数据库与目标完整清单的差集调用官方 `repo-remove`，其他条目保持不变。清除最后一个包时生成标准空 gzip tar 数据库和 files 数据库后照常签名并原子切换；旧包文件仍按兼容窗口保留，但不再出现在当前仓库数据库中。
 
