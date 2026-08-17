@@ -387,16 +387,7 @@ fn classify_makepkg_failure(log: &Path) -> &'static str {
 }
 
 fn builder_command_arguments<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
-    let mut command = vec![
-        "-u",
-        "builder",
-        "--",
-        "/usr/bin/env",
-        "-i",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/bin",
-        "HOME=/home/builder",
-        "LANG=C.UTF-8",
-    ];
+    let mut command = vec!["-u", "builder", "--"];
     command.extend_from_slice(arguments);
     command
 }
@@ -452,7 +443,6 @@ fn run_as_builder_status(
     command.args(builder_command_arguments(arguments));
     command.current_dir(BUILD).stdin(Stdio::null());
     command
-        .env_clear()
         .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
         .env("HOME", "/home/builder")
         .env("LANG", "C.UTF-8");
@@ -595,6 +585,7 @@ mod tests {
         assert!(makepkg_arguments(true).contains(&"--syncdeps"));
         assert!(!makepkg_arguments(true).contains(&"--nocheck"));
         assert!(makepkg_arguments(false).contains(&"--nocheck"));
+        assert!(!builder_command_arguments(&["/usr/bin/makepkg"]).contains(&"/usr/bin/env"));
         assert_eq!(
             guest_error_code(&anyhow::anyhow!("GUEST_CHECKSUM_FAILED: bad source")),
             "GUEST_CHECKSUM_FAILED"

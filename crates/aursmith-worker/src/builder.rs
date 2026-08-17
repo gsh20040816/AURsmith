@@ -307,6 +307,7 @@ async fn execute_attempt(
         .args([
             "run",
             "--rm",
+            "--init",
             "--name",
             &container_name,
             "--network",
