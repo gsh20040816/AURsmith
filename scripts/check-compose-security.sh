@@ -47,6 +47,11 @@ if ! rg -q '^\s*respond @health 404$' deploy/netcup/Caddyfile.snippet; then
   echo "公网管理反代必须隐藏 health" >&2
   exit 1
 fi
+if rg -q 'immutable' deploy/netcup/Caddyfile.snippet \
+  || ! rg -q '^\s*header @package Cache-Control "no-cache, must-revalidate"$' deploy/netcup/Caddyfile.snippet; then
+  echo "同版本重建会替换同名包，公网包禁止 immutable 缓存" >&2
+  exit 1
+fi
 
 builder_json="$(docker compose -f deploy/builder/compose.yaml config --format json)"
 if [[ "$(jq '[.services | to_entries[] | .key as $service | .value.volumes[]? | select(.source == "/var/run/docker.sock" and .target == "/var/run/docker.sock") | $service] | length' <<<"${builder_json}")" != "1" ]] \

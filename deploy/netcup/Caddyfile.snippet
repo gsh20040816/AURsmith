@@ -21,6 +21,6 @@ repo.shgao.top {
 	@database path *.db *.db.* *.files *.files.* *.sig
 	header @database Cache-Control "no-cache, must-revalidate"
 	@package path *.pkg.tar.*
-	header @package Cache-Control "public, max-age=31536000, immutable"
+	header @package Cache-Control "no-cache, must-revalidate"
 	header X-Content-Type-Options nosniff
 }
