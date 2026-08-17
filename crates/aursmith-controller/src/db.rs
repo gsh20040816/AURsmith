@@ -38,6 +38,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+        let obsolete_vcs_review_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'vcs_rewrite_reviews'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(obsolete_vcs_review_table, 0);
         let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
             .fetch_one(&pool)
             .await

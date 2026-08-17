@@ -502,7 +502,6 @@ async fn run_codex(
     prompt: &[u8],
 ) -> anyhow::Result<(AgentOutput, Value, String)> {
     let result_path = output_directory.join("audit-result.json");
-    let last_message_path = output_directory.join("last-message.txt");
     let codex_home_path = output_directory.join(".codex");
     fs::create_dir(&codex_home_path).await?;
     let codex_home = codex_home_path.to_string_lossy().into_owned();
@@ -516,8 +515,6 @@ async fn run_codex(
         "workspace-write".into(),
         "--output-schema".into(),
         schema_path.to_string_lossy().into_owned(),
-        "--output-last-message".into(),
-        last_message_path.to_string_lossy().into_owned(),
         "--model".into(),
         config.model.clone(),
         "--config".into(),
@@ -551,55 +548,16 @@ async fn run_codex(
     )
     .await?;
     ensure_success(&output)?;
-    let (result, output_source) = match fs::read(&result_path).await {
-        Ok(result) => (result, "agent_verified_file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            fs::read(&last_message_path).await.with_context(|| {
-                format!(
-                    "Codex 既没有写入 {}，也没有生成最终消息",
-                    result_path.display()
-                )
-            })?,
-            "cli_last_message_fallback",
-        ),
-        Err(error) => return Err(error).context("无法读取 Codex 审计结果文件"),
-    };
-    let mut raw = parse_codex_output(&result)?;
-    if let Some(object) = raw.as_object_mut() {
-        object.insert(
-            "_aursmith_output_source".into(),
-            Value::String(output_source.into()),
-        );
-    }
+    let result = fs::read(&result_path)
+        .await
+        .with_context(|| format!("无法读取 Codex 审计结果文件 {}", result_path.display()))?;
+    let raw = parse_codex_result(&result)?;
     let parsed = serde_json::from_value(raw.clone()).context("Codex 审计输出字段无效")?;
     Ok((parsed, raw, adapter_version("/usr/local/bin/codex").await))
 }
 
-fn parse_codex_output(output: &[u8]) -> anyhow::Result<Value> {
-    if let Ok(value) = serde_json::from_slice(output) {
-        return Ok(value);
-    }
-    let text = std::str::from_utf8(output).context("Codex 最终输出不是 UTF-8")?;
-    let trimmed = text.trim();
-    if let Some(fenced) = trimmed
-        .strip_prefix("```json")
-        .and_then(|value| value.strip_suffix("```"))
-    {
-        if let Ok(value) = serde_json::from_str(fenced.trim()) {
-            return Ok(value);
-        }
-    }
-    let start = trimmed.find('{');
-    let end = trimmed.rfind('}');
-    if let (Some(start), Some(end)) = (start, end) {
-        if start <= end {
-            if let Ok(value) = serde_json::from_str(&trimmed[start..=end]) {
-                return Ok(value);
-            }
-        }
-    }
-    let diagnostic = trimmed.chars().take(512).collect::<String>();
-    bail!("Codex 最终输出不是约定的 JSON：{diagnostic}")
+fn parse_codex_result(output: &[u8]) -> anyhow::Result<Value> {
+    serde_json::from_slice(output).context("Codex 审计结果文件不是严格 JSON")
 }
 
 async fn run_claude_code(
@@ -880,36 +838,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_output_accepts_json_inside_markdown_fence_or_short_preamble() {
+    fn codex_result_accepts_only_strict_json() {
         let expected = serde_json::json!({"verdict": "approve"});
         assert_eq!(
-            parse_codex_output(
-                br#"```json
-{"verdict":"approve"}
-```"#
-            )
-            .unwrap(),
+            parse_codex_result(br#"{"verdict":"approve"}"#).unwrap(),
             expected
         );
-        assert_eq!(
-            parse_codex_output(b"result follows: {\"verdict\":\"approve\"}").unwrap(),
-            expected
-        );
-    }
-
-    #[test]
-    fn runner_output_source_metadata_does_not_change_agent_fields() {
-        let output: AgentOutput = serde_json::from_value(serde_json::json!({
-            "verdict": "approve",
-            "summary": "ok",
-            "findings": [],
-            "files_read": ["PKGBUILD"],
-            "cost_microusd": null,
-            "_aursmith_output_source": "cli_last_message_fallback"
-        }))
-        .unwrap();
-        assert_eq!(output.verdict, "approve");
-        assert_eq!(output.files_read, ["PKGBUILD"]);
+        assert!(parse_codex_result(b"```json\n{\"verdict\":\"approve\"}\n```").is_err());
+        assert!(parse_codex_result(b"result follows: {\"verdict\":\"approve\"}").is_err());
     }
 
     #[test]

@@ -46,7 +46,7 @@
 - ADR-042：Job 自动重试以明确 failure code 白名单和 Attempt generation 为准，最多重试两次。`uncertain` 必须等待三十分钟再查询 Worker Journal；不能因一次 SSH 错误立即生成可能重复执行的新 Attempt。确定性输入、Profile、身份和审计错误永不进入自动重试白名单。
 - ADR-043：第一版实时进度使用认证 SSE 加 SQLite 增量快照，不引入 Redis、Kafka 或 WebSocket 服务。SSE 只作为“状态已变化”通知，页面随后读取 JSON API，避免连接丢帧后浏览器与控制面状态分叉。
 - ADR-044：Release 证据索引直接进入 Controller 签名的 ReleaseAuthorization，不新建独立证据服务或对象存储。Signer 把原始授权纳入 GPG 签名的 Release Manifest，Publisher 逐字节复验，Archiver 因而自动保存相同证据。内嵌内容限制为 10000 条和 16 MiB，适合结构化审计与 provenance；大型源码、Profile 和原始日志使用独立证据文件并复用受限文件传输。
-- ADR-045：Git VCS 历史重写以真实 commit 祖先关系判定，不能用版本字符串倒退或“commit 只要变化就可疑”的近似规则。网络检查只在 Publisher 上运行，固定已验证公共 IP 并禁用危险 Git 协议和重定向。重写审批绑定 previous/current commit 对，批准一次不会形成永久信任。
+- ADR-045（已替换）：旧版 Git VCS 历史重写专用门禁由 ADR-078 删除。
 - ADR-046：Agent Doctor 禁止通过真实审计请求探测，以免健康检查产生模型费用或把空 fixture 当安全结论。Runner 只检查 CLI、非秘密配置和凭据网关 TCP；Publisher Doctor 负责 AUR 与 source proxy 的实际网络路径。Doctor 失败必须展示具体子检查，不静默降级成“已配置”。
 - ADR-047：第一版日志证据直接进入现有 `job_evidence` 与签名 ReleaseAuthorization，不为日志再引入对象存储。每文件内嵌内容限制 128 KiB、控制响应限制 1 MiB、ReleaseEvidence 限制 16 MiB，同时保存完整大小和摘要；超大日志在控制消息中明确省略，原始字节仍进入 Build 证据归档。失败 Job 证据保留在控制面，成功 Job 证据随 Release 归档。
 - ADR-048：每个成功 Build 生成三个独立的 zstd tar 证据文件：完整签名 Profile、完整 Fetch 输出与 source tree、完整 Build 日志和签名 JobSpec。Controller 只接受绑定 Attempt UUID 的固定三路径清单，并把它们加入原 Artifact `TransferCapability`；Publisher 与 Signer 不解包这些不可信归档，只校验普通文件、大小和 SHA-256。GPG 签名的 Release Manifest 绑定全部证据摘要，Archiver 的目录 Manifest 和 ArchiveReceipt 再绑定实际文件集合。第一版优先保证灾备完整性，跨 Release 的 Profile 内容寻址去重作为后续存储优化。
@@ -79,6 +79,7 @@
 - ADR-075：反向 Builder 的任务容量由 Controller 中该 Worker 的未结束 Job 判定。第一版单 Worker 并发为一，只要存在 `dispatched`、`running` 或 `uncertain` Job 就不签发下一 JobSpec，避免已签名任务在 Worker 本地排队超过十分钟有效期。不能通过单纯延长 JobSpec 有效期掩盖超额派发。
 - ADR-076：Guest 使用仓库自带的最小 pacman 配置，固定启用 Arch 官方 `core`、`extra` 和 `multilib`，镜像地址仍由 Profile 构建参数配置。AUR 的 x86_64 包可以合法依赖 `lib32-*` 官方包；缺少 `multilib` 是构建环境错误，不能把这些依赖删除或对具体包加特判。
 - ADR-077：Build Guest 在执行 makepkg 前安装离线依赖时，必须把 pacman stdout/stderr 写入 `build.log`。失败证据不能只保留退出码，否则无法区分包冲突、依赖版本和损坏输入；补充日志不改变 pacman 参数、依赖集合或失败语义。
+- ADR-078：VCS 审计只覆盖 AUR 包装层，不证明新上游源码安全。相同 AUR commit、Provider 选择和审计策略已有批准时，VCS commit 变化直接复用该批准并创建 Build；非 fast-forward 与普通 VCS 更新同样处理。删除上一 commit 参数、祖先 fetch、专用数据库状态、API 和 Web 人工审批，避免维护一条不能提升包装层审计保证的自研 Git 历史门禁。
 
 ## 已拒绝
 

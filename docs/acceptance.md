@@ -12,12 +12,12 @@
 | ID | 状态 | 当前证据 | 第一版剩余缺口 |
 |---|---|---|---|
 | P01 | 已验证 | 搜索、订阅、暂停、恢复、退订、清除 API 与 Web；清除通过完整 Release 生效 | 隐式依赖保留期目前只有状态，没有按天自动清理策略 |
-| P02 | 已验证 | AUR commit、Git VCS commit 与真实祖先关系跟踪；`paru-git` 上游祖先检查冒烟 | 非 Git VCS 精细跟踪明确延期 |
+| P02 | 已验证 | AUR commit、Git VCS commit 跟踪；VCS-only 更新复用包装层批准的控制面回归测试 | 真实双机 VCS-only 更新仍待整体验收 |
 | P03 | 已验证 | pkgbase DAG、完整 split outputs 构建与 Guest 强校验 | 无 |
 | P04 | 已验证 | 依赖闭包、隐式引用、Provider 选择、循环阻断测试 | bootstrap 循环按计划人工处理 |
 | P05 | 已验证 | ReleaseBatch 拓扑构建、私有依赖输入和整批发布状态机 | 尚未跑订阅到发布的单次无人值守 E2E |
 | P06 | 已验证 | 本地 pkgrel 派生、Guest 工作副本改写和产物版本反验 | 动态 pkgrel 明确失败关闭，需人工处理 |
-| P07 | 已验证 | AUR 消失、维护者/orphan/source 域名、官方晋升、依赖变化及 VCS 历史重写事件 | 无 |
+| P07 | 部分验证 | AUR 消失、维护者/orphan/source 域名事件 | 旧版官方晋升和专用 VCS 事件不属于重构后范围 |
 | P08 | 已验证 | 新批次失败不改变当前 Release；发布故障与回滚实际验证 | 无 |
 | A01 | 已验证 | 包装层扫描、Fetch 后 AuditBundle、三 Runner 调度 | 真实外部模型调用未验证 |
 | A02 | 已验证 | 3/2/≤1、单次重试和高成本批准规则；默认 0 的摘要稳定随机复查可由 UI/环境配置 | 无 |

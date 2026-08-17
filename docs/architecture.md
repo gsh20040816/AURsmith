@@ -85,9 +85,7 @@ AUR 依赖以 `subscription_references` 保存有向边，隐式订阅的引用�
 
 第一版构建架构固定为 x86_64。解析 `.SRCINFO` 时，`depends`、`makedepends`、`checkdepends`、`optdepends` 和 `provides` 分别与对应的 `_x86_64` 字段合并，明确忽略 `_i686`、`_aarch64` 等其他架构字段；这样 CrossOver 等声明 `lib32-*` 运行依赖的 x86_64 包会在 Fetch 阶段获得完整官方依赖闭包。
 
-Agent 审计身份只由 `pkgbase`、AUR Git commit（即完整 AUR 包装仓库文件）、固定 VCS commit、Provider 选择和审计策略版本组成。以上内容不变且已有自动批准结果时，后续手工重建直接复用该审计；Build Profile、官方依赖快照、下载缓存、内部 GPG 公钥包和其他 Fetch 实现元数据变化不触发重新审计。它们仍进入构建 provenance 和确定性校验，但不属于“AUR 打包脚本是否变化”的判定。
-
-Git VCS commit 变化时，Controller 把上一 Revision 的 commit 交给 Publisher。Publisher 先用固定 IP 的 smart HTTP 广告取得当前 ref，再以 `protocol.file/ext=never`、禁重定向、`GIT_TERMINAL_PROMPT=0` 和 `http.curloptResolve` 固定同一公共地址，仅获取该 ref 的无 blob 历史并执行 `merge-base --is-ancestor`。正常快进自动继续；上一 commit 不存在或不是祖先时，不创建新 Revision，而是写入 `vcs_history_rewrite_detected` 事件、critical 告警和待处理人工动作。管理员在包详情中批准或拒绝精确的 previous/current commit 对；批准不能永久信任包，下一次不同重写仍重新阻断。
+Agent 对包装层的批准身份只由 `pkgbase`、AUR Git commit（即完整 AUR 包装仓库文件）、Provider 选择和审计策略版本组成。Git VCS commit 变化会产生新 Revision 和 Build，但只要 AUR 包装层身份未变化，就复用该包装层的既有自动或人工批准；不得把这种复用描述为审计了新的上游源码。VCS 历史是否 fast-forward 不再设置专用门禁。
 
 Publisher 同时包装 Arch 官方仓库 JSON 接口。新订阅若与官方包同名会被拒绝；周期检查发现已有订阅进入官方仓库时，会暂停后续 AUR 更新、保留当前私有版本，并生成迁移告警和独立事件。
 

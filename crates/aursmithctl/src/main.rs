@@ -124,8 +124,6 @@ enum WorkerCommand {
     PublisherDoctor,
     AurSnapshot {
         package_base: String,
-        #[arg(long)]
-        previous_vcs_commit: Option<String>,
     },
     AuthorizeExport {
         envelope_file: PathBuf,
@@ -211,11 +209,8 @@ async fn main() -> anyhow::Result<()> {
                     json!({"command": "official_info", "names": names})
                 }
                 WorkerCommand::PublisherDoctor => json!({"command": "publisher_doctor"}),
-                WorkerCommand::AurSnapshot {
-                    package_base,
-                    previous_vcs_commit,
-                } => {
-                    json!({"command": "aur_snapshot", "package_base": package_base, "previous_vcs_commit": previous_vcs_commit})
+                WorkerCommand::AurSnapshot { package_base } => {
+                    json!({"command": "aur_snapshot", "package_base": package_base})
                 }
                 WorkerCommand::AuthorizeExport { envelope_file } => {
                     let bytes = tokio::fs::read(&envelope_file).await?;

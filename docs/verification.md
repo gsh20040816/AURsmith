@@ -120,7 +120,7 @@
 - 成功刷新会在同一控制面事务中比较旧 package/revision 元数据，记录维护者、orphan 和 source 域名集合变化；域名单元测试确认 `git+` 前缀、source 别名和主机名大小写被规范化，本地 source 不被误认为网络域名。
 - AUR RPC 找不到原 pkgbase 时会打开稳定告警并只追加一次 `package_missing_from_aur` 事件，payload 明确保留 deleted/renamed/merged 三种可能；当前订阅和稳定 Release 不会因此被删除。
 - Web 包页面补齐详情入口，展示 split outputs、不可变 Revision、Provider/依赖解析和 append-only 事件，并补上与退订语义分开的“清除”操作。
-- 未覆盖：尚未对真实发生 AUR merge 的包验证上游是否提供可可靠固定的目标线索；VCS 历史重写仍需要单独实现与验收。
+- 未覆盖：尚未对真实发生 AUR merge 的包验证上游是否提供可可靠固定的目标线索。
 
 ## 2026-08-10：官方依赖变化建议与本地重建版本
 
@@ -244,14 +244,10 @@
 - 定向验证执行 `cargo test -p aursmith-protocol -p aursmith-controller -p aursmith-signer -p aursmith-worker`：65 个测试通过。随后执行 `bash scripts/test-all.sh`，全仓库 99 个 Rust 测试、前端类型检查、6 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。
 - 该轮当时未覆盖大型证据文件；后续“完整 Release 大文件证据与恢复”验证已补齐，旧结论不再代表当前状态。
 
-## 2026-08-10：Git VCS 历史重写门禁
+## 2026-08-10：已删除的 VCS 历史重写门禁
 
-- Publisher 快照请求新增可选上一 commit。当前 ref 仍由固定公共 IP 的 smart HTTP 广告取得；commit 变化时，再以禁用 file/ext 协议、禁重定向、固定 curl DNS 解析和无交互凭据的 Git fetch 获取无 blob 历史，使用 `merge-base --is-ancestor` 判定，不执行上游代码。
-- Controller 对 root 包和隐式 AUR 依赖都执行同一门禁。非祖先关系不会生成 Revision，而是创建稳定 critical 告警、独立 `vcs_history_rewrite_detected` 事件和 ManualAction。Web 包详情要求至少 8 个字符的理由，批准或拒绝只绑定精确 previous/current commit 对。
-- 单元测试用真实临时 Git 仓库验证正常子 commit 为祖先、orphan 分支不是祖先；SQLite 测试验证首次重写进入 pending、精确批准后放行、不同 current commit 再次回到 pending。前端用例实际提交批准请求并确认待处理面板消失。
-- `scripts/smoke-upstream.sh` 扩展后，从真实 `paru-git` source 克隆深度 2 的当前历史，取父 commit 交给正式 Worker；Worker 返回 `vcs_ancestor_of_current=true`，AUR 搜索、普通快照和官方 `pacman` 查询也通过。第一次执行在上游请求阶段只返回汇总的“Worker 返回失败”，未作为通过证据；随后的 `bash -x` 复跑完整通过并由 trap 清理临时 Worker、GPG home、数据库和 Git clone。
-- 最终执行 `bash scripts/test-all.sh`：全仓库 102 个 Rust 测试、前端类型检查、7 个 Vitest 用例、生产构建和 Compose 安全策略检查全部通过。额外回归确认同步期 ancestry 观察值不会进入不可变 Revision 摘要。
-- 边界：真实上游冒烟验证了网络 fetch 的快进路径；历史重写分支由本地 Git 与控制面测试验证，没有要求公共项目实际 force-push 来制造破坏性测试。
+- 此处原先验证的上一 commit 参数、祖先 fetch、专用人工审批与 Web 面板已在 ADR-078 对应重构中删除，不再代表当前系统能力。
+- 当前行为由 `vcs_only_update_reuses_approved_wrapper_audit` 回归测试约束：VCS commit 变化产生新 Revision，但相同 AUR 包装层复用既有批准，不重复调用 Agent。
 
 ## 2026-08-10：无付费 Agent 与 Fetch Doctor
 

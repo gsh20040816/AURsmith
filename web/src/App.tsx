@@ -325,7 +325,6 @@ function PackagesView() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [detail, setDetail] = useState<PackageDetail | null>(null);
-  const [rewriteRationale, setRewriteRationale] = useState("");
   const [rebuilds, setRebuilds] = useState<RebuildRecommendation[]>([]);
   const refresh = () => void Promise.all([api.subscriptions(), api.rebuildRecommendations()]).then(([subscriptionResponse, rebuildResponse]) => { setSubscriptions(subscriptionResponse.items); setRebuilds(rebuildResponse.items); }).catch((reason) => setError(messageOf(reason)));
   useEffect(refresh, []);
@@ -381,20 +380,9 @@ function PackagesView() {
       setDetail(await api.packageDetail(packageBase));
     } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
   };
-  const decideVcsRewrite = async (approve: boolean) => {
-    if (!detail) return;
-    const packageBase = detail.package_base;
-    setBusy(`vcs-rewrite-${packageBase}`); setError("");
-    try {
-      await api.decideVcsRewrite(packageBase, approve, rewriteRationale);
-      setDetail(await api.packageDetail(packageBase));
-      setRewriteRationale("");
-    } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
-  };
   return <>
     <header className="page-header compact"><div><p className="eyebrow">P01 / P02 / P03 / P04</p><h1>AUR 软件包</h1><p className="lede">搜索在 Publisher 上执行；订阅会固定完整 pkgbase Git commit，并展开隐式 AUR 依赖。</p></div></header>
     {error && <Notice kind="error">{error}</Notice>}
-    {detail?.vcs_rewrite_review?.state === "pending" && <section className="work-panel"><div className="manual-decision"><h2>Git VCS 历史重写待确认</h2><p className="panel-note">{detail.package_base} 的上一 commit {detail.vcs_rewrite_review.previous_commit.slice(0, 12)} 不在当前 {detail.vcs_rewrite_review.current_commit.slice(0, 12)} 的祖先链中。批准只对这次 commit 对有效，拒绝会继续阻止更新。</p><label>人工判断理由<input value={rewriteRationale} onChange={(event) => setRewriteRationale(event.target.value)} placeholder="至少 8 个字符" /></label><div><button className="secondary-button" disabled={busy === `vcs-rewrite-${detail.package_base}`} onClick={() => void decideVcsRewrite(true)}>批准本次重写</button><button className="secondary-button danger" disabled={busy === `vcs-rewrite-${detail.package_base}`} onClick={() => void decideVcsRewrite(false)}>拒绝本次重写</button></div></div></section>}
     <section className="search-panel">
       <form className="package-search" onSubmit={(event) => void search(event)}>
         <label htmlFor="aur-query">搜索 AUR</label>

@@ -5,7 +5,7 @@
 | ID | 需求 | 第一阶段验证方式 |
 |---|---|---|
 | P01 | 搜索、订阅、暂停、退订、清除和手工重建 AUR 软件包 | API 与生命周期测试 |
-| P02 | 跟踪 AUR commit 和 Git VCS 上游 commit；历史重写必须阻断并人工确认 | 同步器、祖先关系与人工审批测试 |
+| P02 | 跟踪 AUR commit 和 Git VCS 上游 commit；VCS-only 更新复用未变化包装层的既有批准，不设置历史重写专用门禁 | VCS-only 审计复用回归测试 |
 | P03 | 以 pkgbase 为单位构建全部 split outputs；同一 pkgbase 内 output 之间的依赖不得作为官方包下载或创建自身隐式订阅 | 软件包基础模型与依赖分类测试 |
 | P04 | 解析依赖 DAG、隐式引用、Provider 和循环依赖；第一版 x86_64 构建必须合并无架构后缀和 `_x86_64` 的 `.SRCINFO` 依赖并忽略其他架构依赖 | 依赖图与架构依赖解析测试 |
 | P05 | 把受影响依赖闭包作为一个 ReleaseBatch 构建和发布 | 发布批次测试 |
@@ -16,7 +16,7 @@
 | A02 | 精确实施三个低成本 Agent 的 3/2/不超过 1 票规则 | 投票测试 |
 | A03 | 仅适配 Codex CLI 与 Claude Code；三个低成本 Runner 的 provider、模型、Base URL、API key 和思考强度必须独立配置；隔离调用并保存完整溯源 | 容器、凭据网关及适配器测试 |
 | A04 | 如实记录源码审计覆盖范围 | 报告 Schema 测试 |
-| A05 | AUR/VCS commit、源码清单、Provider 和审计策略均未变化时复用已通过的自动审计，不重复调用 Agent | 审计复用回归测试 |
+| A05 | AUR 包装层 commit、Provider 和审计策略均未变化时复用既有批准，不因 VCS commit 变化重复调用 Agent | 审计复用回归测试 |
 | B01 | 所有不可信构建都运行在 KVM Guest 中 | KVM 集成测试 |
 | B02 | Fetch Guest 直接访问公网；Build Guest 可由 Builder 配置为无网或直接访问公网，实际模式必须写入 provenance | KVM 网络模式测试 |
 | B03 | 记录输入、依赖、Profile、工具、资源限制、日志和产物；第一版自动 Build Job 默认使用 4 个 vCPU | provenance 与 JobSpec 测试 |
