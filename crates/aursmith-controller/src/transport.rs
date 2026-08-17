@@ -99,38 +99,6 @@ pub async fn query_release(
     .await
 }
 
-pub async fn release_files(
-    config: &Config,
-    endpoint: &str,
-    release_id: &str,
-) -> Result<WorkerReply, ApiError> {
-    invoke(
-        config,
-        endpoint,
-        "release-files",
-        Some(release_id.as_bytes().to_vec()),
-    )
-    .await
-}
-
-pub async fn archive_inventory(
-    config: &Config,
-    endpoint: &str,
-    full_digest: bool,
-) -> Result<WorkerReply, ApiError> {
-    invoke(
-        config,
-        endpoint,
-        if full_digest {
-            "inventory --full-digest"
-        } else {
-            "inventory"
-        },
-        None,
-    )
-    .await
-}
-
 pub async fn aur_search(
     config: &Config,
     endpoint: &str,

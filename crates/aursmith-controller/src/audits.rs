@@ -637,14 +637,6 @@ mod tests {
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
-            client_ca_certificate_file: None,
-            webhook_url: None,
-            webhook_hmac_secret_file: "/不存在".into(),
-            ntfy_url: None,
-            backup_dir: "/不存在".into(),
-            backup_export_dir: "/不存在".into(),
-            backup_export_socket: "/不存在".into(),
-            external_archiver_enabled: false,
         };
         AppState::new(
             database,

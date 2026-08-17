@@ -34,24 +34,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export type Session = { id: string; username: string };
-export type Requirement = { id: string; title: string };
-export type Worker = {
-  id: string;
-  name: string;
-  role: "builder" | "publisher" | "archiver";
-  state: "online" | "draining" | "offline" | "degraded" | "incompatible";
-  endpoint: string;
-  connection_mode: "direct" | "reverse";
-  protocol_version: number;
-  labels: string[];
-  last_seen_at: string | null;
-  storage: { total_bytes: number; available_bytes: number; available_percent: number; path: string } | null;
-  clock_skew_seconds: number | null;
-};
 export type Job = {
   id: string;
   kind: "build";
-  required_role: Worker["role"];
+  required_role: "builder";
   status: string;
   priority: number;
   failure_code: string | null;
@@ -119,32 +105,10 @@ export type Release = {
   batch_id: string;
   state: string;
   manifest_sha256: string;
-  source_git_commit: string;
-  writer_epoch: number;
   artifact_count: number;
-  authorization_state: string | null;
   last_error: string | null;
   committed_at: string | null;
   created_at: string;
-};
-export type ReleaseEvidence = {
-  release_id: string;
-  authorization_sha256: string;
-  evidence: {
-    schema_version: number;
-    records: Array<{ kind: string; identity: string; sha256: string; document: unknown }>;
-  };
-};
-export type ArchiveCopy = {
-  id: string;
-  release_id: string;
-  state: string;
-  receipt_sha256: string | null;
-  release_manifest_sha256: string;
-  archiver_name: string | null;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
 };
 export type ClientBootstrap = {
   repository_config: string;
@@ -154,64 +118,10 @@ export type ClientBootstrap = {
   commands: string[];
   warnings: string[];
 };
-export type Alert = {
-  id: string;
-  fingerprint: string;
-  severity: string;
-  state: "open" | "acknowledged" | "resolved";
-  title: string;
-  details: unknown;
-  opened_at: string;
-  acknowledged_at: string | null;
-  resolved_at: string | null;
-};
 export type Doctor = {
   ready: boolean;
   checked_at: string;
   checks: Array<{ id: string; ok: boolean; message: string }>;
-};
-export type ControlPlaneBackup = {
-  id: string;
-  state: "creating" | "verified" | "failed";
-  database_sha256: string | null;
-  database_size: number | null;
-  last_error: string | null;
-  created_at: string;
-  verified_at: string | null;
-  archive_state: "issued" | "verified" | "failed" | null;
-  archive_receipt_sha256: string | null;
-  archiver_name: string | null;
-};
-export type ArchiveInventory = {
-  id: string;
-  archiver_name: string;
-  full_digest: boolean;
-  release_count: number;
-  backup_count: number;
-  file_count: number;
-  byte_count: number;
-  failure_count: number;
-  checked_at: string;
-};
-export type Settings = {
-  agents: {
-    supported_adapters: string[];
-    low_runner_count: number;
-    high_runner_configured: boolean;
-    configuration_source: string;
-    api_keys_exposed: false;
-  };
-  budget: {
-    agent_daily_call_limit: number;
-    agent_monthly_call_limit: number;
-    agent_monthly_cost_limit_microusd: number;
-    agent_random_high_cost_review_basis_points: number;
-    daily_used: number;
-    monthly_used: number;
-    monthly_cost_microusd: number;
-  };
-  notifications: { webhook_configured: boolean; ntfy_configured: boolean };
-  repository: { name: string; base_url: string; publisher_compatibility_days: number };
 };
 export const api = {
   login: (input: { username: string; password: string }) =>
@@ -221,25 +131,6 @@ export const api = {
     }),
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   me: () => request<Session>("/api/v1/auth/me"),
-  requirements: () => request<{ items: Requirement[] }>("/api/v1/requirements"),
-  settings: () => request<Settings>("/api/v1/settings"),
-  updateSettings: (budget: Pick<Settings["budget"], "agent_daily_call_limit" | "agent_monthly_call_limit" | "agent_monthly_cost_limit_microusd" | "agent_random_high_cost_review_basis_points">) =>
-    request<Settings>("/api/v1/settings", { method: "PUT", body: JSON.stringify(budget) }),
-  workers: () => request<{ items: Worker[] }>("/api/v1/workers"),
-  registerWorker: (worker: {
-    name: string;
-    role: Worker["role"];
-    endpoint: string;
-    ssh_host_key_sha256: string;
-    protocol_version: number;
-    labels: string[];
-    connection_mode?: "direct" | "reverse";
-    worker_id?: string;
-    identity_signing_key_hex?: string;
-  }) => request<{ id: string }>("/api/v1/workers", {
-    method: "POST",
-    body: JSON.stringify(worker)
-  }),
   jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
   jobEvidence: (id: string) => request<{ job_id: string; kind: string; sha256: string; document: unknown; created_at: string }>(`/api/v1/jobs/${encodeURIComponent(id)}/evidence`),
   searchAur: (query: string) =>
@@ -247,22 +138,13 @@ export const api = {
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
   audits: () => request<{ items: Audit[] }>("/api/v1/audits"),
   releases: () => request<{ items: Release[] }>("/api/v1/releases"),
-  releaseEvidence: (id: string) => request<ReleaseEvidence>(`/api/v1/releases/${encodeURIComponent(id)}/evidence`),
   rollbackRelease: (id: string) => request<{
     release_id: string;
     server_rolled_back: boolean;
     client_auto_downgrade: false;
-    pacman_commands: string[];
   }>(`/api/v1/releases/${encodeURIComponent(id)}/rollback`, { method: "POST" }),
-  archives: () => request<{ items: ArchiveCopy[] }>("/api/v1/archives"),
-  archiveInventories: () => request<{ items: ArchiveInventory[] }>("/api/v1/archive-inventories"),
   clientBootstrap: () => request<ClientBootstrap>("/api/v1/client-bootstrap"),
-  alerts: () => request<{ items: Alert[] }>("/api/v1/alerts"),
-  acknowledgeAlert: (id: string) => request<{ id: string; state: string }>(`/api/v1/alerts/${encodeURIComponent(id)}/acknowledge`, { method: "POST" }),
   doctor: () => request<Doctor>("/api/v1/doctor"),
-  backups: () => request<{ items: ControlPlaneBackup[] }>("/api/v1/backups"),
-  createBackup: () => request<ControlPlaneBackup>("/api/v1/backups", { method: "POST" }),
-  verifyBackup: (id: string) => request<ControlPlaneBackup>(`/api/v1/backups/${encodeURIComponent(id)}/verify`, { method: "POST" }),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>
     request<{ bundle_sha256: string; decision: string }>(
       `/api/v1/audits/${encodeURIComponent(bundle)}/manual-decision`,
@@ -299,13 +181,5 @@ export const api = {
     request<{ package_base: string; state: string; batch_id: string }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/rebuild`,
       { method: "POST" }
-    ),
-  probeWorker: (id: string) =>
-    request<{ id: string; state: string }>(`/api/v1/workers/${id}/probe`, {
-      method: "POST"
-    }),
-  drainWorker: (id: string) =>
-    request<{ id: string; state: string }>(`/api/v1/workers/${id}/drain`, {
-      method: "POST"
-    })
+    )
 };

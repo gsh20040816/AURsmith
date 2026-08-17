@@ -24,14 +24,6 @@ pub struct Config {
     pub repository_name: String,
     pub source_git_commit: String,
     pub repository_base_url: String,
-    pub client_ca_certificate_file: Option<String>,
-    pub webhook_url: Option<String>,
-    pub webhook_hmac_secret_file: String,
-    pub ntfy_url: Option<String>,
-    pub backup_dir: String,
-    pub backup_export_dir: String,
-    pub backup_export_socket: String,
-    pub external_archiver_enabled: bool,
 }
 
 impl Config {
@@ -91,19 +83,6 @@ impl Config {
                 .unwrap_or_else(|_| "development".into()),
             repository_base_url: env::var("AURSMITH_REPOSITORY_BASE_URL")
                 .unwrap_or_else(|_| "https://repo.aursmith.lan".into()),
-            client_ca_certificate_file: optional_env("AURSMITH_CLIENT_CA_CERTIFICATE_FILE"),
-            webhook_url: optional_env("AURSMITH_WEBHOOK_URL"),
-            webhook_hmac_secret_file: env::var("AURSMITH_WEBHOOK_HMAC_SECRET_FILE")
-                .unwrap_or_else(|_| "/run/secrets/webhook_hmac_secret".into()),
-            ntfy_url: optional_env("AURSMITH_NTFY_URL"),
-            backup_dir: env::var("AURSMITH_BACKUP_DIR")
-                .unwrap_or_else(|_| "/var/lib/aursmith/backups".into()),
-            backup_export_dir: env::var("AURSMITH_BACKUP_EXPORT_DIR")
-                .unwrap_or_else(|_| "/var/lib/aursmith/transfers".into()),
-            backup_export_socket: env::var("AURSMITH_BACKUP_EXPORT_SOCKET")
-                .unwrap_or_else(|_| "/run/aursmith-controller/export.sock".into()),
-            external_archiver_enabled: env::var("AURSMITH_EXTERNAL_ARCHIVER_ENABLED")
-                .is_ok_and(|value| value == "true"),
         })
     }
 
@@ -139,13 +118,6 @@ impl Config {
             .with_context(|| format!("无法同步私有 SSH 密钥 {}", target.display()))?;
         Ok(())
     }
-}
-
-fn optional_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
 }
 
 fn parse_nonnegative(name: &str, default: i64) -> i64 {

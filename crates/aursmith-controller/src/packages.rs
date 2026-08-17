@@ -1113,78 +1113,17 @@ pub async fn list_releases(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.source_git_commit, releases.writer_epoch, releases.committed_at, releases.created_at, release_authorizations.state AS authorization_state, release_authorizations.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count FROM releases LEFT JOIN release_authorizations ON release_authorizations.release_id = releases.id ORDER BY releases.created_at DESC LIMIT 200")
+    let rows = sqlx::query("WITH current AS (SELECT json_extract(value_json, '$') AS id FROM system_settings WHERE key = 'current_release_id') SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.committed_at, releases.created_at, release_authorizations.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count FROM releases LEFT JOIN release_authorizations ON release_authorizations.release_id = releases.id WHERE releases.state = 'committed' ORDER BY CASE WHEN releases.id = (SELECT id FROM current) THEN 0 ELSE 1 END, releases.committed_at DESC LIMIT 2")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>("id"),
         "batch_id": row.get::<String,_>("batch_id"),
         "state": row.get::<String,_>("state"),
         "manifest_sha256": row.get::<String,_>("manifest_sha256"),
-        "source_git_commit": row.get::<String,_>("source_git_commit"),
-        "writer_epoch": row.get::<i64,_>("writer_epoch"),
         "artifact_count": row.get::<i64,_>("artifact_count"),
-        "authorization_state": row.get::<Option<String>,_>("authorization_state"),
         "last_error": row.get::<Option<String>,_>("last_error"),
         "committed_at": row.get::<Option<String>,_>("committed_at"),
         "created_at": row.get::<String,_>("created_at"),
-    })).collect::<Vec<_>>() })))
-}
-
-pub async fn release_evidence(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    auth::require_administrator(&state, &headers).await?;
-    let release_id = Uuid::parse_str(&id)
-        .map_err(|_| ApiError::bad_request("INVALID_RELEASE_ID", "Release ID 无效"))?;
-    let raw: String =
-        sqlx::query_scalar("SELECT envelope_json FROM release_authorizations WHERE release_id = ?")
-            .bind(release_id.to_string())
-            .fetch_optional(&state.database)
-            .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::not_found("Release 证据不存在"))?;
-    let envelope: SignedEnvelope = serde_json::from_str(&raw).map_err(ApiError::internal)?;
-    if envelope.verifying_key != state.signing_key.verifying_key().as_bytes() {
-        return Err(ApiError::conflict(
-            "RELEASE_EVIDENCE_UNTRUSTED",
-            "ReleaseAuthorization 不是由当前 Controller 签发",
-        ));
-    }
-    let authorization: aursmith_protocol::ReleaseAuthorization = envelope
-        .verify("aursmith.release_authorization")
-        .map_err(ApiError::internal)?;
-    if authorization.release_id != release_id {
-        return Err(ApiError::conflict(
-            "RELEASE_EVIDENCE_MISMATCH",
-            "ReleaseAuthorization 身份不匹配",
-        ));
-    }
-    Ok(Json(json!({
-        "release_id": release_id,
-        "authorization_sha256": envelope.payload_sha256,
-        "evidence": authorization.evidence
-    })))
-}
-
-pub async fn list_archives(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    auth::require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("SELECT archive_copies.id, archive_copies.release_id, archive_copies.state, archive_copies.receipt_sha256, archive_copies.last_error, archive_copies.created_at, archive_copies.updated_at, workers.name AS archiver_name, releases.manifest_sha256 FROM archive_copies JOIN releases ON releases.id = archive_copies.release_id LEFT JOIN workers ON workers.id = archive_copies.archiver_worker_id ORDER BY archive_copies.created_at DESC LIMIT 200")
-        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
-        "id": row.get::<String,_>("id"),
-        "release_id": row.get::<String,_>("release_id"),
-        "state": row.get::<String,_>("state"),
-        "receipt_sha256": row.get::<Option<String>,_>("receipt_sha256"),
-        "release_manifest_sha256": row.get::<String,_>("manifest_sha256"),
-        "archiver_name": row.get::<Option<String>,_>("archiver_name"),
-        "last_error": row.get::<Option<String>,_>("last_error"),
-        "created_at": row.get::<String,_>("created_at"),
-        "updated_at": row.get::<String,_>("updated_at"),
     })).collect::<Vec<_>>() })))
 }
 
@@ -1224,20 +1163,6 @@ pub async fn rollback_release(
             "Publisher 回滚结果与 Controller 记录不一致",
         ));
     }
-    let artifact_paths = sqlx::query_scalar::<_, String>("SELECT artifacts.path FROM artifacts JOIN release_artifacts ON release_artifacts.artifact_sha256 = artifacts.sha256 WHERE release_artifacts.release_id = ? ORDER BY artifacts.path")
-        .bind(&release_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    let commands = artifact_paths
-        .into_iter()
-        .map(|path| {
-            let url = format!(
-                "{}/x86_64/releases/{}/{}",
-                state.config.repository_base_url.trim_end_matches('/'),
-                release_id,
-                path
-            );
-            format!("sudo pacman -U '{}'", url.replace('\'', "'\\''"))
-        })
-        .collect::<Vec<_>>();
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('current_release_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
         .bind(json!(release_id).to_string()).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
@@ -1255,7 +1180,6 @@ pub async fn rollback_release(
         "release_id": release_id,
         "server_rolled_back": true,
         "client_auto_downgrade": false,
-        "pacman_commands": commands,
     })))
 }
 
