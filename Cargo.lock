@@ -245,6 +245,7 @@ dependencies = [
  "anyhow",
  "aursmith-domain",
  "aursmith-protocol",
+ "aursmith-signer",
  "axum",
  "base64",
  "chrono",

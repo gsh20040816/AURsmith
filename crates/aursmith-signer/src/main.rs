@@ -14,7 +14,6 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
 #[command(name = "aursmith-signer", version)]
@@ -39,12 +38,7 @@ struct Cli {
     keyring_refresh_days: i64,
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "aursmith=info".into()))
-        .with(tracing_subscriber::fmt::layer().json())
-        .init();
-    let cli = Cli::parse();
+fn prepare(cli: &Cli) -> anyhow::Result<()> {
     if !(1..=365).contains(&cli.keyring_refresh_days) {
         bail!("AURSMITH_KEYRING_REFRESH_DAYS 必须在 1 到 365 之间");
     }
@@ -52,13 +46,41 @@ fn main() -> anyhow::Result<()> {
     if controller_key.len() != 32 {
         bail!("Controller verifying key 必须是 32 字节");
     }
-    initialize_gpg(&cli)?;
-    loop {
-        if let Err(error) = process_pending(&cli, &controller_key) {
-            tracing::warn!(%error, "Signer 扫描 Release inbox 失败");
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    initialize_gpg(cli)
+}
+
+pub fn spawn_publisher_signing(
+    inbox: PathBuf,
+    output: PathBuf,
+    repository: PathBuf,
+    controller_key_hex: String,
+    gpg_private_key: PathBuf,
+    gpg_home: PathBuf,
+    keyring_refresh_days: i64,
+) -> anyhow::Result<()> {
+    let cli = Cli {
+        inbox,
+        output,
+        repository,
+        controller_key_hex,
+        gpg_private_key,
+        gpg_home,
+        keyring_refresh_days,
+    };
+    prepare(&cli)?;
+    std::thread::Builder::new()
+        .name("aursmith-publisher-signing".into())
+        .spawn(move || {
+            let controller_key =
+                hex::decode(&cli.controller_key_hex).expect("启动前已验证 Controller key");
+            loop {
+                if let Err(error) = process_pending(&cli, &controller_key) {
+                    tracing::warn!(%error, "Publisher 签名队列扫描失败");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })?;
+    Ok(())
 }
 
 fn initialize_gpg(cli: &Cli) -> anyhow::Result<()> {

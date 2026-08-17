@@ -1,4 +1,3 @@
-use crate::SignedEnvelope;
 use aursmith_domain::{ArchiveState, AttemptRef, WorkerRole};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -144,6 +143,14 @@ pub struct BuilderPoll {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderUpload {
+    pub id: Uuid,
+    pub attempt: AttemptRef,
+    pub files: Vec<ManifestEntry>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderLease {
     #[serde(default)]
     pub acknowledged_attempts: Vec<Uuid>,
@@ -152,7 +159,7 @@ pub struct BuilderLease {
     #[serde(default)]
     pub job: Option<JobSpec>,
     #[serde(default)]
-    pub transfer: Option<SignedEnvelope>,
+    pub transfer: Option<BuilderUpload>,
     pub issued_at: DateTime<Utc>,
     pub next_poll_seconds: u16,
 }

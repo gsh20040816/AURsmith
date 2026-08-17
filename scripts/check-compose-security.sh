@@ -88,12 +88,12 @@ if jq -e '.services | has("repository")' <<<"${publisher_json}" >/dev/null \
   echo "Publisher 必须自行提供只绑定宿主回环地址的仓库 HTTP 服务" >&2
   exit 1
 fi
-if [[ "$(jq '[.services.signer | select(.network_mode == "none")] | length' <<<"${publisher_json}")" != "1" ]]; then
-  echo "Signer 必须完全断网" >&2
+if jq -e '.services | has("signer")' <<<"${publisher_json}" >/dev/null; then
+  echo "Publisher 不得再拆分独立 Signer 服务" >&2
   exit 1
 fi
-if jq -e '.services.worker.secrets[]? | select(.source == "repository_gpg_private_key")' <<<"${publisher_json}" >/dev/null; then
-  echo "Publisher Worker 禁止挂载仓库 GPG 私钥" >&2
+if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_private_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
+  echo "固定 Publisher 必须直接持有仓库 GPG 私钥" >&2
   exit 1
 fi
 if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_public_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
@@ -102,10 +102,6 @@ if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_pu
 fi
 if [[ "$(jq '[.services.ssh.volumes[]? | select(.target == "/landing" and .source == "publisher-landing" and (.read_only // false) == false)] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "Publisher SSH 必须只通过 Publisher landing 卷接收受限 Builder 推送" >&2
-  exit 1
-fi
-if jq -e '.services.signer.secrets[]? | select(.source == "repository_gpg_public_key")' <<<"${publisher_json}" >/dev/null; then
-  echo "Signer 不需要挂载仓库 GPG 公钥 secret" >&2
   exit 1
 fi
 if [[ "$(jq -r '.services.pacoloco.user // ""' <<<"${publisher_json}")" != "65532:65532" ]] \

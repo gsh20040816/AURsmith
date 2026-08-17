@@ -5,7 +5,7 @@ use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
     ArchiveInventory, ArchiveReceipt, ArtifactRecord, BackupArchiveReceipt, BuilderLease,
-    BuilderPoll, ControlPlaneBackup, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization,
+    BuilderPoll, BuilderUpload, ControlPlaneBackup, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization,
     ReleaseManifest, ReleaseRollbackAuthorization, ReverseAttemptReport, SignedEnvelope,
     TransferCapability,
 };
@@ -87,12 +87,16 @@ struct Cli {
     repository_http_bind: Option<SocketAddr>,
     #[arg(long, env = "AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE")]
     repository_gpg_public_key_file: Option<PathBuf>,
+    #[arg(long, env = "AURSMITH_REPOSITORY_GPG_PRIVATE_KEY_FILE")]
+    repository_gpg_private_key_file: Option<PathBuf>,
     #[arg(
         long,
         env = "AURSMITH_PUBLISHER_GPG_HOME",
         default_value = "/run/aursmith-gpg"
     )]
     publisher_gpg_home: PathBuf,
+    #[arg(long, env = "AURSMITH_KEYRING_REFRESH_DAYS", default_value_t = 30)]
+    keyring_refresh_days: i64,
     #[arg(long, env = "AURSMITH_RELEASE_RETENTION_DAYS", default_value_t = 30)]
     release_retention_days: u32,
     #[arg(
@@ -183,7 +187,7 @@ enum WorkerCommand {
     AuthorizeImport { envelope: SignedEnvelope },
     PreparePushImport { envelope: SignedEnvelope },
     ResolveImport { capability_id: String },
-    FinalizePushImport { envelope: SignedEnvelope },
+    FinalizePushImport { envelope: BuilderUpload },
     AuthorizeRelease { envelope: SignedEnvelope },
     QueryRelease { release_id: String },
     ReleaseFiles { release_id: String },
@@ -255,6 +259,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let publisher_signing = if matches!(cli.role, RoleArg::Publisher) {
+        Some((
+            cli.repository_gpg_private_key_file
+                .clone()
+                .context("Publisher 必须配置仓库 GPG 私钥")?,
+            cli.keyring_refresh_days,
+        ))
+    } else {
+        None
+    };
     let controller_bearer_token = cli
         .controller_bearer_token_file
         .as_deref()
@@ -305,6 +319,17 @@ async fn main() -> anyhow::Result<()> {
             repository_public_key
                 .as_deref()
                 .context("Publisher 必须配置仓库 GPG 公钥")?,
+        )?;
+        let (private_key, keyring_refresh_days) =
+            publisher_signing.context("Publisher 签名配置缺失")?;
+        aursmith_signer::spawn_publisher_signing(
+            worker.signer_inbox.clone(),
+            worker.signer_output.clone(),
+            worker.repository_dir.clone(),
+            hex::encode(&worker.trusted_controller_key),
+            private_key,
+            worker.publisher_gpg_home.clone(),
+            keyring_refresh_days,
         )?;
         spawn_publisher(worker.clone());
         if let Some(bind) = cli.repository_http_bind {
@@ -556,24 +581,16 @@ async fn cleanup_releasable_attempt(worker: &Worker, attempt_id: Uuid) -> anyhow
     Ok(())
 }
 
-async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Result<()> {
-    let capability: TransferCapability = envelope.verify("aursmith.transfer_capability")?;
+async fn push_transfer(worker: &Worker, upload: BuilderUpload) -> anyhow::Result<()> {
     let local_state: Option<String> =
         sqlx::query_scalar("SELECT state FROM transfer_exports WHERE capability_id = ?")
-            .bind(capability.id.to_string())
+            .bind(upload.id.to_string())
             .fetch_optional(&worker.database)
             .await?;
     if matches!(local_state.as_deref(), Some("pushed" | "completed")) {
         return Ok(());
     }
-    let prepared = authorize_export(worker, envelope.clone()).await;
-    if !prepared.ok {
-        bail!(
-            "Builder 无法准备 Artifact 导出：{} {}",
-            prepared.code,
-            prepared.message
-        );
-    }
+    prepare_builder_upload(worker, &upload).await?;
     let endpoint = worker
         .reverse_publisher_endpoint
         .as_deref()
@@ -609,8 +626,8 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
     let source = worker
         .jobs_dir
         .join("transfers")
-        .join(capability.id.to_string());
-    let destination = format!("{remote}:.{}.partial/", capability.id);
+        .join(upload.id.to_string());
+    let destination = format!("{remote}:.{}.partial/", upload.id);
     let private_key = tempfile::NamedTempFile::new()?;
     std::fs::copy(identity, private_key.path()).context("复制 Publisher 推送私钥失败")?;
     std::fs::set_permissions(private_key.path(), std::fs::Permissions::from_mode(0o600))?;
@@ -643,7 +660,7 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
         );
     }
     let envelope_file = tempfile::NamedTempFile::new()?;
-    std::fs::write(envelope_file.path(), serde_json::to_vec(&envelope)?)?;
+    std::fs::write(envelope_file.path(), serde_json::to_vec(&upload)?)?;
     let finalize = tokio::process::Command::new("/usr/bin/ssh")
         .args(["-T", "-p", &endpoint.port().unwrap_or(22).to_string(), "-i"])
         .arg(private_key.path())
@@ -682,7 +699,48 @@ async fn push_transfer(worker: &Worker, envelope: SignedEnvelope) -> anyhow::Res
         );
     }
     sqlx::query("UPDATE transfer_exports SET state = 'pushed' WHERE capability_id = ?")
-        .bind(capability.id.to_string())
+        .bind(upload.id.to_string())
+        .execute(&worker.database)
+        .await?;
+    Ok(())
+}
+
+async fn prepare_builder_upload(worker: &Worker, upload: &BuilderUpload) -> anyhow::Result<()> {
+    if upload.expires_at < Utc::now() || upload.files.is_empty() {
+        bail!("Builder 上传任务已过期或 Manifest 为空");
+    }
+    let runtime = worker.builder.as_ref().context("Builder runtime 不可用")?;
+    let directory = runtime
+        .jobs_dir()
+        .join("transfers")
+        .join(upload.id.to_string());
+    let manifest_json = serde_json::to_string(&upload.files)?;
+    if directory.exists() {
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT manifest_json FROM transfer_exports WHERE capability_id = ?",
+        )
+        .bind(upload.id.to_string())
+        .fetch_optional(&worker.database)
+        .await?;
+        if existing.as_deref() == Some(manifest_json.as_str()) {
+            return Ok(());
+        }
+        bail!("相同上传 ID 对应了不同 Manifest");
+    }
+    let source = runtime
+        .jobs_dir()
+        .join("completed")
+        .join(upload.attempt.attempt_id.to_string())
+        .join("output");
+    if let Err(error) = materialize_export(&source, &directory, &upload.files) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    sqlx::query("INSERT INTO transfer_exports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, ?, ?, 'ready')")
+        .bind(upload.id.to_string())
+        .bind(upload.expires_at)
+        .bind(directory.to_string_lossy().as_ref())
+        .bind(manifest_json)
         .execute(&worker.database)
         .await?;
     Ok(())
@@ -1369,18 +1427,17 @@ async fn resolve_import(worker: &Worker, capability_id: &str) -> WorkerResponse 
     }
 }
 
-async fn finalize_push_import(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
-    if envelope.verifying_key != worker.trusted_controller_key {
-        return WorkerResponse::error("UNTRUSTED_CONTROLLER", "TransferCapability 签名无效");
+async fn finalize_push_import(worker: &Worker, upload: BuilderUpload) -> WorkerResponse {
+    if worker.role != WorkerRole::Publisher
+        || upload.expires_at < Utc::now()
+        || upload.files.is_empty()
+    {
+        return WorkerResponse::error("INVALID_UPLOAD", "Builder 上传通知无效或已过期");
     }
-    let capability: TransferCapability = match envelope.verify("aursmith.transfer_capability") {
-        Ok(value) => value,
-        Err(error) => return WorkerResponse::error("INVALID_CAPABILITY", error.to_string()),
-    };
     let row = sqlx::query(
         "SELECT directory, manifest_json, state FROM transfer_imports WHERE capability_id = ?",
     )
-    .bind(capability.id.to_string())
+    .bind(upload.id.to_string())
     .fetch_optional(&worker.database)
     .await;
     let row = match row {
@@ -1389,20 +1446,20 @@ async fn finalize_push_import(worker: &Worker, envelope: SignedEnvelope) -> Work
         Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     };
     let state: String = row.get("state");
-    let final_directory = worker.landing_dir.join(capability.id.to_string());
+    let final_directory = worker.landing_dir.join(upload.id.to_string());
     if state == "verified" {
         return WorkerResponse::ok(
             "IDEMPOTENT_IMPORT",
-            serde_json::json!({"capability_id": capability.id}),
+            serde_json::json!({"upload_id": upload.id}),
         );
     }
     if row.get::<String, _>("manifest_json")
-        != serde_json::to_string(&capability.files).unwrap_or_default()
+        != serde_json::to_string(&upload.files).unwrap_or_default()
     {
-        return WorkerResponse::error("CAPABILITY_CONFLICT", "接收 Manifest 与授权不一致");
+        return WorkerResponse::error("UPLOAD_CONFLICT", "接收 Manifest 与上传通知不一致");
     }
     let staging = PathBuf::from(row.get::<String, _>("directory"));
-    if let Err(error) = verify_manifest_directory(&staging, &capability.files) {
+    if let Err(error) = verify_manifest_directory(&staging, &upload.files) {
         return WorkerResponse::error("TRANSFER_DIGEST_MISMATCH", error.to_string());
     }
     if let Err(error) = std::fs::rename(&staging, &final_directory) {
@@ -1412,13 +1469,13 @@ async fn finalize_push_import(worker: &Worker, envelope: SignedEnvelope) -> Work
         "UPDATE transfer_imports SET state = 'verified', directory = ? WHERE capability_id = ?",
     )
     .bind(final_directory.to_string_lossy().as_ref())
-    .bind(capability.id.to_string())
+    .bind(upload.id.to_string())
     .execute(&worker.database)
     .await
     {
         Ok(_) => WorkerResponse::ok(
             "IMPORT_VERIFIED",
-            serde_json::json!({"capability_id": capability.id}),
+            serde_json::json!({"upload_id": upload.id}),
         ),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }

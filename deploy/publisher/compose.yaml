@@ -28,7 +28,9 @@ services:
       AURSMITH_REPOSITORY_ARCH: ${AURSMITH_REPOSITORY_ARCH:-x86_64}
       AURSMITH_REPOSITORY_HTTP_BIND: 0.0.0.0:8080
       AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE: /run/secrets/repository_gpg_public_key
+      AURSMITH_REPOSITORY_GPG_PRIVATE_KEY_FILE: /run/secrets/repository_gpg_private_key
       AURSMITH_PUBLISHER_GPG_HOME: /run/aursmith-gpg
+      AURSMITH_KEYRING_REFRESH_DAYS: ${AURSMITH_KEYRING_REFRESH_DAYS:-30}
       AURSMITH_RELEASE_RETENTION_DAYS: ${AURSMITH_RELEASE_RETENTION_DAYS:-30}
       AURSMITH_RELEASE_RETENTION_MIN_VERSIONS: ${AURSMITH_RELEASE_RETENTION_MIN_VERSIONS:-3}
       AURSMITH_JOBS_DIR: /jobs
@@ -47,6 +49,7 @@ services:
       - builder_pull_key
       - builder_known_hosts
       - repository_gpg_public_key
+      - repository_gpg_private_key
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /run/aursmith-gpg:uid=10001,gid=10001,mode=0700,size=16m
@@ -58,35 +61,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    restart: unless-stopped
-
-  signer:
-    build:
-      context: ../..
-      dockerfile: deploy/images/signer.Dockerfile
-      args:
-        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    network_mode: none
-    environment:
-      AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
-      AURSMITH_GPG_PRIVATE_KEY_FILE: /run/secrets/repository_gpg_private_key
-      AURSMITH_GPG_HOME: /run/aursmith-gnupg
-      AURSMITH_SIGNER_INBOX: /inbox
-      AURSMITH_SIGNER_OUTPUT: /signed
-      AURSMITH_SIGNER_REPOSITORY: /repository
-      AURSMITH_KEYRING_REFRESH_DAYS: ${AURSMITH_KEYRING_REFRESH_DAYS:-30}
-    secrets:
-      - repository_gpg_private_key
-    volumes:
-      - signer-inbox:/inbox:ro
-      - signer-output:/signed
-      - publisher-hot:/repository:ro
-    tmpfs:
-      - /run/aursmith-gnupg:uid=10001,gid=10001,mode=0700,size=16m
-      - /tmp:uid=10001,gid=10001,mode=0700,size=64m
     restart: unless-stopped
 
   ssh:

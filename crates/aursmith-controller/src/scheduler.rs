@@ -960,7 +960,7 @@ async fn reverse_worker_has_active_job(
 pub(crate) async fn lease_reverse_transfer(
     state: &AppState,
     worker_id: Uuid,
-) -> Result<Option<SignedEnvelope>, ApiError> {
+) -> Result<Option<aursmith_protocol::BuilderUpload>, ApiError> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT envelope_json FROM transfer_capabilities WHERE source_worker_id = ? AND state = 'export_ready' AND expires_at > ? ORDER BY updated_at LIMIT 1",
     )
@@ -970,9 +970,11 @@ pub(crate) async fn lease_reverse_transfer(
     .await
     .map_err(ApiError::internal)?;
     if let Some(value) = existing {
-        return serde_json::from_str(&value)
-            .map(Some)
-            .map_err(ApiError::internal);
+        let envelope: SignedEnvelope = serde_json::from_str(&value).map_err(ApiError::internal)?;
+        let capability: aursmith_protocol::TransferCapability = envelope
+            .verify("aursmith.transfer_capability")
+            .map_err(ApiError::internal)?;
+        return builder_upload(capability).map(Some);
     }
     let issued = sqlx::query(
         "SELECT envelope_json FROM transfer_capabilities WHERE source_worker_id = ? AND state = 'issued' AND expires_at > ? ORDER BY updated_at LIMIT 1",
@@ -1004,7 +1006,21 @@ pub(crate) async fn lease_reverse_transfer(
     sqlx::query("UPDATE transfer_capabilities SET state = 'export_ready', updated_at = ? WHERE id = ? AND state = 'issued'")
         .bind(Utc::now()).bind(capability.id.to_string())
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    Ok(Some(envelope))
+    builder_upload(capability).map(Some)
+}
+
+fn builder_upload(
+    capability: aursmith_protocol::TransferCapability,
+) -> Result<aursmith_protocol::BuilderUpload, ApiError> {
+    let attempt = capability
+        .attempt
+        .ok_or_else(|| ApiError::conflict("ATTEMPT_REQUIRED", "Builder 上传任务缺少 Attempt"))?;
+    Ok(aursmith_protocol::BuilderUpload {
+        id: capability.id,
+        attempt,
+        files: capability.files,
+        expires_at: capability.expires_at,
+    })
 }
 
 async fn dispatch_job_to_worker(
