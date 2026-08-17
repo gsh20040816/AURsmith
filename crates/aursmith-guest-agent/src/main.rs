@@ -359,6 +359,10 @@ fn makepkg_arguments(allow_check: bool) -> Vec<&'static str> {
 
 fn classify_makepkg_failure(log: &Path) -> &'static str {
     let text = String::from_utf8_lossy(&fs::read(log).unwrap_or_default()).to_ascii_lowercase();
+    classify_makepkg_failure_text(&text)
+}
+
+fn classify_makepkg_failure_text(text: &str) -> &'static str {
     if [
         "could not resolve host",
         "temporary failure in name resolution",
@@ -369,6 +373,7 @@ fn classify_makepkg_failure(log: &Path) -> &'static str {
     ]
     .iter()
     .any(|pattern| text.contains(pattern))
+        || contains_transient_http_status(text)
     {
         "BUILD_NETWORK_TRANSIENT"
     } else if text.contains("did not pass the validity check") || text.contains("checksum") {
@@ -384,6 +389,20 @@ fn classify_makepkg_failure(log: &Path) -> &'static str {
     } else {
         "GUEST_BUILD_FAILED"
     }
+}
+
+fn contains_transient_http_status(text: &str) -> bool {
+    [408_u16, 429].into_iter().chain(500..=599).any(|status| {
+        [
+            format!("returned error: {status}"),
+            format!("http error {status}"),
+            format!("http status {status}"),
+            format!("http/1.1 {status}"),
+            format!("http/2 {status}"),
+        ]
+        .iter()
+        .any(|pattern| text.contains(pattern))
+    })
 }
 
 fn builder_command_arguments<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
@@ -589,6 +608,22 @@ mod tests {
         assert_eq!(
             guest_error_code(&anyhow::anyhow!("GUEST_CHECKSUM_FAILED: bad source")),
             "GUEST_CHECKSUM_FAILED"
+        );
+    }
+
+    #[test]
+    fn transient_http_download_failures_are_retryable_but_not_not_found() {
+        assert_eq!(
+            classify_makepkg_failure_text(
+                "curl: (22) the requested url returned error: 429\n==> error: failure while downloading"
+            ),
+            "BUILD_NETWORK_TRANSIENT"
+        );
+        assert_eq!(
+            classify_makepkg_failure_text(
+                "curl: (22) the requested url returned error: 404\n==> error: failure while downloading"
+            ),
+            "GUEST_BUILD_FAILED"
         );
     }
 
