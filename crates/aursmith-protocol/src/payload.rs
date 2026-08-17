@@ -1,4 +1,4 @@
-use aursmith_domain::{ArchiveState, AttemptRef, WorkerRole};
+use aursmith_domain::AttemptRef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -50,7 +50,6 @@ pub struct InlineInput {
 pub struct JobSpec {
     pub job_id: Uuid,
     pub attempt: AttemptRef,
-    pub required_role: WorkerRole,
     #[serde(default)]
     pub kind: JobKind,
     pub revision_sha256: String,
@@ -112,21 +111,6 @@ pub enum GuestResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransferCapability {
-    pub id: Uuid,
-    pub source_worker: Uuid,
-    pub destination_worker: Uuid,
-    pub attempt: Option<AttemptRef>,
-    #[serde(default)]
-    pub release_id: Option<Uuid>,
-    #[serde(default)]
-    pub backup_id: Option<Uuid>,
-    pub writer_epoch: u64,
-    pub files: Vec<ManifestEntry>,
-    pub expires_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReverseAttemptReport {
     pub job_id: Uuid,
     pub response: serde_json::Value,
@@ -165,10 +149,9 @@ pub struct BuilderLease {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseAuthorization {
+pub struct ReleasePlan {
     pub release_id: Uuid,
     pub batch_id: Uuid,
-    pub writer_epoch: u64,
     pub repository_name: String,
     pub source_git_commit: String,
     pub revision_sha256s: Vec<String>,
@@ -180,8 +163,6 @@ pub struct ReleaseAuthorization {
     pub removed_package_names: Vec<String>,
     #[serde(default)]
     pub include_repository_keyring: bool,
-    #[serde(default)]
-    pub evidence: ReleaseEvidence,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -192,7 +173,6 @@ pub struct ReleaseManifest {
     pub batch_id: Uuid,
     pub source_git_commit: String,
     pub repository_name: String,
-    pub writer_epoch: u64,
     pub artifacts: Vec<ArtifactRecord>,
     #[serde(default)]
     pub evidence_files: Vec<ManifestEntry>,
@@ -205,69 +185,15 @@ pub struct ReleaseManifest {
     #[serde(default)]
     pub artifact_inspections: Option<ManifestEntry>,
     #[serde(default)]
-    pub release_authorization: Option<ManifestEntry>,
+    pub release_plan: Option<ManifestEntry>,
     pub committed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ReleaseEvidence {
-    pub schema_version: u16,
-    pub records: Vec<ReleaseEvidenceRecord>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseEvidenceRecord {
-    pub kind: String,
-    pub identity: String,
-    pub sha256: String,
-    pub document: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseRollbackAuthorization {
+pub struct ReleaseRollbackRequest {
     pub release_id: Uuid,
-    pub writer_epoch: u64,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArchiveReceipt {
-    pub release_id: Uuid,
-    pub archive_worker: Uuid,
-    pub release_manifest_sha256: String,
-    pub files: Vec<ManifestEntry>,
-    pub state: ArchiveState,
-    pub verified_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlPlaneBackup {
-    pub backup_id: Uuid,
-    pub database: ManifestEntry,
-    pub source_git_commit: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArchiveInventory {
-    pub archive_worker: Uuid,
-    pub full_digest: bool,
-    pub release_count: u64,
-    #[serde(default)]
-    pub backup_count: u64,
-    pub file_count: u64,
-    pub byte_count: u64,
-    pub failures: Vec<String>,
-    pub checked_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackupArchiveReceipt {
-    pub backup_id: Uuid,
-    pub archive_worker: Uuid,
-    pub files: Vec<ManifestEntry>,
-    pub verified_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -286,7 +212,6 @@ mod tests {
                 attempt_id: Uuid::new_v4(),
                 generation: 0,
             },
-            required_role: WorkerRole::Builder,
             kind: JobKind::Build,
             revision_sha256: "a".repeat(64),
             source_manifest_sha256: None,

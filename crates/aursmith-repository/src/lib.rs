@@ -1,9 +1,8 @@
+//! Publisher 内部的仓库组装、签名和 keyring 生成实现。
+
 use anyhow::{Context, bail};
-use aursmith_protocol::{
-    ArtifactRecord, ManifestEntry, ReleaseAuthorization, ReleaseManifest, SignedEnvelope,
-};
+use aursmith_protocol::{ArtifactRecord, ManifestEntry, ReleaseManifest, ReleasePlan};
 use chrono::{Duration as ChronoDuration, Utc};
-use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,29 +11,15 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
 };
 
-#[derive(Debug, Parser)]
-#[command(name = "aursmith-signer", version)]
+#[derive(Debug, Clone)]
 struct Cli {
-    #[arg(long, env = "AURSMITH_SIGNER_INBOX", default_value = "/inbox")]
     inbox: PathBuf,
-    #[arg(long, env = "AURSMITH_SIGNER_OUTPUT", default_value = "/signed")]
     output: PathBuf,
-    #[arg(
-        long,
-        env = "AURSMITH_SIGNER_REPOSITORY",
-        default_value = "/repository"
-    )]
     repository: PathBuf,
-    #[arg(long, env = "AURSMITH_CONTROLLER_VERIFYING_KEY_HEX")]
-    controller_key_hex: String,
-    #[arg(long, env = "AURSMITH_GPG_PRIVATE_KEY_FILE")]
     gpg_private_key: PathBuf,
-    #[arg(long, env = "AURSMITH_GPG_HOME", default_value = "/run/aursmith-gnupg")]
     gpg_home: PathBuf,
-    #[arg(long, env = "AURSMITH_KEYRING_REFRESH_DAYS", default_value_t = 30)]
     keyring_refresh_days: i64,
 }
 
@@ -42,45 +27,48 @@ fn prepare(cli: &Cli) -> anyhow::Result<()> {
     if !(1..=365).contains(&cli.keyring_refresh_days) {
         bail!("AURSMITH_KEYRING_REFRESH_DAYS 必须在 1 到 365 之间");
     }
-    let controller_key = hex::decode(&cli.controller_key_hex)?;
-    if controller_key.len() != 32 {
-        bail!("Controller verifying key 必须是 32 字节");
-    }
     initialize_gpg(cli)
 }
 
-pub fn spawn_publisher_signing(
-    inbox: PathBuf,
-    output: PathBuf,
-    repository: PathBuf,
-    controller_key_hex: String,
-    gpg_private_key: PathBuf,
-    gpg_home: PathBuf,
-    keyring_refresh_days: i64,
-) -> anyhow::Result<()> {
-    let cli = Cli {
-        inbox,
-        output,
-        repository,
-        controller_key_hex,
-        gpg_private_key,
-        gpg_home,
-        keyring_refresh_days,
-    };
-    prepare(&cli)?;
-    std::thread::Builder::new()
-        .name("aursmith-publisher-signing".into())
-        .spawn(move || {
-            let controller_key =
-                hex::decode(&cli.controller_key_hex).expect("启动前已验证 Controller key");
-            loop {
-                if let Err(error) = process_pending(&cli, &controller_key) {
-                    tracing::warn!(%error, "Publisher 签名队列扫描失败");
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        })?;
-    Ok(())
+#[derive(Clone)]
+pub struct PublisherSigning {
+    cli: Cli,
+}
+
+impl PublisherSigning {
+    pub fn new(
+        repository: PathBuf,
+        gpg_private_key: PathBuf,
+        gpg_home: PathBuf,
+        keyring_refresh_days: i64,
+    ) -> anyhow::Result<Self> {
+        let cli = Cli {
+            inbox: PathBuf::new(),
+            output: PathBuf::new(),
+            repository,
+            gpg_private_key,
+            gpg_home,
+            keyring_refresh_days,
+        };
+        prepare(&cli)?;
+        Ok(Self { cli })
+    }
+
+    pub fn sign(&self, input: &Path, output: &Path) -> anyhow::Result<()> {
+        let mut cli = self.cli.clone();
+        cli.inbox = input
+            .parent()
+            .context("Publisher 签名输入缺少父目录")?
+            .to_owned();
+        cli.output = output
+            .parent()
+            .context("Publisher 签名输出缺少父目录")?
+            .to_owned();
+        if input.file_name() != output.file_name() {
+            bail!("Publisher 签名输入与输出 Release ID 不一致");
+        }
+        process_release_path(&cli, input)
+    }
 }
 
 fn initialize_gpg(cli: &Cli) -> anyhow::Result<()> {
@@ -101,40 +89,19 @@ fn initialize_gpg(cli: &Cli) -> anyhow::Result<()> {
     )
 }
 
-fn process_pending(cli: &Cli, controller_key: &[u8]) -> anyhow::Result<()> {
-    for entry in fs::read_dir(&cli.inbox)?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_ok_and(|kind| kind.is_dir())
-                && !entry.file_name().to_string_lossy().starts_with('.')
-        })
-    {
-        if let Err(error) = process_release(cli, controller_key, &entry) {
-            tracing::warn!(
-                %error,
-                release_directory = %entry.file_name().to_string_lossy(),
-                "Signer 处理 Release 失败"
-            );
-        }
-    }
-    Ok(())
-}
-
-fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> anyhow::Result<()> {
-    let directory_name = entry.file_name();
-    let directory_name = directory_name.to_string_lossy();
+fn process_release_path(cli: &Cli, input: &Path) -> anyhow::Result<()> {
+    let directory_name = input
+        .file_name()
+        .context("Publisher 签名输入缺少 Release ID")?
+        .to_string_lossy();
     if cli.output.join(directory_name.as_ref()).is_dir() {
         return Ok(());
     }
-    let authorization_path = entry.path().join("authorization.json");
-    let envelope: SignedEnvelope = serde_json::from_slice(&fs::read(&authorization_path)?)?;
-    if envelope.verifying_key != controller_key {
-        bail!("ReleaseAuthorization 不是由当前 Controller 签发");
-    }
-    let authorization: ReleaseAuthorization = envelope.verify("aursmith.release_authorization")?;
-    validate_authorization(cli, &authorization, &entry.path())?;
+    let plan_path = input.join("release-plan.json");
+    let authorization: ReleasePlan = serde_json::from_slice(&fs::read(&plan_path)?)?;
+    validate_authorization(cli, &authorization, input)?;
     let release_id = authorization.release_id.to_string();
-    if entry.file_name().to_string_lossy() != release_id {
+    if directory_name != release_id {
         bail!("inbox 目录与 Release ID 不匹配");
     }
     let staging = cli.output.join(format!(".{release_id}.staging"));
@@ -148,7 +115,7 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     fs::create_dir_all(&staging)?;
     let mut changed_package_paths = Vec::new();
     for artifact in &authorization.artifacts {
-        let source = entry.path().join(&artifact.path);
+        let source = input.join(&artifact.path);
         if source.is_file() {
             let destination = staging.join(
                 Path::new(&artifact.path)
@@ -180,7 +147,7 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     };
     let mut evidence_files = Vec::new();
     for evidence in &authorization.evidence_files {
-        let source = entry.path().join(&evidence.path);
+        let source = input.join(&evidence.path);
         let destination = staging.join(&evidence.path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -208,21 +175,20 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
     )?;
     gpg_sign(cli, &database)?;
     gpg_sign(cli, &files_database)?;
-    let inspection_source = entry.path().join("artifact-inspections.json");
+    let inspection_source = input.join("artifact-inspections.json");
     let inspection_bytes = fs::read(&inspection_source)?;
     if inspection_bytes.len() > 1024 {
         bail!("Publisher Artifact 占位文件过大");
     }
     let inspection_destination = staging.join("artifact-inspections.json");
     fs::write(&inspection_destination, inspection_bytes)?;
-    let authorization_destination = staging.join("authorization.json");
-    fs::copy(&authorization_path, &authorization_destination)?;
+    let plan_destination = staging.join("release-plan.json");
+    fs::copy(&plan_path, &plan_destination)?;
     let manifest = ReleaseManifest {
         release_id: authorization.release_id,
         batch_id: authorization.batch_id,
         source_git_commit: authorization.source_git_commit,
         repository_name: authorization.repository_name,
-        writer_epoch: authorization.writer_epoch,
         artifacts: authorization.artifacts,
         evidence_files,
         removed_package_names: authorization.removed_package_names,
@@ -230,7 +196,7 @@ fn process_release(cli: &Cli, controller_key: &[u8], entry: &fs::DirEntry) -> an
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
         artifact_inspections: Some(file_entry(&inspection_destination)?),
-        release_authorization: Some(file_entry(&authorization_destination)?),
+        release_plan: Some(file_entry(&plan_destination)?),
         committed_at: Utc::now(),
     };
     fs::write(
@@ -352,7 +318,7 @@ fn find_reusable_package(cli: &Cli, artifact: &ArtifactRecord) -> anyhow::Result
 
 fn create_repository_keyring_package(
     cli: &Cli,
-    authorization: &ReleaseAuthorization,
+    authorization: &ReleasePlan,
     staging: &Path,
 ) -> anyhow::Result<ArtifactRecord> {
     let fingerprint = repository_fingerprint(cli)?;
@@ -484,11 +450,11 @@ fn repository_fingerprint(cli: &Cli) -> anyhow::Result<String> {
 
 fn validate_authorization(
     cli: &Cli,
-    authorization: &ReleaseAuthorization,
+    authorization: &ReleasePlan,
     root: &Path,
 ) -> anyhow::Result<()> {
     if authorization.expires_at < Utc::now() {
-        bail!("ReleaseAuthorization 已过期");
+        bail!("ReleasePlan 已过期");
     }
     if authorization.repository_name.is_empty()
         || !authorization
@@ -531,7 +497,7 @@ fn validate_authorization(
         package_names.insert(artifact.package_name.clone().unwrap_or_default());
     }
     if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
-        bail!("aursmith-keyring 是 Signer 生成的保留包名");
+        bail!("aursmith-keyring 是 Publisher 生成的保留包名");
     }
     if authorization.evidence_files.len() > 4096 {
         bail!("Release 证据文件数量超过上限");
@@ -598,7 +564,7 @@ fn copy_current_repository_databases(
 }
 
 fn expected_repository_packages(
-    authorization: &ReleaseAuthorization,
+    authorization: &ReleasePlan,
     repository_keyring: Option<&ArtifactRecord>,
 ) -> anyhow::Result<BTreeMap<String, (String, String)>> {
     let mut expected = BTreeMap::new();
@@ -837,7 +803,6 @@ mod tests {
             inbox: root.join("inbox"),
             output: root.join("output"),
             repository: root.join("repository"),
-            controller_key_hex: "00".repeat(32),
             gpg_private_key: root.join("unused"),
             gpg_home: root.join("gnupg"),
             keyring_refresh_days: 30,
@@ -866,32 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_release_does_not_abort_the_inbox_scan() {
-        let root = tempfile::tempdir().unwrap();
-        let inbox = root.path().join("inbox");
-        let output = root.path().join("output");
-        fs::create_dir_all(inbox.join("bad-release")).unwrap();
-        fs::create_dir_all(&output).unwrap();
-        fs::write(
-            inbox.join("bad-release/authorization.json"),
-            b"not valid json",
-        )
-        .unwrap();
-        let cli = Cli {
-            inbox,
-            output,
-            repository: root.path().join("repository"),
-            controller_key_hex: "00".repeat(32),
-            gpg_private_key: root.path().join("unused"),
-            gpg_home: root.path().join("gnupg"),
-            keyring_refresh_days: 30,
-        };
-
-        assert!(process_pending(&cli, &[0; 32]).is_ok());
-    }
-
-    #[test]
-    fn committed_release_is_skipped_before_reading_stale_authorization() {
+    fn committed_release_is_skipped_before_reading_stale_plan() {
         let root = tempfile::tempdir().unwrap();
         let release_id = Uuid::new_v4().to_string();
         let inbox = root.path().join("inbox");
@@ -899,7 +839,7 @@ mod tests {
         fs::create_dir_all(inbox.join(&release_id)).unwrap();
         fs::create_dir_all(output.join(&release_id)).unwrap();
         fs::write(
-            inbox.join(&release_id).join("authorization.json"),
+            inbox.join(&release_id).join("release-plan.json"),
             b"stale invalid authorization",
         )
         .unwrap();
@@ -908,17 +848,16 @@ mod tests {
             inbox,
             output,
             repository: root.path().join("repository"),
-            controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home: root.path().join("gnupg"),
             keyring_refresh_days: 30,
         };
 
-        assert!(process_release(&cli, &[0; 32], &entry).is_ok());
+        assert!(process_release_path(&cli, &entry.path()).is_ok());
     }
 
     #[test]
-    fn authorization_accepts_package_without_transferred_evidence() {
+    fn release_plan_accepts_package_without_transferred_evidence() {
         let root = tempfile::tempdir().unwrap();
         let package_root = tempfile::tempdir().unwrap();
         fs::write(
@@ -936,10 +875,9 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let authorization = ReleaseAuthorization {
+        let authorization = ReleasePlan {
             release_id: Uuid::new_v4(),
             batch_id: Uuid::new_v4(),
-            writer_epoch: 1,
             repository_name: "aursmith".into(),
             source_git_commit: "a".repeat(40),
             revision_sha256s: vec!["b".repeat(64)],
@@ -955,7 +893,6 @@ mod tests {
             evidence_files: vec![],
             removed_package_names: vec![],
             include_repository_keyring: true,
-            evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };
@@ -965,12 +902,11 @@ mod tests {
     }
 
     #[test]
-    fn authorization_rejects_traversal_before_running_tools() {
+    fn release_plan_rejects_traversal_before_running_tools() {
         let root = tempfile::tempdir().unwrap();
-        let authorization = ReleaseAuthorization {
+        let authorization = ReleasePlan {
             release_id: Uuid::new_v4(),
             batch_id: Uuid::new_v4(),
-            writer_epoch: 1,
             repository_name: "aursmith".into(),
             source_git_commit: "a".repeat(40),
             revision_sha256s: vec!["b".repeat(64)],
@@ -986,7 +922,6 @@ mod tests {
             evidence_files: vec![],
             removed_package_names: vec![],
             include_repository_keyring: true,
-            evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };
@@ -1084,15 +1019,13 @@ mod tests {
             inbox: root.path().join("inbox"),
             output: root.path().join("output"),
             repository: root.path().join("repository"),
-            controller_key_hex: "00".repeat(32),
             gpg_private_key: root.path().join("unused"),
             gpg_home,
             keyring_refresh_days: 30,
         };
-        let authorization = ReleaseAuthorization {
+        let authorization = ReleasePlan {
             release_id: Uuid::new_v4(),
             batch_id: Uuid::new_v4(),
-            writer_epoch: 1,
             repository_name: "aursmith".into(),
             source_git_commit: "abcdef1234567890".into(),
             revision_sha256s: vec![],
@@ -1101,7 +1034,6 @@ mod tests {
             evidence_files: vec![],
             removed_package_names: vec!["old-package".into()],
             include_repository_keyring: true,
-            evidence: Default::default(),
             issued_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(5),
         };
@@ -1148,7 +1080,6 @@ mod tests {
             batch_id: Uuid::new_v4(),
             source_git_commit: "a".repeat(40),
             repository_name: "aursmith".into(),
-            writer_epoch: 1,
             artifacts: vec![],
             evidence_files: vec![],
             removed_package_names: vec![],
@@ -1156,7 +1087,7 @@ mod tests {
             repository_database: placeholder.clone(),
             repository_files: placeholder,
             artifact_inspections: None,
-            release_authorization: None,
+            release_plan: None,
             committed_at: Utc::now(),
         };
         let manifest_path = release_root.join("release-manifest.json");

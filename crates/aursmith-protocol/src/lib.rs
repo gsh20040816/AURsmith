@@ -1,8 +1,6 @@
-mod envelope;
 mod path;
 mod payload;
 
-pub use envelope::{EnvelopeError, SignedEnvelope};
 pub use path::{PathPolicyError, validate_relative_path};
 pub use payload::*;
 

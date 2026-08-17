@@ -6,8 +6,6 @@ export DOCKER_GID="${DOCKER_GID:-996}"
 export AURSMITH_SECRET_GID="${AURSMITH_SECRET_GID:-1000}"
 export AURSMITH_JOBS_DIR="${AURSMITH_JOBS_DIR:-/var/lib/aursmith-builder/jobs}"
 export AURSMITH_PUBLIC_ORIGIN="https://aursmith.example.test"
-export AURSMITH_CONTROLLER_VERIFYING_KEY_HEX="${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000000}"
-export AURSMITH_TRANSFER_ENDPOINTS_JSON="${AURSMITH_TRANSFER_ENDPOINTS_JSON:-{\"00000000-0000-0000-0000-000000000001\":\"ssh://aursmith@192.0.2.10:2222\"}}"
 export AURSMITH_CONTROLLER_POLL_URL="${AURSMITH_CONTROLLER_POLL_URL:-https://controller.example.test/api/v1/builder/poll}"
 export AURSMITH_BUILDER_TOKEN_SHA256="${AURSMITH_BUILDER_TOKEN_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_REVERSE_PUBLISHER_ENDPOINT="${AURSMITH_REVERSE_PUBLISHER_ENDPOINT:-ssh://aursmith@192.0.2.20:2223}"
@@ -104,13 +102,8 @@ if [[ "$(jq '[.services.ssh.volumes[]? | select(.target == "/landing" and .sourc
   echo "Publisher SSH 必须只通过 Publisher landing 卷接收受限 Builder 推送" >&2
   exit 1
 fi
-if [[ "$(jq -r '.services.pacoloco.user // ""' <<<"${publisher_json}")" != "65532:65532" ]] \
-  || [[ "$(jq -r '.services.pacoloco.read_only // false' <<<"${publisher_json}")" != "true" ]]; then
-  echo "pacoloco 必须以固定无特权用户和只读根文件系统运行" >&2
-  exit 1
-fi
-if [[ "$(jq '[.services.pacoloco.volumes[]? | select(.target == "/var/cache/pacoloco" and .type == "volume")] | length' <<<"${publisher_json}")" != "1" ]]; then
-  echo "pacoloco 只能把持久写入放入独立缓存卷" >&2
+if jq -e '.services | has("pacoloco")' <<<"${publisher_json}" >/dev/null; then
+  echo "Publisher 不得部署 pacoloco" >&2
   exit 1
 fi
 

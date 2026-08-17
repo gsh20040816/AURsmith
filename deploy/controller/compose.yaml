@@ -16,23 +16,18 @@ services:
       AURSMITH_PUBLIC_ORIGIN: ${AURSMITH_PUBLIC_ORIGIN:?必须设置管理站点的固定 HTTPS Origin}
       AURSMITH_SESSION_IDLE_MINUTES: ${AURSMITH_SESSION_IDLE_MINUTES:-60}
       AURSMITH_SESSION_ABSOLUTE_HOURS: ${AURSMITH_SESSION_ABSOLUTE_HOURS:-168}
-      AURSMITH_SIGNING_KEY_FILE: /run/secrets/controller_signing_key
       AURSMITH_SSH_IDENTITY_SOURCE_FILE: /run/secrets/worker_ssh_key
       AURSMITH_SSH_IDENTITY_FILE: /run/aursmith-private/worker_ssh_key
       AURSMITH_SSH_KNOWN_HOSTS_FILE: /run/secrets/worker_known_hosts
       AURSMITH_LOW_AGENT_ENDPOINTS: http://agent-low-1:8090,http://agent-low-2:8090,http://agent-low-3:8090
       AURSMITH_HIGH_AGENT_ENDPOINT: http://agent-high:8090
-      AURSMITH_AGENT_DAILY_CALL_LIMIT: ${AURSMITH_AGENT_DAILY_CALL_LIMIT:-300}
-      AURSMITH_AGENT_MONTHLY_CALL_LIMIT: ${AURSMITH_AGENT_MONTHLY_CALL_LIMIT:-3000}
-      AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD: ${AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD:-5000000}
-      AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS: ${AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS:-0}
       AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
       AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
       AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
       AURSMITH_BUILDER_TOKEN_SHA256: ${AURSMITH_BUILDER_TOKEN_SHA256:?必须设置固定 Builder Bearer secret 的 SHA-256}
+      AURSMITH_PUBLISHER_ENDPOINT: ${AURSMITH_PUBLISHER_ENDPOINT:-ssh://aursmith@publisher-ssh:2222}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
-      - controller_signing_key
       - worker_ssh_key
       - worker_known_hosts
     volumes:
@@ -138,8 +133,6 @@ services:
     restart: unless-stopped
 
 secrets:
-  controller_signing_key:
-    file: ${AURSMITH_SIGNING_KEY_FILE:-./secrets/controller_signing_key}
   worker_ssh_key:
     file: ${AURSMITH_WORKER_SSH_KEY_FILE:-./secrets/worker_ssh_key}
   worker_known_hosts:

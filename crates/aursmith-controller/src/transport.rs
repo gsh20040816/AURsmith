@@ -1,5 +1,5 @@
 use crate::{config::Config, error::ApiError};
-use aursmith_protocol::SignedEnvelope;
+use aursmith_protocol::{BuilderUpload, ReleasePlan, ReleaseRollbackRequest};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{process::Stdio, time::Duration};
@@ -14,74 +14,30 @@ pub struct WorkerReply {
     pub data: Value,
 }
 
-pub async fn status(config: &Config, endpoint: &str) -> Result<WorkerReply, ApiError> {
-    invoke(config, endpoint, "status", None).await
-}
-
-pub async fn query(config: &Config, endpoint: &str, job_id: &str) -> Result<WorkerReply, ApiError> {
-    invoke(config, endpoint, &format!("query {job_id}"), None).await
-}
-
-pub async fn submit(
-    config: &Config,
-    endpoint: &str,
-    envelope: &SignedEnvelope,
-) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
-    invoke(config, endpoint, "submit", Some(body)).await
-}
-
-pub async fn authorize_export(
-    config: &Config,
-    endpoint: &str,
-    envelope: &SignedEnvelope,
-) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
-    invoke(config, endpoint, "authorize-export", Some(body)).await
-}
-
-pub async fn authorize_import(
-    config: &Config,
-    endpoint: &str,
-    envelope: &SignedEnvelope,
-) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
-    invoke(config, endpoint, "authorize-import", Some(body)).await
-}
-
 pub async fn prepare_push_import(
     config: &Config,
     endpoint: &str,
-    envelope: &SignedEnvelope,
+    upload: &BuilderUpload,
 ) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
+    let body = serde_json::to_vec(upload).map_err(ApiError::internal)?;
     invoke(config, endpoint, "prepare-push-import", Some(body)).await
-}
-
-pub async fn complete_export(
-    config: &Config,
-    endpoint: &str,
-    envelope: &SignedEnvelope,
-) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
-    invoke(config, endpoint, "complete-export", Some(body)).await
 }
 
 pub async fn authorize_release(
     config: &Config,
     endpoint: &str,
-    envelope: &SignedEnvelope,
+    plan: &ReleasePlan,
 ) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
+    let body = serde_json::to_vec(plan).map_err(ApiError::internal)?;
     invoke(config, endpoint, "authorize-release", Some(body)).await
 }
 
 pub async fn authorize_rollback(
     config: &Config,
     endpoint: &str,
-    envelope: &SignedEnvelope,
+    request: &ReleaseRollbackRequest,
 ) -> Result<WorkerReply, ApiError> {
-    let body = serde_json::to_vec(envelope).map_err(ApiError::internal)?;
+    let body = serde_json::to_vec(request).map_err(ApiError::internal)?;
     invoke(config, endpoint, "authorize-rollback", Some(body)).await
 }
 

@@ -1,5 +1,6 @@
 [package]
-name = "aursmith-signer"
+name = "aursmith-repository"
+description = "AURsmith Publisher repository assembly and signing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,14 +8,12 @@ rust-version.workspace = true
 autobins = false
 
 [lib]
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
 aursmith-protocol = { path = "../aursmith-protocol" }
 chrono.workspace = true
-clap.workspace = true
-ed25519-dalek.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

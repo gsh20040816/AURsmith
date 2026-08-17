@@ -37,9 +37,8 @@ async fn main() -> anyhow::Result<()> {
     let _ = cli.command;
 
     let database = db::connect(&config.database_url).await?;
-    let signing_key = config.load_signing_key()?;
     config.materialize_ssh_identity()?;
-    let state = routes::AppState::new(database, config.clone(), signing_key);
+    let state = routes::AppState::new(database, config.clone());
     scheduler::spawn(state.clone());
     let app = routes::router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_address)

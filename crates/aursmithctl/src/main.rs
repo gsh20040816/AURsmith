@@ -2,7 +2,6 @@ use anyhow::{Context, bail};
 use aursmith_domain::credentials;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sqlx::{
     SqlitePool,
@@ -70,13 +69,6 @@ enum Command {
         #[arg(long, default_value = "/etc/ssh/sshd_config")]
         config: PathBuf,
     },
-    /// 生成 Controller Ed25519 密钥；生产部署应直接写入私有文件，避免私钥经过终端。
-    GenerateControllerKey {
-        #[arg(long, requires = "public_key_file")]
-        private_key_file: Option<PathBuf>,
-        #[arg(long, requires = "private_key_file")]
-        public_key_file: Option<PathBuf>,
-    },
     /// 仅供 Publisher 的 rsync 固定 remote-shell 使用。
     RsyncSsh {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -102,60 +94,19 @@ enum AdminCommand {
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
     Status,
-    Drain,
-    Query {
-        job_id: String,
-    },
-    Submit {
-        envelope_file: PathBuf,
-    },
-    AurSearch {
-        query: String,
-    },
-    AurInfo {
-        names: Vec<String>,
-    },
-    AurProviders {
-        names: Vec<String>,
-    },
-    OfficialInfo {
-        names: Vec<String>,
-    },
+    Query { job_id: String },
+    AurSearch { query: String },
+    AurInfo { names: Vec<String> },
+    AurProviders { names: Vec<String> },
+    OfficialInfo { names: Vec<String> },
     PublisherDoctor,
-    AurSnapshot {
-        package_base: String,
-    },
-    AuthorizeExport {
-        envelope_file: PathBuf,
-    },
-    AuthorizeImport {
-        envelope_file: PathBuf,
-    },
-    PreparePushImport {
-        envelope_file: PathBuf,
-    },
-    FinalizePushImport {
-        envelope_file: PathBuf,
-    },
-    CompleteExport {
-        envelope_file: PathBuf,
-    },
-    AuthorizeRelease {
-        envelope_file: PathBuf,
-    },
-    AuthorizeRollback {
-        envelope_file: PathBuf,
-    },
-    QueryRelease {
-        release_id: String,
-    },
-    ReleaseFiles {
-        release_id: String,
-    },
-    Inventory {
-        #[arg(long)]
-        full_digest: bool,
-    },
+    AurSnapshot { package_base: String },
+    PreparePushImport { envelope_file: PathBuf },
+    FinalizePushImport { envelope_file: PathBuf },
+    AuthorizeRelease { envelope_file: PathBuf },
+    AuthorizeRollback { envelope_file: PathBuf },
+    QueryRelease { release_id: String },
+    ReleaseFiles { release_id: String },
 }
 
 #[tokio::main]
@@ -186,16 +137,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Worker { socket, command } => {
             let request = match command {
                 WorkerCommand::Status => json!({"command": "status"}),
-                WorkerCommand::Drain => json!({"command": "drain"}),
                 WorkerCommand::Query { job_id } => json!({"command": "query", "job_id": job_id}),
-                WorkerCommand::Submit { envelope_file } => {
-                    let bytes = tokio::fs::read(&envelope_file)
-                        .await
-                        .with_context(|| format!("无法读取 {}", envelope_file.display()))?;
-                    let envelope: Value =
-                        serde_json::from_slice(&bytes).context("Envelope 文件不是有效 JSON")?;
-                    json!({"command": "submit", "envelope": envelope})
-                }
                 WorkerCommand::AurSearch { query } => {
                     json!({"command": "aur_search", "query": query})
                 }
@@ -212,16 +154,6 @@ async fn main() -> anyhow::Result<()> {
                 WorkerCommand::AurSnapshot { package_base } => {
                     json!({"command": "aur_snapshot", "package_base": package_base})
                 }
-                WorkerCommand::AuthorizeExport { envelope_file } => {
-                    let bytes = tokio::fs::read(&envelope_file).await?;
-                    let envelope: Value = serde_json::from_slice(&bytes)?;
-                    json!({"command": "authorize_export", "envelope": envelope})
-                }
-                WorkerCommand::AuthorizeImport { envelope_file } => {
-                    let bytes = tokio::fs::read(&envelope_file).await?;
-                    let envelope: Value = serde_json::from_slice(&bytes)?;
-                    json!({"command": "authorize_import", "envelope": envelope})
-                }
                 WorkerCommand::PreparePushImport { envelope_file } => {
                     let bytes = tokio::fs::read(&envelope_file).await?;
                     let envelope: Value = serde_json::from_slice(&bytes)?;
@@ -231,11 +163,6 @@ async fn main() -> anyhow::Result<()> {
                     let bytes = tokio::fs::read(&envelope_file).await?;
                     let envelope: Value = serde_json::from_slice(&bytes)?;
                     json!({"command": "finalize_push_import", "envelope": envelope})
-                }
-                WorkerCommand::CompleteExport { envelope_file } => {
-                    let bytes = tokio::fs::read(&envelope_file).await?;
-                    let envelope: Value = serde_json::from_slice(&bytes)?;
-                    json!({"command": "complete_export", "envelope": envelope})
                 }
                 WorkerCommand::AuthorizeRelease { envelope_file } => {
                     let bytes = tokio::fs::read(&envelope_file).await?;
@@ -252,9 +179,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 WorkerCommand::ReleaseFiles { release_id } => {
                     json!({"command": "release_files", "release_id": release_id})
-                }
-                WorkerCommand::Inventory { full_digest } => {
-                    json!({"command": "inventory", "full_digest": full_digest})
                 }
             };
             let response = worker_request(&socket, request).await?;
@@ -276,10 +200,6 @@ async fn main() -> anyhow::Result<()> {
             &private_directory,
             &config,
         )?,
-        Command::GenerateControllerKey {
-            private_key_file,
-            public_key_file,
-        } => generate_controller_key(private_key_file.as_deref(), public_key_file.as_deref())?,
         Command::RsyncSsh { arguments } => rsync_ssh(arguments)?,
     }
     Ok(())
@@ -698,23 +618,6 @@ mod tests {
         assert!(!jobs_directory_usable(Path::new("relative/jobs")));
     }
 
-    #[test]
-    fn controller_key_can_be_written_without_printing_the_private_value() {
-        let directory = tempfile::tempdir().unwrap();
-        let private = directory.path().join("controller.key");
-        let public = directory.path().join("controller.pub");
-        generate_controller_key(Some(&private), Some(&public)).unwrap();
-        let private_value = fs::read_to_string(&private).unwrap();
-        let public_value = fs::read_to_string(&public).unwrap();
-        assert_eq!(private_value.trim().len(), 64);
-        assert_eq!(public_value.trim().len(), 64);
-        assert_eq!(
-            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(generate_controller_key(Some(&private), Some(&public)).is_err());
-    }
-
     #[tokio::test]
     async fn local_admin_commands_enforce_one_administrator_and_revoke_sessions() {
         let directory = tempfile::tempdir().unwrap();
@@ -819,56 +722,6 @@ mod tests {
     }
 }
 
-fn generate_controller_key(
-    private_key_file: Option<&Path>,
-    public_key_file: Option<&Path>,
-) -> anyhow::Result<()> {
-    let mut secret = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .context("无法打开系统随机源")?
-        .read_exact(&mut secret)
-        .context("无法从系统随机源读取密钥")?;
-    let signing_key = SigningKey::from_bytes(&secret);
-    let private_key_hex = hex::encode(secret);
-    let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
-    match (private_key_file, public_key_file) {
-        (Some(private_path), Some(public_path)) => {
-            write_new_file(private_path, private_key_hex.as_bytes(), 0o600)?;
-            write_new_file(public_path, public_key_hex.as_bytes(), 0o644)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "private_key_file": private_path,
-                    "public_key_file": public_path,
-                    "public_key_hex": public_key_hex,
-                }))?
-            );
-        }
-        (None, None) => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "private_key_hex": private_key_hex,
-                "public_key_hex": public_key_hex,
-            }))?
-        ),
-        _ => bail!("必须同时提供私钥与公钥输出文件"),
-    }
-    Ok(())
-}
-
-fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .with_context(|| format!("无法创建 {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
-}
-
 async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
     let original = env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
     let parts: Vec<_> = original.split_ascii_whitespace().collect();
@@ -877,32 +730,17 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
     }
     let request = match parts.as_slice() {
         ["status"] => json!({"command": "status"}),
-        ["drain"] => json!({"command": "drain"}),
         ["query", job_id] if uuid_like(job_id) => json!({"command": "query", "job_id": job_id}),
-        ["submit"] => {
-            let mut bytes = Vec::new();
-            tokio::io::stdin()
-                .take(4 * 1024 * 1024)
-                .read_to_end(&mut bytes)
-                .await
-                .context("读取 JobSpec Envelope 失败")?;
-            let envelope: Value =
-                serde_json::from_slice(&bytes).context("JobSpec Envelope 不是有效 JSON")?;
-            json!({"command": "submit", "envelope": envelope})
-        }
         ["aur-search"] => read_limited_json_command("aur_search").await?,
         ["aur-info"] => read_limited_json_command("aur_info").await?,
         ["aur-providers"] => read_limited_json_command("aur_providers").await?,
         ["official-info"] => read_limited_json_command("official_info").await?,
         ["publisher-doctor"] => json!({"command": "publisher_doctor"}),
         ["aur-snapshot"] => read_limited_json_command("aur_snapshot").await?,
-        ["authorize-export"]
-        | ["authorize-import"]
-        | ["prepare-push-import"]
+        ["prepare-push-import"]
         | ["finalize-push-import"]
         | ["authorize-release"]
-        | ["authorize-rollback"]
-        | ["complete-export"] => {
+        | ["authorize-rollback"] => {
             let mut bytes = Vec::new();
             tokio::io::stdin()
                 .take(4 * 1024 * 1024)
@@ -913,11 +751,8 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
                 serde_json::from_slice(&bytes).context("签名授权 Envelope 不是有效 JSON")?;
             json!({
                 "command": match parts[0] {
-                    "authorize-export" => "authorize_export",
-                    "authorize-import" => "authorize_import",
                     "prepare-push-import" => "prepare_push_import",
                     "finalize-push-import" => "finalize_push_import",
-                    "complete-export" => "complete_export",
                     "authorize-rollback" => "authorize_rollback",
                     _ => "authorize_release",
                 },
@@ -940,8 +775,6 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
                 "release_id": release_id
             })
         }
-        ["inventory"] => json!({"command": "inventory", "full_digest": false}),
-        ["inventory", "--full-digest"] => json!({"command": "inventory", "full_digest": true}),
         _ => bail!("SSH 命令未被允许"),
     };
     let response = worker_request(socket, request).await?;

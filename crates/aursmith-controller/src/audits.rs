@@ -1,8 +1,4 @@
-use crate::{
-    auth,
-    error::ApiError,
-    routes::{AppState, append_event_in_transaction},
-};
+use crate::{auth, error::ApiError, routes::AppState};
 use aursmith_domain::{AgentVerdict, AuditDecision, LowCostRoute};
 use axum::{
     Json,
@@ -46,13 +42,6 @@ pub async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
     };
     let run_id: String = row.get("id");
     let bundle_sha256: String = row.get("audit_bundle_sha256");
-    if !budget_available(state).await? {
-        sqlx::query("UPDATE agent_runs SET status = 'failed', verdict = 'error', raw_output_json = ?, finished_at = ? WHERE audit_bundle_sha256 = ? AND status = 'pending'")
-            .bind(json!({"error": "AGENT_BUDGET_EXCEEDED"}).to_string()).bind(Utc::now()).bind(&bundle_sha256)
-            .execute(&state.database).await.map_err(ApiError::internal)?;
-        finalize(state, &bundle_sha256, AuditDecision::ManualReview).await?;
-        return Ok(());
-    }
     let claimed = sqlx::query("UPDATE agent_runs SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'")
         .bind(Utc::now()).bind(&run_id).execute(&state.database).await.map_err(ApiError::internal)?;
     if claimed.rows_affected() == 0 {
@@ -135,42 +124,6 @@ pub async fn reconcile_completed(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn budget_available(state: &AppState) -> Result<bool, ApiError> {
-    let daily: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_runs WHERE started_at >= datetime('now', 'start of day')",
-    )
-    .fetch_one(&state.database)
-    .await
-    .map_err(ApiError::internal)?;
-    let monthly: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_runs WHERE started_at >= datetime('now', 'start of month')",
-    )
-    .fetch_one(&state.database)
-    .await
-    .map_err(ApiError::internal)?;
-    let monthly_cost: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(cost_microusd), 0) FROM agent_runs WHERE started_at >= datetime('now', 'start of month')")
-        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
-    let daily_limit = crate::routes::effective_i64_setting(
-        state,
-        "agent_daily_call_limit",
-        state.config.agent_daily_call_limit,
-    )
-    .await?;
-    let monthly_limit = crate::routes::effective_i64_setting(
-        state,
-        "agent_monthly_call_limit",
-        state.config.agent_monthly_call_limit,
-    )
-    .await?;
-    let monthly_cost_limit = crate::routes::effective_i64_setting(
-        state,
-        "agent_monthly_cost_limit_microusd",
-        state.config.agent_monthly_cost_limit_microusd,
-    )
-    .await?;
-    Ok(daily < daily_limit && monthly < monthly_limit && monthly_cost < monthly_cost_limit)
-}
-
 async fn invoke_runner(endpoint: &str, request: &Value) -> Result<RunnerResponse, String> {
     let url = format!("{}/v1/audit", endpoint.trim_end_matches('/'));
     let response = reqwest::Client::builder()
@@ -227,13 +180,24 @@ async fn record_failure(
     sqlx::query("UPDATE agent_runs SET status = 'failed', verdict = 'error', raw_output_json = ?, finished_at = ? WHERE id = ?")
         .bind(json!({"error": error}).to_string()).bind(Utc::now()).bind(run_id)
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    if attempt % 2 == 0 {
+    if transient_agent_error(error) && attempt.rem_euclid(3) != 2 {
         sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES (?, ?, ?, ?, ?, 'unconfigured', 'unconfigured', 'v1', 'v1', 'pending')")
             .bind(Uuid::new_v4().to_string()).bind(bundle).bind(tier).bind(slot).bind(attempt + 1)
             .execute(&state.database).await.map_err(ApiError::internal)?;
         return Ok(());
     }
     evaluate(state, bundle, tier).await
+}
+
+fn transient_agent_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    ["timeout", "timed out", "connection", "dns"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || [408_u16, 429]
+            .into_iter()
+            .chain(500..=599)
+            .any(|status| lower.contains(&format!("http {status}")))
 }
 
 async fn evaluate(state: &AppState, bundle: &str, tier: &str) -> Result<(), ApiError> {
@@ -266,19 +230,7 @@ async fn evaluate(state: &AppState, bundle: &str, tier: &str) -> Result<(), ApiE
             };
     }
     match LowCostRoute::from_verdicts(verdicts) {
-        LowCostRoute::Approved => {
-            let basis_points = crate::routes::effective_i64_setting(
-                state,
-                "agent_random_high_cost_review_basis_points",
-                state.config.agent_random_high_cost_review_basis_points,
-            )
-            .await?;
-            if random_high_cost_review_selected(bundle, basis_points) {
-                schedule_high_cost(state, bundle).await?;
-            } else {
-                finalize(state, bundle, AuditDecision::ApprovedByLowCost).await?;
-            }
-        }
+        LowCostRoute::Approved => finalize(state, bundle, AuditDecision::ApprovedByLowCost).await?,
         LowCostRoute::EscalateHighCost => schedule_high_cost(state, bundle).await?,
         LowCostRoute::ManualReview => finalize(state, bundle, AuditDecision::ManualReview).await?,
     }
@@ -302,22 +254,8 @@ async fn schedule_high_cost(state: &AppState, bundle: &str) -> Result<(), ApiErr
 fn next_attempt_generation(maximum: Option<i64>) -> i64 {
     match maximum {
         None => 0,
-        Some(value) if value % 2 == 0 => value + 2,
-        Some(value) => value + 1,
+        Some(value) => value + (3 - value.rem_euclid(3)),
     }
-}
-
-fn random_high_cost_review_selected(bundle: &str, basis_points: i64) -> bool {
-    let basis_points = basis_points.clamp(0, 10_000) as u64;
-    if basis_points == 0 {
-        return false;
-    }
-    if basis_points == 10_000 {
-        return true;
-    }
-    let digest = Sha256::digest(bundle.as_bytes());
-    let bucket = u64::from_be_bytes(digest[..8].try_into().unwrap()) % 10_000;
-    bucket < basis_points
 }
 
 async fn finalize(state: &AppState, bundle: &str, decision: AuditDecision) -> Result<(), ApiError> {
@@ -483,7 +421,7 @@ pub async fn retry(
     headers: HeaderMap,
     Path(bundle): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
+    auth::require_administrator(&state, &headers).await?;
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     let row = sqlx::query("SELECT revision_id, state FROM audit_bundles WHERE sha256 = ?")
         .bind(&bundle)
@@ -548,15 +486,6 @@ pub async fn retry(
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
-    append_event_in_transaction(
-        &mut transaction,
-        "revision",
-        &revision_id,
-        "audit_retried",
-        json!({"bundle_sha256": bundle, "attempts": attempts}),
-        &actor,
-    )
-    .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     Ok(Json(json!({
         "bundle_sha256": bundle,
@@ -598,12 +527,21 @@ mod tests {
     }
 
     #[test]
-    fn retry_starts_a_new_two_attempt_generation() {
+    fn retry_starts_a_new_three_attempt_generation() {
         assert_eq!(next_attempt_generation(None), 0);
-        assert_eq!(next_attempt_generation(Some(0)), 2);
-        assert_eq!(next_attempt_generation(Some(1)), 2);
-        assert_eq!(next_attempt_generation(Some(2)), 4);
-        assert_eq!(next_attempt_generation(Some(3)), 4);
+        assert_eq!(next_attempt_generation(Some(0)), 3);
+        assert_eq!(next_attempt_generation(Some(1)), 3);
+        assert_eq!(next_attempt_generation(Some(2)), 3);
+        assert_eq!(next_attempt_generation(Some(3)), 6);
+    }
+
+    #[test]
+    fn only_transient_agent_failures_are_retryable() {
+        assert!(transient_agent_error("Runner HTTP 429：rate limited"));
+        assert!(transient_agent_error("Runner HTTP 503：unavailable"));
+        assert!(transient_agent_error("connection timed out"));
+        assert!(!transient_agent_error("Runner HTTP 401：bad credential"));
+        assert!(!transient_agent_error("结果文件不符合 Schema"));
     }
 
     async fn fixture(verdicts: [&str; 3]) -> AppState {
@@ -622,7 +560,6 @@ mod tests {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             public_origin: "https://aursmith.test".into(),
-            signing_key_file: "/不存在".into(),
             ssh_identity_source_file: "/不存在".into(),
             ssh_identity_file: "/不存在".into(),
             ssh_known_hosts_file: "/不存在".into(),
@@ -630,20 +567,13 @@ mod tests {
             session_absolute_hours: 1,
             low_agent_endpoints: vec![],
             high_agent_endpoint: String::new(),
-            agent_daily_call_limit: 300,
-            agent_monthly_call_limit: 3000,
-            agent_monthly_cost_limit_microusd: 5_000_000,
-            agent_random_high_cost_review_basis_points: 0,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
             builder_token_sha256: crate::auth::sha256("test-builder-token"),
+            publisher_endpoint: "ssh://publisher.test:22".into(),
         };
-        AppState::new(
-            database,
-            config,
-            ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-        )
+        AppState::new(database, config)
     }
 
     #[tokio::test]
@@ -674,30 +604,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(high_runs, 1);
-    }
-
-    #[tokio::test]
-    async fn opted_in_random_review_escalates_three_approvals() {
-        let state = fixture(["approve", "approve", "approve"]).await;
-        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('agent_random_high_cost_review_basis_points', '10000', ?)")
-            .bind(Utc::now()).execute(&state.database).await.unwrap();
-        evaluate(&state, &"c".repeat(64), "low").await.unwrap();
-        let high_runs: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE tier = 'high'")
-                .fetch_one(&state.database)
-                .await
-                .unwrap();
-        assert_eq!(high_runs, 1);
-    }
-
-    #[test]
-    fn random_review_boundaries_are_deterministic() {
-        assert!(!random_high_cost_review_selected(&"a".repeat(64), 0));
-        assert!(random_high_cost_review_selected(&"a".repeat(64), 10_000));
-        assert_eq!(
-            random_high_cost_review_selected(&"a".repeat(64), 1234),
-            random_high_cost_review_selected(&"a".repeat(64), 1234)
-        );
     }
 
     #[tokio::test]
@@ -734,13 +640,5 @@ mod tests {
             .unwrap();
         assert_eq!(decisions, 1);
         assert_eq!(actions, 1);
-    }
-
-    #[tokio::test]
-    async fn exhausted_budget_is_not_available() {
-        let state = fixture(["approve", "approve", "approve"]).await;
-        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('agent_daily_call_limit', '0', ?)")
-            .bind(Utc::now()).execute(&state.database).await.unwrap();
-        assert!(!budget_available(&state).await.unwrap());
     }
 }

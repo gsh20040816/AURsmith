@@ -9,7 +9,6 @@ pub struct Config {
     pub bind_address: String,
     pub database_url: String,
     pub public_origin: String,
-    pub signing_key_file: String,
     pub ssh_identity_source_file: String,
     pub ssh_identity_file: String,
     pub ssh_known_hosts_file: String,
@@ -17,14 +16,11 @@ pub struct Config {
     pub session_absolute_hours: i64,
     pub low_agent_endpoints: Vec<String>,
     pub high_agent_endpoint: String,
-    pub agent_daily_call_limit: i64,
-    pub agent_monthly_call_limit: i64,
-    pub agent_monthly_cost_limit_microusd: i64,
-    pub agent_random_high_cost_review_basis_points: i64,
     pub repository_name: String,
     pub source_git_commit: String,
     pub repository_base_url: String,
     pub builder_token_sha256: String,
+    pub publisher_endpoint: String,
 }
 
 impl Config {
@@ -59,8 +55,6 @@ impl Config {
             database_url: env::var("AURSMITH_DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://runtime/controller.db".into()),
             public_origin,
-            signing_key_file: env::var("AURSMITH_SIGNING_KEY_FILE")
-                .unwrap_or_else(|_| "/run/secrets/controller_signing_key".into()),
             ssh_identity_source_file: env::var("AURSMITH_SSH_IDENTITY_SOURCE_FILE")
                 .unwrap_or_else(|_| "/run/secrets/worker_ssh_key".into()),
             ssh_identity_file: env::var("AURSMITH_SSH_IDENTITY_FILE")
@@ -77,17 +71,6 @@ impl Config {
                 .map(str::to_owned)
                 .collect(),
             high_agent_endpoint: env::var("AURSMITH_HIGH_AGENT_ENDPOINT").unwrap_or_default(),
-            agent_daily_call_limit: parse_nonnegative("AURSMITH_AGENT_DAILY_CALL_LIMIT", 300),
-            agent_monthly_call_limit: parse_nonnegative("AURSMITH_AGENT_MONTHLY_CALL_LIMIT", 3000),
-            agent_monthly_cost_limit_microusd: parse_nonnegative(
-                "AURSMITH_AGENT_MONTHLY_COST_LIMIT_MICROUSD",
-                5_000_000,
-            ),
-            agent_random_high_cost_review_basis_points: parse_bounded_nonnegative(
-                "AURSMITH_AGENT_RANDOM_HIGH_COST_REVIEW_BASIS_POINTS",
-                0,
-                10_000,
-            ),
             repository_name: env::var("AURSMITH_REPOSITORY_NAME")
                 .unwrap_or_else(|_| "aursmith".into()),
             source_git_commit: env::var("AURSMITH_SOURCE_GIT_COMMIT")
@@ -95,17 +78,9 @@ impl Config {
             repository_base_url: env::var("AURSMITH_REPOSITORY_BASE_URL")
                 .unwrap_or_else(|_| "https://repo.aursmith.lan".into()),
             builder_token_sha256: builder_token_sha256.to_ascii_lowercase(),
+            publisher_endpoint: env::var("AURSMITH_PUBLISHER_ENDPOINT")
+                .context("必须设置固定 Publisher SSH 端点：AURSMITH_PUBLISHER_ENDPOINT")?,
         })
-    }
-
-    pub fn load_signing_key(&self) -> anyhow::Result<ed25519_dalek::SigningKey> {
-        let value = fs::read_to_string(&self.signing_key_file)
-            .with_context(|| format!("无法读取 Controller 签名密钥 {}", self.signing_key_file))?;
-        let bytes = hex::decode(value.trim()).context("Controller 签名密钥不是十六进制")?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Controller 签名密钥必须是 32 字节"))?;
-        Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
     }
 
     pub fn materialize_ssh_identity(&self) -> anyhow::Result<()> {
@@ -130,18 +105,6 @@ impl Config {
             .with_context(|| format!("无法同步私有 SSH 密钥 {}", target.display()))?;
         Ok(())
     }
-}
-
-fn parse_nonnegative(name: &str, default: i64) -> i64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 0)
-        .unwrap_or(default)
-}
-
-fn parse_bounded_nonnegative(name: &str, default: i64, maximum: i64) -> i64 {
-    parse_nonnegative(name, default).min(maximum)
 }
 
 fn parse_bounded_positive(name: &str, default: i64, maximum: i64) -> anyhow::Result<i64> {

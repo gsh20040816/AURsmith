@@ -8,8 +8,6 @@ rust-version.workspace = true
 [dependencies]
 aursmith-domain = { path = "../aursmith-domain" }
 chrono.workspace = true
-ciborium.workspace = true
-ed25519-dalek.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,12 +1,12 @@
 # AURsmith
 
-AURsmith 是面向少量 Arch Linux 客户端的私有、可审计 AUR 二进制仓库。它持续跟踪用户订阅的 AUR 软件包，审计不可变修订，在普通联网 Docker 容器中构建，发布经过签名的 pacman 仓库，并独立归档历史 Release。
+AURsmith 是供一个管理员和少量 Arch Linux 客户端使用的私有 AUR 二进制仓库。它跟踪明确订阅的 AUR pkgbase，固定包装层 commit，经三个 low Agent 和按需 high Agent 审查后，在家庭 Builder 的一次性联网 Docker 容器中构建，并由公网 Publisher 直接签名为 pacman 仓库。
 
-系统第一版拆分为 Controller、Builder 和 Publisher 三套 Docker Compose Stack；外部 Archiver 保留为可选扩展。任何 AURsmith 服务都不会直接部署到宿主机。
+真实拓扑固定为两台设备：公网设备运行 Controller、Web、Publisher、三个 low Runner、一个 high Runner和 credential gateway；家庭设备只运行一个主动轮询的 Builder。项目不提供多 Worker、独立 Signer、Archiver、告警平台或内置备份服务。
 
-规范性需求位于 `docs/requirements.md`。只有当一个需求 ID 具备实现、自动化测试或明确的人工验证记录时，才能标记为完成。
+本轮权威需求位于 `docs/refactor-requirements.md`，当前架构、部署和验证边界分别见 `docs/architecture.md`、`docs/deployment.md` 和 `docs/verification.md`。
 
-开发和发布全过程使用 Git 管理：验证通过的改动按阶段形成小型提交并直接进入 `main`，每个发布版本记录产生它的准确源码 commit。
+开发和部署使用 Git 管理；生产镜像以准确源码 commit 写入 OCI revision label。
 
 ## 公网入口
 

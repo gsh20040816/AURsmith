@@ -18,8 +18,8 @@ trap cleanup EXIT
 cargo build --locked -p aursmith-worker -p aursmithctl
 
 install -d -m 0700 "${runtime_directory}/key-home" "${runtime_directory}/publisher-gpg"
-install -d "${runtime_directory}/landing" "${runtime_directory}/signer-inbox" \
-  "${runtime_directory}/signer-output" "${runtime_directory}/repository" \
+install -d "${runtime_directory}/landing" "${runtime_directory}/staging" \
+  "${runtime_directory}/repository" \
   "${runtime_directory}/jobs" "${runtime_directory}/archive"
 gpg --homedir "${runtime_directory}/key-home" --batch --passphrase '' \
   --quick-generate-key 'AURsmith upstream smoke' ed25519 sign 1d >/dev/null 2>&1
@@ -31,12 +31,10 @@ AURSMITH_WORKER_NAME=publisher-smoke \
 AURSMITH_WORKER_ROLE=publisher \
 AURSMITH_WORKER_SOCKET="${runtime_directory}/worker.sock" \
 AURSMITH_WORKER_DATABASE="sqlite://${runtime_directory}/worker.db" \
-AURSMITH_CONTROLLER_VERIFYING_KEY_HEX=0000000000000000000000000000000000000000000000000000000000000000 \
  AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE="${runtime_directory}/repository-public-key.gpg" \
  AURSMITH_PUBLISHER_GPG_HOME="${runtime_directory}/publisher-gpg" \
  AURSMITH_LANDING_DIR="${runtime_directory}/landing" \
- AURSMITH_SIGNER_INBOX="${runtime_directory}/signer-inbox" \
- AURSMITH_SIGNER_OUTPUT="${runtime_directory}/signer-output" \
+ AURSMITH_PUBLISHER_STAGING_DIR="${runtime_directory}/staging" \
  AURSMITH_REPOSITORY_DIR="${runtime_directory}/repository" \
  AURSMITH_JOBS_DIR="${runtime_directory}/jobs" \
  AURSMITH_ARCHIVE_DIR="${runtime_directory}/archive" \

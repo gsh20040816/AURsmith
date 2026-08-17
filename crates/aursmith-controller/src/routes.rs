@@ -10,7 +10,6 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use chrono::Utc;
-use ed25519_dalek::SigningKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(test)]
@@ -28,15 +27,13 @@ use uuid::Uuid;
 pub struct AppState {
     pub database: SqlitePool,
     pub config: Arc<Config>,
-    pub signing_key: Arc<SigningKey>,
 }
 
 impl AppState {
-    pub fn new(database: SqlitePool, config: Config, signing_key: SigningKey) -> Self {
+    pub fn new(database: SqlitePool, config: Config) -> Self {
         Self {
             database,
             config: Arc::new(config),
-            signing_key: Arc::new(signing_key),
         }
     }
 }
@@ -122,22 +119,6 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "service": "controller", "version": env!("CARGO_PKG_VERSION")}))
 }
 
-pub(crate) async fn effective_i64_setting(
-    state: &AppState,
-    key: &str,
-    default: i64,
-) -> Result<i64, ApiError> {
-    let value: Option<String> =
-        sqlx::query_scalar("SELECT value_json FROM system_settings WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&state.database)
-            .await
-            .map_err(ApiError::internal)?;
-    value.map_or(Ok(default), |value| {
-        serde_json::from_str(&value).map_err(ApiError::internal)
-    })
-}
-
 async fn client_bootstrap(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -184,33 +165,26 @@ async fn doctor_status(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let workers = sqlx::query("SELECT id, name, role, state, endpoint, status_json, clock_skew_seconds, last_seen_at FROM workers ORDER BY role, name")
-        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let mut checks = Vec::new();
-    for role in ["builder", "publisher"] {
-        let online = workers
-            .iter()
-            .filter(|row| {
-                row.get::<String, _>("role") == role && row.get::<String, _>("state") == "online"
-            })
-            .count();
-        checks.push(json!({"id": format!("worker-{role}"), "ok": online > 0, "message": format!("{role} 在线实例：{online}")}));
-    }
-    for row in &workers {
-        let status = row
-            .get::<Option<String>, _>("status_json")
-            .and_then(|value| serde_json::from_str::<Value>(&value).ok())
-            .unwrap_or(Value::Null);
-        let available = status["storage"]["available_percent"].as_u64();
-        let skew = row.get::<Option<i64>, _>("clock_skew_seconds");
-        checks.push(json!({
-            "id": format!("worker-health-{}", row.get::<String,_>("id")),
-            "ok": row.get::<String,_>("state") == "online"
-                && available.is_none_or(|value| value >= 10)
-                && skew.is_none_or(|value| value.unsigned_abs() <= 60),
-            "message": format!("{}：状态 {}，可用空间 {}%，时钟偏差 {} 秒", row.get::<String,_>("name"), row.get::<String,_>("state"), available.map(|value| value.to_string()).unwrap_or_else(|| "未知".into()), skew.map(|value| value.to_string()).unwrap_or_else(|| "未知".into())),
-        }));
-    }
+    let builder = sqlx::query("SELECT last_seen_at, status_json FROM builder_runtime WHERE id = 1")
+        .fetch_optional(&state.database)
+        .await
+        .map_err(ApiError::internal)?;
+    let builder_recent = builder.as_ref().is_some_and(|row| {
+        row.get::<Option<chrono::DateTime<Utc>>, _>("last_seen_at")
+            .is_some_and(|last_poll| last_poll >= Utc::now() - chrono::Duration::minutes(2))
+    });
+    let builder_status = builder
+        .as_ref()
+        .and_then(|row| row.get::<Option<String>, _>("status_json"))
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .unwrap_or(Value::Null);
+    let available = builder_status["storage"]["available_percent"].as_u64();
+    checks.push(json!({
+        "id": "builder-poll",
+        "ok": builder_recent && available.is_none_or(|value| value >= 10),
+        "message": format!("Builder 最近轮询：{}，可用空间：{}%", if builder_recent { "正常" } else { "超过 2 分钟" }, available.map(|value| value.to_string()).unwrap_or_else(|| "未知".into())),
+    }));
     let fingerprint_ready: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM system_settings WHERE key = 'repository_gpg_fingerprint'",
     )
@@ -247,30 +221,23 @@ async fn doctor_status(
             .await,
         );
     }
-    let publisher_endpoint = workers
-        .iter()
-        .find(|row| {
-            row.get::<String, _>("role") == "publisher" && row.get::<String, _>("state") == "online"
-        })
-        .map(|row| row.get::<String, _>("endpoint"));
-    if let Some(endpoint) = publisher_endpoint {
-        match crate::transport::publisher_doctor(&state.config, &endpoint).await {
-            Ok(reply) if reply.ok => {
-                for name in ["aur"] {
-                    let check = &reply.data["checks"][name];
-                    checks.push(json!({
-                        "id": format!("publisher-{name}"),
-                        "ok": check["ok"].as_bool().unwrap_or(false),
-                        "message": check["message"].as_str().unwrap_or("Publisher Doctor 返回字段无效")
-                    }));
-                }
+    match crate::transport::publisher_doctor(&state.config, &state.config.publisher_endpoint).await
+    {
+        Ok(reply) if reply.ok => {
+            for name in ["aur"] {
+                let check = &reply.data["checks"][name];
+                checks.push(json!({
+                    "id": format!("publisher-{name}"),
+                    "ok": check["ok"].as_bool().unwrap_or(false),
+                    "message": check["message"].as_str().unwrap_or("Publisher Doctor 返回字段无效")
+                }));
             }
-            Ok(reply) => checks
-                .push(json!({"id": "publisher-upstream", "ok": false, "message": reply.message})),
-            Err(error) => checks.push(
-                json!({"id": "publisher-upstream", "ok": false, "message": error.to_string()}),
-            ),
         }
+        Ok(reply) => {
+            checks.push(json!({"id": "publisher-upstream", "ok": false, "message": reply.message}))
+        }
+        Err(error) => checks
+            .push(json!({"id": "publisher-upstream", "ok": false, "message": error.to_string()})),
     }
     let ready = checks.iter().all(|check| check["ok"] == true);
     Ok(Json(
@@ -409,28 +376,20 @@ async fn builder_poll(
             "Builder 轮询时间戳已过期",
         ));
     }
-    let worker = sqlx::query(
-        "SELECT id FROM workers WHERE role = 'builder' AND connection_mode = 'reverse' ORDER BY created_at LIMIT 1",
-    )
-    .fetch_optional(&state.database)
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| ApiError::not_found("固定 Builder 尚未初始化"))?;
-    let worker_id = Uuid::parse_str(worker.get("id")).map_err(ApiError::internal)?;
     let mut acknowledged_attempts = Vec::new();
     for report in poll.attempts {
-        let result = sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) SELECT ?, id, ?, ? FROM jobs WHERE id = ? AND worker_id = ? ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
-            .bind(worker_id.to_string()).bind(report.response.to_string())
-            .bind(Utc::now()).bind(report.job_id.to_string()).bind(worker_id.to_string())
+        let result = sqlx::query("INSERT INTO builder_reports(job_id, response_json, updated_at) SELECT id, ?, ? FROM jobs WHERE id = ? ON CONFLICT(job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
+            .bind(report.response.to_string())
+            .bind(Utc::now()).bind(report.job_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
         if result.rows_affected() > 0 {
             acknowledged_attempts.push(report.job_id);
         }
     }
     for capability_id in poll.completed_transfers {
-        sqlx::query("UPDATE transfer_capabilities SET state = 'verified', last_error = NULL, export_cleaned_at = COALESCE(export_cleaned_at, ?), updated_at = ? WHERE id = ? AND source_worker_id = ? AND state IN ('export_ready', 'verified')")
+        sqlx::query("UPDATE uploads SET state = 'verified', last_error = NULL, export_cleaned_at = COALESCE(export_cleaned_at, ?), updated_at = ? WHERE id = ? AND state IN ('export_ready', 'verified')")
             .bind(Utc::now())
-            .bind(Utc::now()).bind(capability_id.to_string()).bind(worker_id.to_string())
+            .bind(Utc::now()).bind(capability_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
     }
     let status = &poll.status;
@@ -440,13 +399,18 @@ async fn builder_poll(
             "Builder 状态角色无效",
         ));
     }
-    sqlx::query("UPDATE workers SET state = 'online', status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?")
-        .bind(status.to_string())
-        .bind(Utc::now()).bind(Utc::now()).bind(worker_id.to_string())
-        .execute(&state.database).await.map_err(ApiError::internal)?;
-    let releasable_attempts = releasable_reverse_attempts(&state.database, worker_id).await?;
-    let job = crate::scheduler::lease_reverse_job(&state, worker_id).await?;
-    let transfer = crate::scheduler::lease_reverse_transfer(&state, worker_id).await?;
+    sqlx::query(
+        "UPDATE builder_runtime SET status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = 1",
+    )
+    .bind(status.to_string())
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .execute(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let releasable_attempts = releasable_reverse_attempts(&state.database).await?;
+    let job = crate::scheduler::lease_reverse_job(&state).await?;
+    let transfer = crate::scheduler::lease_reverse_transfer(&state).await?;
     Ok(Json(BuilderLease {
         acknowledged_attempts,
         releasable_attempts,
@@ -457,14 +421,10 @@ async fn builder_poll(
     }))
 }
 
-async fn releasable_reverse_attempts(
-    database: &SqlitePool,
-    worker_id: Uuid,
-) -> Result<Vec<Uuid>, ApiError> {
+async fn releasable_reverse_attempts(database: &SqlitePool) -> Result<Vec<Uuid>, ApiError> {
     Ok(sqlx::query_scalar::<_, String>(
-        "SELECT attempts.id FROM attempts JOIN jobs ON jobs.id = attempts.job_id LEFT JOIN release_batches ON release_batches.id = jobs.batch_id WHERE jobs.worker_id = ? AND attempts.status IN ('succeeded', 'failed', 'cancelled') AND (jobs.status IN ('failed', 'cancelled') OR release_batches.state IN ('published', 'build_failed', 'publish_failed', 'transfer_failed', 'superseded')) ORDER BY attempts.finished_at, attempts.id LIMIT 256",
+        "SELECT attempts.id FROM attempts JOIN jobs ON jobs.id = attempts.job_id LEFT JOIN release_batches ON release_batches.id = jobs.batch_id WHERE attempts.status IN ('succeeded', 'failed', 'cancelled') AND (jobs.status IN ('failed', 'cancelled') OR release_batches.state IN ('published', 'build_failed', 'publish_failed', 'transfer_failed', 'superseded')) ORDER BY attempts.finished_at, attempts.id LIMIT 256",
     )
-    .bind(worker_id.to_string())
     .fetch_all(database)
     .await
     .map_err(ApiError::internal)?
@@ -479,7 +439,7 @@ async fn list_jobs(
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, workers.name AS worker_name, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count, EXISTS(SELECT 1 FROM job_evidence WHERE job_evidence.job_id = jobs.id) AS has_evidence FROM jobs LEFT JOIN workers ON workers.id = jobs.worker_id ORDER BY jobs.created_at DESC LIMIT 200",
+        "SELECT jobs.id, jobs.kind, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count, EXISTS(SELECT 1 FROM job_evidence WHERE job_evidence.job_id = jobs.id) AS has_evidence FROM jobs ORDER BY jobs.created_at DESC LIMIT 200",
     )
     .fetch_all(&state.database)
     .await
@@ -495,7 +455,7 @@ async fn list_jobs(
                 "priority": row.get::<i64, _>("priority"),
                 "failure_code": row.get::<Option<String>, _>("failure_code"),
                 "revision_sha256": row.get::<Option<String>, _>("revision_sha256"),
-                "worker_name": row.get::<Option<String>, _>("worker_name"),
+                "worker_name": "builder",
                 "attempt_count": row.get::<i64, _>("attempt_count"),
                 "has_evidence": row.get::<bool, _>("has_evidence"),
                 "next_attempt_at": row.get::<Option<String>, _>("next_attempt_at"),
@@ -531,30 +491,6 @@ async fn job_evidence(
     })))
 }
 
-pub(crate) async fn append_event_in_transaction(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    aggregate_type: &str,
-    aggregate_id: &str,
-    event_type: &str,
-    payload: Value,
-    actor: &str,
-) -> Result<(), ApiError> {
-    sqlx::query(
-        "INSERT INTO events(event_id, aggregate_type, aggregate_id, event_type, payload_json, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(aggregate_type)
-    .bind(aggregate_id)
-    .bind(event_type)
-    .bind(payload.to_string())
-    .bind(actor)
-    .bind(Utc::now())
-    .execute(&mut **transaction)
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,11 +503,7 @@ mod tests {
     async fn test_router() -> Router {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         insert_test_administrator(&database).await;
-        router(AppState::new(
-            database,
-            test_config(),
-            SigningKey::from_bytes(&[9_u8; 32]),
-        ))
+        router(AppState::new(database, test_config()))
     }
 
     fn test_config() -> Config {
@@ -579,7 +511,6 @@ mod tests {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             public_origin: "https://aursmith.test".into(),
-            signing_key_file: "/不存在".into(),
             ssh_identity_source_file: "/不存在".into(),
             ssh_identity_file: "/不存在".into(),
             ssh_known_hosts_file: "/不存在".into(),
@@ -587,14 +518,11 @@ mod tests {
             session_absolute_hours: 1,
             low_agent_endpoints: vec![],
             high_agent_endpoint: String::new(),
-            agent_daily_call_limit: 300,
-            agent_monthly_call_limit: 3000,
-            agent_monthly_cost_limit_microusd: 5_000_000,
-            agent_random_high_cost_review_basis_points: 0,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
             builder_token_sha256: auth::sha256("test-builder-token"),
+            publisher_endpoint: "ssh://publisher.test:22".into(),
         }
     }
 
@@ -745,11 +673,7 @@ mod tests {
     async fn management_writes_require_origin_and_csrf_but_get_does_not_touch_session() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         insert_test_administrator(&database).await;
-        let app = router(AppState::new(
-            database.clone(),
-            test_config(),
-            SigningKey::from_bytes(&[9_u8; 32]),
-        ));
+        let app = router(AppState::new(database.clone(), test_config()));
         let cookie = login_cookie(&app).await;
         let before: String = sqlx::query_scalar("SELECT last_seen_at FROM sessions")
             .fetch_one(&database)
@@ -815,11 +739,7 @@ mod tests {
     async fn idle_and_absolute_session_expiry_are_both_enforced() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         insert_test_administrator(&database).await;
-        let app = router(AppState::new(
-            database.clone(),
-            test_config(),
-            SigningKey::from_bytes(&[9_u8; 32]),
-        ));
+        let app = router(AppState::new(database.clone(), test_config()));
         let idle_cookie = login_cookie(&app).await;
         sqlx::query("UPDATE sessions SET last_seen_at = ?")
             .bind(Utc::now() - chrono::Duration::minutes(31))
@@ -894,7 +814,6 @@ mod tests {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             public_origin: "https://aursmith.test".into(),
-            signing_key_file: "/不存在".into(),
             ssh_identity_source_file: "/不存在".into(),
             ssh_identity_file: "/不存在".into(),
             ssh_known_hosts_file: "/不存在".into(),
@@ -902,14 +821,11 @@ mod tests {
             session_absolute_hours: 1,
             low_agent_endpoints: vec![],
             high_agent_endpoint: String::new(),
-            agent_daily_call_limit: 300,
-            agent_monthly_call_limit: 3000,
-            agent_monthly_cost_limit_microusd: 5_000_000,
-            agent_random_high_cost_review_basis_points: 0,
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
             builder_token_sha256: auth::sha256("test-builder-token"),
+            publisher_endpoint: "ssh://publisher.test:22".into(),
         };
         let worker_id = Uuid::new_v4();
         let now = Utc::now();
@@ -921,11 +837,7 @@ mod tests {
             .execute(&database)
             .await
             .unwrap();
-        let app = router(AppState::new(
-            database,
-            config,
-            SigningKey::from_bytes(&[9_u8; 32]),
-        ));
+        let app = router(AppState::new(database, config));
         let poll = BuilderPoll {
             status: json!({"role": "builder"}),
             attempts: vec![aursmith_protocol::ReverseAttemptReport {
@@ -988,9 +900,7 @@ mod tests {
                 .bind(job_status).bind(now).execute(&database).await.unwrap();
         }
 
-        let releasable = releasable_reverse_attempts(&database, worker_id)
-            .await
-            .unwrap();
+        let releasable = releasable_reverse_attempts(&database).await.unwrap();
         assert!(!releasable.contains(&active_attempt));
         assert!(releasable.contains(&published_attempt));
         assert!(releasable.contains(&failed_attempt));

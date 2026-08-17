@@ -5,24 +5,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkerRole {
-    Builder,
-    Publisher,
-    Archiver,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerState {
-    Online,
-    Draining,
-    Offline,
-    Degraded,
-    Incompatible,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SubscriptionKind {
     Direct,
     Implicit,
@@ -78,15 +60,6 @@ pub enum ReleaseState {
     RolledBack,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArchiveState {
-    Pending,
-    Transferring,
-    Verified,
-    Failed,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptRef {
     pub job_id: Uuid,
@@ -118,17 +91,6 @@ pub struct PackageBaseRevision {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerSummary {
-    pub id: Uuid,
-    pub name: String,
-    pub role: WorkerRole,
-    pub state: WorkerState,
-    pub protocol_version: u16,
-    pub labels: BTreeSet<String>,
-    pub last_seen_at: Option<DateTime<Utc>>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,10 +112,8 @@ mod tests {
     }
 
     #[test]
-    fn archive_and_release_have_independent_states() {
+    fn release_state_is_explicit() {
         let release = ReleaseState::Committed;
-        let archive = ArchiveState::Failed;
         assert_eq!(release, ReleaseState::Committed);
-        assert_eq!(archive, ArchiveState::Failed);
     }
 }

@@ -13,7 +13,7 @@ RUN pacman -Syu --noconfirm --needed \
     && useradd --uid 10001 --create-home --home-dir /var/lib/aursmith --shell /bin/sh aursmith \
     && install -d -o aursmith -g aursmith \
       /run/aursmith /var/lib/aursmith/runtime /jobs \
-      /landing /staging /repository /archive
+      /landing /staging /repository
 COPY --from=builder /src/target/release/aursmith-worker /usr/local/bin/aursmith-worker
 COPY --from=builder /src/target/release/aursmithctl /usr/local/bin/aursmithctl
 USER 10001:10001

@@ -1,11 +1,6 @@
-use crate::{
-    auth,
-    error::ApiError,
-    routes::{AppState, append_event_in_transaction},
-    transport,
-};
+use crate::{auth, error::ApiError, routes::AppState, transport};
 use aursmith_domain::{AuditFile, DependencyGraph, FindingSeverity, scan_aur_wrapper};
-use aursmith_protocol::{ReleaseRollbackAuthorization, SignedEnvelope};
+use aursmith_protocol::ReleaseRollbackRequest;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -116,7 +111,7 @@ pub async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let endpoint = publisher_endpoint(&state.database).await?;
+    let endpoint = state.config.publisher_endpoint.clone();
     let reply = transport::aur_search(&state.config, &endpoint, &query.q).await?;
     let packages: Vec<UpstreamPackage> =
         serde_json::from_value(reply.data.get("items").cloned().unwrap_or(Value::Null))
@@ -133,7 +128,7 @@ pub async fn subscribe(
 ) -> Result<impl IntoResponse, ApiError> {
     let administrator_id = auth::require_administrator(&state, &headers).await?;
     validate_name(&request.package_name)?;
-    let endpoint = publisher_endpoint(&state.database).await?;
+    let endpoint = state.config.publisher_endpoint.clone();
     let official = transport::official_info(
         &state.config,
         &endpoint,
@@ -348,7 +343,7 @@ fn official_dependency_names_from_data(
 
 async fn apply_snapshot(
     database: &SqlitePool,
-    actor: &str,
+    _actor: &str,
     package: &UpstreamPackage,
     snapshot: &UpstreamSnapshot,
     requested_outputs: &[String],
@@ -379,15 +374,6 @@ async fn apply_snapshot(
     let input_sha256 = revision_input_digest(snapshot, dependency_map)?;
     let now = Utc::now();
     let mut transaction = database.begin().await.map_err(ApiError::internal)?;
-    let previous_package =
-        sqlx::query("SELECT maintainer, orphaned FROM package_bases WHERE name = ?")
-            .bind(&snapshot.package_base)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(ApiError::internal)?;
-    let previous_metadata: Option<String> = sqlx::query_scalar("SELECT metadata_json FROM revisions WHERE package_base = ? ORDER BY created_at DESC LIMIT 1")
-        .bind(&snapshot.package_base).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?;
-
     sqlx::query(
         "INSERT INTO package_bases(name, version, description, maintainer, out_of_date_at, orphaned, vcs_kind, outputs_json, dependencies_json, optional_dependencies_json, provides_json, architectures_json, aur_last_modified, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET version = excluded.version, description = excluded.description, maintainer = excluded.maintainer, out_of_date_at = excluded.out_of_date_at, orphaned = excluded.orphaned, vcs_kind = excluded.vcs_kind, outputs_json = excluded.outputs_json, dependencies_json = excluded.dependencies_json, optional_dependencies_json = excluded.optional_dependencies_json, provides_json = excluded.provides_json, architectures_json = excluded.architectures_json, aur_last_modified = excluded.aur_last_modified, last_synced_at = excluded.last_synced_at",
     )
@@ -408,55 +394,6 @@ async fn apply_snapshot(
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::internal)?;
-
-    if let Some(previous) = previous_package {
-        let previous_maintainer: Option<String> = previous.get("maintainer");
-        if previous_maintainer != package.maintainer {
-            append_event_in_transaction(
-                &mut transaction,
-                "package_base",
-                &snapshot.package_base,
-                "package_maintainer_changed",
-                json!({"before": previous_maintainer, "after": package.maintainer}),
-                actor,
-            )
-            .await?;
-        }
-        let was_orphaned = previous.get::<i64, _>("orphaned") != 0;
-        let is_orphaned = package.maintainer.is_none();
-        if was_orphaned != is_orphaned {
-            append_event_in_transaction(
-                &mut transaction,
-                "package_base",
-                &snapshot.package_base,
-                if is_orphaned {
-                    "package_became_orphan"
-                } else {
-                    "package_adopted"
-                },
-                json!({"orphaned": is_orphaned}),
-                actor,
-            )
-            .await?;
-        }
-    }
-    if let Some(previous_metadata) = previous_metadata {
-        let previous: UpstreamSnapshot =
-            serde_json::from_str(&previous_metadata).map_err(ApiError::internal)?;
-        let before = source_domains(&previous.sources);
-        let after = source_domains(&snapshot.sources);
-        if before != after {
-            append_event_in_transaction(
-                &mut transaction,
-                "package_base",
-                &snapshot.package_base,
-                "package_source_domains_changed",
-                json!({"before": before, "after": after}),
-                actor,
-            )
-            .await?;
-        }
-    }
 
     let subscription_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -631,15 +568,6 @@ async fn apply_snapshot(
         }
         (Some(batch_id), batch_state)
     };
-    append_event_in_transaction(
-        &mut transaction,
-        "subscription",
-        &snapshot.package_base,
-        "package_subscribed",
-        json!({"revision_id": revision_id, "batch_id": batch_id, "aur_commit": snapshot.aur_commit, "idempotent": idempotent_revision}),
-        actor,
-    )
-    .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     Ok(json!({
         "package_base": snapshot.package_base,
@@ -745,7 +673,7 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
 pub(crate) async fn schedule_rebuild_batch(
     database: &SqlitePool,
     changed: BTreeSet<String>,
-    actor: &str,
+    _actor: &str,
     reason: &str,
 ) -> Result<Option<String>, ApiError> {
     if changed.is_empty() {
@@ -813,15 +741,6 @@ pub(crate) async fn schedule_rebuild_batch(
             .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE batch_id = ?) AND status NOT IN ('succeeded', 'failed', 'cancelled')")
             .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        append_event_in_transaction(
-            &mut transaction,
-            "release_batch",
-            &old_batch_id,
-            "release_batch_superseded",
-            json!({"superseded_by": batch_id}),
-            actor,
-        )
-        .await?;
     }
     for (index, package_base) in order.into_iter().enumerate() {
         let previous = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, metadata_json FROM revisions WHERE package_base = ? AND rebuild_generation = 0 ORDER BY created_at DESC LIMIT 1")
@@ -866,15 +785,6 @@ pub(crate) async fn schedule_rebuild_batch(
             .bind(&batch_id).bind(&revision_id).bind(i64::try_from(index).map_err(ApiError::internal)?)
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
     }
-    append_event_in_transaction(
-        &mut transaction,
-        "release_batch",
-        &batch_id,
-        "rebuild_batch_created",
-        json!({"changed_packages": changed, "reason": reason}),
-        actor,
-    )
-    .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     schedule_ready_builds(database).await?;
     Ok(Some(batch_id))
@@ -918,8 +828,6 @@ pub async fn package_detail(
         .fetch_all(&state.database)
         .await
         .map_err(ApiError::internal)?;
-    let events = sqlx::query("SELECT event_type, payload_json, actor, created_at FROM events WHERE aggregate_type = 'package_base' AND aggregate_id = ? ORDER BY sequence DESC LIMIT 100")
-        .bind(&package_base).fetch_all(&state.database).await.map_err(ApiError::internal)?;
     let allow_check: i64 = sqlx::query_scalar(
         "SELECT COALESCE((SELECT allow_check FROM package_build_policies WHERE package_base = ?), 1)",
     )
@@ -949,11 +857,6 @@ pub async fn package_detail(
             "name": row.get::<String, _>("dependency_name"), "kind": row.get::<String, _>("dependency_kind"),
             "target_package_base": row.get::<Option<String>, _>("target_package_base"), "state": row.get::<String, _>("provider_state"),
             "candidates": parse_json::<Value>(row.get("candidates_json")).unwrap_or_else(|_| json!([]))
-        })).collect::<Vec<_>>(),
-        "events": events.into_iter().map(|row| json!({
-            "type": row.get::<String,_>("event_type"),
-            "payload": serde_json::from_str::<Value>(row.get("payload_json")).unwrap_or(Value::Null),
-            "actor": row.get::<String,_>("actor"), "created_at": row.get::<String,_>("created_at")
         })).collect::<Vec<_>>()
     })))
 }
@@ -964,7 +867,7 @@ pub async fn set_build_policy(
     Path(package_base): Path<String>,
     Json(request): Json<BuildPolicyRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
+    auth::require_administrator(&state, &headers).await?;
     validate_name(&package_base)?;
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM package_bases WHERE name = ?")
         .bind(&package_base)
@@ -982,15 +885,6 @@ pub async fn set_build_policy(
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
-    append_event_in_transaction(
-        &mut transaction,
-        "package_base",
-        &package_base,
-        "package_build_policy_changed",
-        json!({"allow_check": request.allow_check}),
-        &actor,
-    )
-    .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     Ok(Json(json!({
         "package_base": package_base,
@@ -1003,7 +897,7 @@ pub async fn delete_subscription(
     headers: HeaderMap,
     Path(package_base): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
+    auth::require_administrator(&state, &headers).await?;
     validate_name(&package_base)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     let removed_package_bases = delete_subscription_rows(&mut transaction, &package_base).await?;
@@ -1017,15 +911,6 @@ pub async fn delete_subscription(
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
-    append_event_in_transaction(
-        &mut transaction,
-        "subscription",
-        &package_base,
-        "subscription_deleted",
-        json!({"batch_id": batch_id, "removed_package_bases": removed_package_bases}),
-        &actor,
-    )
-    .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     Ok(Json(json!({
         "package_base": package_base,
@@ -1113,7 +998,7 @@ pub async fn list_releases(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("WITH current AS (SELECT json_extract(value_json, '$') AS id FROM system_settings WHERE key = 'current_release_id') SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.committed_at, releases.created_at, release_authorizations.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count FROM releases LEFT JOIN release_authorizations ON release_authorizations.release_id = releases.id WHERE releases.state = 'committed' ORDER BY CASE WHEN releases.id = (SELECT id FROM current) THEN 0 ELSE 1 END, releases.committed_at DESC LIMIT 2")
+    let rows = sqlx::query("WITH current AS (SELECT json_extract(value_json, '$') AS id FROM system_settings WHERE key = 'current_release_id') SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.committed_at, releases.created_at, release_jobs.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count FROM releases LEFT JOIN release_jobs ON release_jobs.release_id = releases.id WHERE releases.state = 'committed' ORDER BY CASE WHEN releases.id = (SELECT id FROM current) THEN 0 ELSE 1 END, releases.committed_at DESC LIMIT 2")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>("id"),
@@ -1132,28 +1017,30 @@ pub async fn rollback_release(
     headers: HeaderMap,
     Path(release_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
+    auth::require_administrator(&state, &headers).await?;
     let release_uuid = Uuid::parse_str(&release_id)
         .map_err(|_| ApiError::bad_request("INVALID_RELEASE", "Release ID 无效"))?;
-    let row = sqlx::query("SELECT releases.manifest_sha256, releases.writer_epoch, workers.endpoint FROM releases JOIN release_authorizations ON release_authorizations.release_id = releases.id JOIN workers ON workers.id = release_authorizations.publisher_worker_id WHERE releases.id = ? AND releases.state = 'committed' AND workers.state = 'online'")
-        .bind(&release_id).fetch_optional(&state.database).await.map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::conflict("RELEASE_NOT_ROLLBACKABLE", "Release 不存在、未提交或 Publisher 不在线"))?;
+    let row =
+        sqlx::query("SELECT manifest_sha256 FROM releases WHERE id = ? AND state = 'committed'")
+            .bind(&release_id)
+            .fetch_optional(&state.database)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::conflict("RELEASE_NOT_ROLLBACKABLE", "Release 不存在或未提交")
+            })?;
     let now = Utc::now();
-    let authorization = ReleaseRollbackAuthorization {
+    let authorization = ReleaseRollbackRequest {
         release_id: release_uuid,
-        writer_epoch: u64::try_from(row.get::<i64, _>("writer_epoch"))
-            .map_err(ApiError::internal)?,
         issued_at: now,
         expires_at: now + Duration::minutes(5),
     };
-    let envelope = SignedEnvelope::sign(
-        "aursmith.release_rollback_authorization",
+    let reply = transport::authorize_rollback(
+        &state.config,
+        &state.config.publisher_endpoint,
         &authorization,
-        &state.signing_key,
     )
-    .map_err(ApiError::internal)?;
-    let reply =
-        transport::authorize_rollback(&state.config, row.get("endpoint"), &envelope).await?;
+    .await?;
     if reply.data["release_id"].as_str() != Some(release_id.as_str())
         || reply.data["manifest_sha256"].as_str()
             != Some(row.get::<String, _>("manifest_sha256").as_str())
@@ -1166,15 +1053,6 @@ pub async fn rollback_release(
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('current_release_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
         .bind(json!(release_id).to_string()).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    append_event_in_transaction(
-        &mut transaction,
-        "release",
-        &release_id,
-        "release_rolled_back",
-        json!({"client_downgrade_required": true}),
-        &actor,
-    )
-    .await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     Ok(Json(json!({
         "release_id": release_id,
@@ -1268,7 +1146,7 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
     let followed_outputs: Vec<String> = parse_json(row.get("followed_outputs_json"))?;
     let selected_providers: BTreeMap<String, String> =
         parse_json(row.get("selected_providers_json"))?;
-    let endpoint = publisher_endpoint(&state.database).await?;
+    let endpoint = state.config.publisher_endpoint.clone();
     let last_official_check: Option<chrono::DateTime<Utc>> = row
         .get::<Option<String>, _>("last_official_checked_at")
         .and_then(|value| value.parse().ok());
@@ -1286,20 +1164,6 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
                     .is_some_and(|packages| !packages.is_empty())
             })
         }) {
-            sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'info', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = 'open', details_json = excluded.details_json, resolved_at = NULL")
-                .bind(Uuid::new_v4().to_string()).bind(format!("official-promotion:{package_base}"))
-                .bind(format!("软件包已进入 Arch 官方仓库：{package_base}"))
-                .bind(json!({"package_base": package_base, "outputs": outputs}).to_string()).bind(now)
-                .execute(&state.database).await.map_err(ApiError::internal)?;
-            append_event(
-                &state.database,
-                "package_base",
-                package_base,
-                "package_promoted_to_official",
-                json!({"outputs": outputs}),
-                actor,
-            )
-            .await?;
             return Ok(
                 json!({"package_base": package_base, "state": "official_migration_required"}),
             );
@@ -1313,30 +1177,6 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
         .into_iter()
         .find(|package| package.package_base == package_base);
     let Some(package) = package else {
-        let fingerprint = format!("aur-lifecycle-missing:{package_base}");
-        let already_open: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM alerts WHERE fingerprint = ? AND state != 'resolved'",
-        )
-        .bind(&fingerprint)
-        .fetch_one(&state.database)
-        .await
-        .map_err(ApiError::internal)?;
-        sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = CASE WHEN alerts.state = 'resolved' THEN 'open' ELSE alerts.state END, details_json = excluded.details_json, resolved_at = NULL")
-            .bind(Uuid::new_v4().to_string()).bind(&fingerprint)
-            .bind(format!("AUR 软件包已不可见：{package_base}"))
-            .bind(json!({"package_base": package_base, "possible_causes": ["deleted", "renamed", "merged"]}).to_string())
-            .bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
-        if already_open == 0 {
-            append_event(
-                &state.database,
-                "package_base",
-                package_base,
-                "package_missing_from_aur",
-                json!({"possible_causes": ["deleted", "renamed", "merged"]}),
-                actor,
-            )
-            .await?;
-        }
         return Err(ApiError::conflict(
             "AUR_PACKAGE_MISSING",
             "AUR 软件包可能已删除、重命名或合并",
@@ -1369,12 +1209,6 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
     sqlx::query("INSERT INTO package_sync_state(package_base, consecutive_failures, last_checked_at, last_success_at, last_error, next_check_at) VALUES (?, 0, ?, ?, NULL, ?) ON CONFLICT(package_base) DO UPDATE SET consecutive_failures = 0, last_checked_at = excluded.last_checked_at, last_success_at = excluded.last_success_at, last_error = NULL, next_check_at = excluded.next_check_at")
         .bind(package_base).bind(Utc::now()).bind(Utc::now()).bind(next)
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    sqlx::query("UPDATE alerts SET state = 'resolved', resolved_at = ? WHERE fingerprint = ? AND state != 'resolved'")
-        .bind(Utc::now()).bind(format!("aur-sync:{package_base}"))
-        .execute(&state.database).await.map_err(ApiError::internal)?;
-    sqlx::query("UPDATE alerts SET state = 'resolved', resolved_at = ? WHERE fingerprint = ? AND state != 'resolved'")
-        .bind(Utc::now()).bind(format!("aur-lifecycle-missing:{package_base}"))
-        .execute(&state.database).await.map_err(ApiError::internal)?;
     Ok(result)
 }
 
@@ -1387,45 +1221,6 @@ async fn record_sync_failure(
     sqlx::query("INSERT INTO package_sync_state(package_base, consecutive_failures, last_checked_at, last_error, next_check_at) VALUES (?, 1, ?, ?, ?) ON CONFLICT(package_base) DO UPDATE SET consecutive_failures = package_sync_state.consecutive_failures + 1, last_checked_at = excluded.last_checked_at, last_error = excluded.last_error, next_check_at = excluded.next_check_at")
         .bind(package_base).bind(Utc::now()).bind(error).bind(next)
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    let failures: i64 = sqlx::query_scalar(
-        "SELECT consecutive_failures FROM package_sync_state WHERE package_base = ?",
-    )
-    .bind(package_base)
-    .fetch_one(&state.database)
-    .await
-    .map_err(ApiError::internal)?;
-    if failures >= 3 {
-        sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'warning', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = 'open', details_json = excluded.details_json, resolved_at = NULL")
-            .bind(Uuid::new_v4().to_string()).bind(format!("aur-sync:{package_base}"))
-            .bind(format!("AUR 连续同步失败：{package_base}"))
-            .bind(json!({"package_base": package_base, "consecutive_failures": failures, "last_error": error}).to_string())
-            .bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
-    }
-    Ok(())
-}
-
-async fn publisher_endpoint(database: &SqlitePool) -> Result<String, ApiError> {
-    sqlx::query_scalar(
-        "SELECT endpoint FROM workers WHERE role = 'publisher' AND state = 'online' LIMIT 1",
-    )
-    .fetch_optional(database)
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| ApiError::conflict("NO_ELIGIBLE_PUBLISHER", "没有在线 Publisher，无法访问 AUR"))
-}
-
-async fn append_event(
-    database: &SqlitePool,
-    aggregate_type: &str,
-    aggregate_id: &str,
-    event_type: &str,
-    payload: Value,
-    actor: &str,
-) -> Result<(), ApiError> {
-    sqlx::query("INSERT INTO events(event_id, aggregate_type, aggregate_id, event_type, payload_json, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .bind(Uuid::new_v4().to_string()).bind(aggregate_type).bind(aggregate_id)
-        .bind(event_type).bind(payload.to_string()).bind(actor).bind(Utc::now())
-        .execute(database).await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -1805,26 +1600,6 @@ fn vcs_kind(package_base: &str) -> Option<&'static str> {
         .find(|kind| package_base.ends_with(&format!("-{kind}")))
 }
 
-fn source_domains(sources: &[String]) -> BTreeSet<String> {
-    sources
-        .iter()
-        .filter_map(|source| {
-            let value = source
-                .rsplit_once("::")
-                .map(|(_, value)| value)
-                .unwrap_or(source);
-            let value = ["git+", "hg+", "svn+", "bzr+"]
-                .into_iter()
-                .find_map(|prefix| value.strip_prefix(prefix))
-                .unwrap_or(value);
-            url::Url::parse(value)
-                .ok()?
-                .host_str()
-                .map(|host| host.to_ascii_lowercase())
-        })
-        .collect()
-}
-
 fn validate_name(value: &str) -> Result<(), ApiError> {
     if value.is_empty()
         || value.len() > 128
@@ -1908,18 +1683,6 @@ mod tests {
             opt_depends: vec![],
             provides: vec![],
         }
-    }
-
-    #[test]
-    fn source_domain_change_ignores_local_sources_and_normalizes_vcs_prefixes() {
-        assert_eq!(
-            source_domains(&[
-                "archive::https://Downloads.Example.org/source.tar.zst".into(),
-                "git+https://git.example.org/project.git#branch=main".into(),
-                "local.patch".into(),
-            ]),
-            BTreeSet::from(["downloads.example.org".into(), "git.example.org".into(),])
-        );
     }
 
     #[test]
@@ -2526,12 +2289,14 @@ mod tests {
             .fetch_one(&database)
             .await
             .unwrap();
-        let pre_scans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_pre_scans")
-            .fetch_one(&database)
-            .await
-            .unwrap();
+        let pre_scan_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'audit_pre_scans'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
         assert_eq!(agent_runs, 3, "AUR 包装层审计必须直接启动三个低成本 Agent");
-        assert_eq!(pre_scans, 0, "不得再创建 Fetch 前置扫描双轨");
+        assert_eq!(pre_scan_tables, 0, "不得保留 Fetch 前置扫描双轨");
     }
 
     #[tokio::test]
