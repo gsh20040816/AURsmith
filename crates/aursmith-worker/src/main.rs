@@ -2334,42 +2334,57 @@ fn consolidate_release_artifact_links(
         .parent()
         .context("Release Manifest 缺少目录")?;
     let hot = worker.repository_dir.join(&worker.repository_arch);
+    let current_target = std::fs::read_link(hot.join(format!("{}.db", manifest.repository_name)))?;
+    let current_release = current_target
+        .components()
+        .nth(1)
+        .and_then(|component| component.as_os_str().to_str())
+        .context("当前仓库数据库链接没有 Release ID")?
+        .parse::<uuid::Uuid>()?;
     for artifact in manifest
         .artifacts
         .iter()
         .chain(manifest.repository_keyring.iter())
     {
-        atomic_link_identical_file(
+        let linked = atomic_link_if_identical_file(
             &release.join(&artifact.path),
             &hot.join(&artifact.path),
             &artifact.sha256,
         )?;
+        if manifest.release_id == current_release && !linked {
+            bail!(
+                "当前仓库文件与 Release 不一致：{}",
+                hot.join(&artifact.path).display()
+            );
+        }
     }
     Ok(())
 }
 
-fn atomic_link_identical_file(
+fn atomic_link_if_identical_file(
     source: &Path,
     target: &Path,
     expected_sha256: &str,
-) -> anyhow::Result<()> {
-    if !source.is_file() || !target.is_file() {
-        bail!("拒绝合并内容不一致的仓库文件：{}", target.display());
+) -> anyhow::Result<bool> {
+    if !source.is_file() {
+        bail!("Release 文件不存在：{}", source.display());
     }
     let source_metadata = std::fs::metadata(source)?;
+    if source_metadata.len() == 0 || file_sha256(source)? != expected_sha256 {
+        bail!("Release 文件摘要不一致：{}", source.display());
+    }
+    if !target.is_file() {
+        return Ok(false);
+    }
     let target_metadata = std::fs::metadata(target)?;
     use std::os::unix::fs::MetadataExt;
     if source_metadata.dev() == target_metadata.dev()
         && source_metadata.ino() == target_metadata.ino()
     {
-        return Ok(());
+        return Ok(true);
     }
-    if source_metadata.len() != target_metadata.len()
-        || source_metadata.len() == 0
-        || file_sha256(source)? != expected_sha256
-        || file_sha256(target)? != expected_sha256
-    {
-        bail!("拒绝合并内容不一致的仓库文件：{}", target.display());
+    if source_metadata.len() != target_metadata.len() || file_sha256(target)? != expected_sha256 {
+        return Ok(false);
     }
     let temporary = target.with_file_name(format!(
         ".{}.link",
@@ -2383,7 +2398,8 @@ fn atomic_link_identical_file(
     }
     std::fs::hard_link(source, &temporary)?;
     std::fs::rename(&temporary, target)?;
-    sync_directory(target.parent().context("仓库文件缺少父目录")?)
+    sync_directory(target.parent().context("仓库文件缺少父目录")?)?;
+    Ok(true)
 }
 
 fn transfer_manifest_is_consumed(
@@ -3890,12 +3906,26 @@ mod transfer_tests {
             std::fs::metadata(&source).unwrap().ino(),
             std::fs::metadata(&target).unwrap().ino()
         );
-        atomic_link_identical_file(&source, &target, &digest).unwrap();
+        assert!(atomic_link_if_identical_file(&source, &target, &digest).unwrap());
         assert_eq!(
             std::fs::metadata(&source).unwrap().ino(),
             std::fs::metadata(&target).unwrap().ino()
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"same package");
+    }
+
+    #[test]
+    fn historical_repository_file_with_same_name_keeps_new_hot_content() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("release.pkg.tar.zst");
+        let target = root.path().join("hot.pkg.tar.zst");
+        std::fs::write(&source, b"historical package").unwrap();
+        std::fs::write(&target, b"current package").unwrap();
+        let digest = hex::encode(Sha256::digest(b"historical package"));
+
+        assert!(!atomic_link_if_identical_file(&source, &target, &digest).unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"current package");
+        assert!(atomic_link_if_identical_file(&source, &target, &"0".repeat(64)).is_err());
     }
 
     #[test]
