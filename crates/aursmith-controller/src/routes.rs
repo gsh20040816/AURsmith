@@ -554,7 +554,7 @@ async fn doctor_status(
     if let Some(endpoint) = publisher_endpoint {
         match crate::transport::publisher_doctor(&state.config, &endpoint).await {
             Ok(reply) if reply.ok => {
-                for name in ["aur", "source_proxy"] {
+                for name in ["aur"] {
                     let check = &reply.data["checks"][name];
                     checks.push(json!({
                         "id": format!("publisher-{name}"),

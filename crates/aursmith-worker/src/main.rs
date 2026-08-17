@@ -61,8 +61,6 @@ struct Cli {
         default_value = "https://aur.archlinux.org/"
     )]
     aur_base_url: String,
-    #[arg(long, env = "AURSMITH_SOURCE_PROXY_URL")]
-    source_proxy_url: Option<String>,
     #[arg(long, env = "AURSMITH_PACOLOCO_METRICS_URL")]
     pacoloco_metrics_url: Option<String>,
     #[arg(long, env = "AURSMITH_JOBS_DIR", default_value = "/jobs")]
@@ -139,7 +137,6 @@ struct Worker {
     database: SqlitePool,
     trusted_controller_key: Vec<u8>,
     aur: aur::AurClient,
-    source_proxy_url: Option<String>,
     pacoloco_metrics_url: Option<String>,
     builder: Option<builder::BuilderRuntime>,
     transfer_endpoints: BTreeMap<String, String>,
@@ -260,7 +257,6 @@ async fn main() -> anyhow::Result<()> {
         database,
         trusted_controller_key,
         aur,
-        source_proxy_url: cli.source_proxy_url,
         pacoloco_metrics_url: cli.pacoloco_metrics_url,
         builder: if matches!(cli.role, RoleArg::Builder) {
             Some(builder::BuilderRuntime::new(jobs_dir.clone()))
@@ -3221,35 +3217,6 @@ async fn publisher_doctor(worker: &Worker) -> WorkerResponse {
         Ok(_) => serde_json::json!({"ok": true, "message": "AUR RPC 可达"}),
         Err(error) => serde_json::json!({"ok": false, "message": format!("AUR RPC 失败：{error}")}),
     };
-    let source_proxy = match worker.source_proxy_url.as_deref() {
-        None => serde_json::json!({"ok": false, "message": "未配置 AURSMITH_SOURCE_PROXY_URL"}),
-        Some(proxy_url) => {
-            let result = async {
-                validate_source_proxy_url(proxy_url)?;
-                let client = reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(5))
-                    .timeout(std::time::Duration::from_secs(15))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .proxy(reqwest::Proxy::all(proxy_url)?)
-                    .build()?;
-                client
-                    .get("https://archlinux.org/robots.txt")
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            match result {
-                Ok(()) => {
-                    serde_json::json!({"ok": true, "message": "source proxy 可转发公开 HTTPS"})
-                }
-                Err(error) => {
-                    serde_json::json!({"ok": false, "message": format!("source proxy 失败：{error}")})
-                }
-            }
-        }
-    };
     let pacoloco = match pacoloco_metrics(worker).await {
         Some(value) => serde_json::json!({"ok": true, "metrics": value}),
         None if worker.pacoloco_metrics_url.is_none() => {
@@ -3259,7 +3226,7 @@ async fn publisher_doctor(worker: &Worker) -> WorkerResponse {
     };
     WorkerResponse::ok(
         "PUBLISHER_DOCTOR",
-        serde_json::json!({"checks": {"aur": aur, "source_proxy": source_proxy, "pacoloco": pacoloco}}),
+        serde_json::json!({"checks": {"aur": aur, "pacoloco": pacoloco}}),
     )
 }
 
@@ -3314,20 +3281,6 @@ fn validate_internal_metrics_url(value: &str) -> anyhow::Result<reqwest::Url> {
         || parsed.fragment().is_some()
     {
         bail!("pacoloco metrics URL 必须是无凭据和参数的内部 HTTP /metrics URL");
-    }
-    Ok(parsed)
-}
-
-fn validate_source_proxy_url(value: &str) -> anyhow::Result<reqwest::Url> {
-    let parsed = reqwest::Url::parse(value).context("source proxy URL 无效")?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        bail!("source proxy 必须是无内嵌凭据、查询参数和片段的 HTTP(S) URL");
     }
     Ok(parsed)
 }
@@ -3680,13 +3633,6 @@ mod transfer_tests {
     use super::*;
 
     #[test]
-    fn source_proxy_url_rejects_credentials_and_query_parameters() {
-        assert!(validate_source_proxy_url("http://source-proxy:3128").is_ok());
-        assert!(validate_source_proxy_url("http://user:secret@source-proxy:3128").is_err());
-        assert!(validate_source_proxy_url("http://source-proxy:3128/?target=private").is_err());
-    }
-
-    #[test]
     fn reported_failed_attempts_do_not_wait_for_release_authorization() {
         assert!(attempt_can_be_released_locally("failed", Some("reported")));
         assert!(attempt_can_be_released_locally(
@@ -4012,7 +3958,6 @@ mod transfer_tests {
             database,
             trusted_controller_key: vec![0; 32],
             aur: aur::AurClient::new("https://aur.archlinux.org/").unwrap(),
-            source_proxy_url: None,
             pacoloco_metrics_url: None,
             builder: None,
             transfer_endpoints: BTreeMap::new(),

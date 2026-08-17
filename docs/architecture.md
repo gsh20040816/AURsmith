@@ -15,7 +15,7 @@
 
 Controller 进程同时提供 JSON API、SSE 和编译后的 React 静态页面；Publisher Worker 同时提供只读仓库 HTTP。两者只映射到宿主回环地址，由部署节点已有的 Caddy 统一终止 TLS。AURsmith 容器不读取宿主证书私钥，也不再维护内层 CA、Web Caddy 或仓库 Caddy。
 
-Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docker Socket、libvirt Socket、TUN 或 privileged 权限。受限联网的 Fetch Guest 通过 Publisher 代理获取源码；全新的 Build Guest 不带网卡，只接收不可变且已经审计的输入。
+Builder daemon 在容器中通过 `/dev/kvm` 直接启动 QEMU，不获得 Docker Socket、libvirt Socket、TUN 或 privileged 权限。受限联网的 Fetch Guest 通过 QEMU user networking 直接获取源码；全新的 Build Guest 不带网卡，只接收不可变且已经审计的输入。
 
 第一版 Publisher 保留 pacoloco 作为 Arch 官方包缓存，以 UID/GID 65532、只读根文件系统和独立缓存卷运行，不接触 source、Artifact 或签名密钥。宿主 Caddy 在 `/arch-cache/` 下反向代理 pacoloco。Fetch VM 使用 QEMU user networking 直接访问公网，不部署 HTTP source proxy；Build Guest 是否联网由 Builder 独立配置。
 
@@ -61,7 +61,7 @@ Controller 每 24 小时或按管理员请求执行一次控制面一致性备�
 
 每个 verified 控制面备份由 SQLite 原生快照、摘要和 Controller 签名 Envelope 组成，保存在 Controller 持久卷。第一版不自动复制到独立故障域，因此初始化向导和设置页必须继续提示离线保存 Controller、GPG、CA 私钥和管理员恢复材料。
 
-Doctor 不通过付费模型请求伪造“Agent 可用”。每个 Agent Runner 的 `/healthz` 只验证 Codex/Claude Code 固定 CLI 文件、adapter/provider/model 配置，以及到凭据网关的 TCP；凭据网关在启动时已经验证 API key secret 和 provider HTTPS URL。Controller 实际请求三个低成本和一个高成本 Runner 的健康端点。Publisher 的 `publisher-doctor` 同时执行无结果也合法的 AUR RPC 查询、经配置的 source proxy 请求公开 Arch HTTPS 文件，并读取 pacoloco `/metrics`；它不执行 PKGBUILD，也不给 Build VM 网络。
+Doctor 不通过付费模型请求伪造“Agent 可用”。每个 Agent Runner 的 `/healthz` 只验证 Codex/Claude Code 固定 CLI 文件、adapter/provider/model 配置，以及到凭据网关的 TCP；凭据网关在启动时已经验证 API key secret 和 provider HTTPS URL。Controller 实际请求三个低成本和一个高成本 Runner 的健康端点。Publisher 的 `publisher-doctor` 执行无结果也合法的 AUR RPC 查询，并读取 pacoloco `/metrics`；它不执行 PKGBUILD，也不给 Build VM 网络。
 
 离线恢复命令先核对当前 Controller 公钥、Envelope、固定文件名、大小、摘要和 SQLite 完整性，再复制到目标文件系统复验。替换前把原数据库及 WAL/SHM 一并移动到带 UTC 时间和 Backup ID 的 `recovery` 目录，恢复中途失败时尝试放回原数据库。恢复要求先停止 Controller；在线 API 不提供数据库替换能力。
 

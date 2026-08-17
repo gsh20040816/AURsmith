@@ -69,11 +69,8 @@ official_result="$("${repository_root}/target/debug/aursmithctl" worker \
   --socket "${runtime_directory}/worker.sock" official-info pacman)"
 jq -e '.ok == true and (.data.pacman | length) >= 1' <<<"${official_result}" >/dev/null
 
-if [[ -n "${AURSMITH_SOURCE_PROXY_URL:-}" ]]; then
-  doctor_result="$("${repository_root}/target/debug/aursmithctl" worker \
-    --socket "${runtime_directory}/worker.sock" publisher-doctor)"
-  jq -e '.ok == true and .data.checks.aur.ok == true and .data.checks.source_proxy.ok == true' \
-    <<<"${doctor_result}" >/dev/null
-fi
+doctor_result="$("${repository_root}/target/debug/aursmithctl" worker \
+  --socket "${runtime_directory}/worker.sock" publisher-doctor)"
+jq -e '.ok == true and .data.checks.aur.ok == true' <<<"${doctor_result}" >/dev/null
 
 echo "Publisher 上游冒烟通过"
