@@ -8,16 +8,13 @@ RUN cargo build --locked --release -p aursmith-guest-agent
 
 FROM archlinux:base@sha256:345a872f6c95e082d4b8c050af637eebb57402c6e2177b411c3acf7df84eb33b
 ARG AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux
-ENV DOTNET_CLI_USE_MSBUILD_SERVER=0 \
-    MSBUILDDISABLENODEREUSE=1 \
-    UseSharedCompilation=false
 COPY deploy/common/pacman-aursmith.conf /etc/pacman.conf
 RUN case "${AURSMITH_ARCH_MIRROR}" in https://*) ;; *) echo 'AURSMITH_ARCH_MIRROR 必须是 HTTPS URL' >&2; exit 1 ;; esac \
     && case "${AURSMITH_ARCH_MIRROR}" in *[[:space:]]*) echo 'AURSMITH_ARCH_MIRROR 不能包含空白' >&2; exit 1 ;; esac \
     && case "${AURSMITH_ARCH_MIRROR}" in *'@'*|*'?'*|*'#'*) echo 'AURSMITH_ARCH_MIRROR 不能包含凭据、查询参数或片段' >&2; exit 1 ;; esac \
     && repository_mirror="${AURSMITH_ARCH_MIRROR%/}" \
     && printf 'Server = %s/$repo/os/$arch\n' "${repository_mirror}" > /etc/pacman.d/mirrorlist \
-    && pacman -Syu --noconfirm --needed base-devel ca-certificates devtools git gnupg namcap sudo \
+    && pacman -Syu --noconfirm --needed base-devel ca-certificates git gnupg sudo \
     && rm -rf /var/cache/pacman/pkg/* \
     && useradd --uid 1000 --create-home --shell /bin/bash builder \
     && printf 'builder ALL=(root) NOPASSWD: /usr/bin/pacman\n' > /etc/sudoers.d/aursmith-builder \

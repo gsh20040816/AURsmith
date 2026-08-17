@@ -116,6 +116,8 @@ Docker 模板只固定：每次使用全新容器和可写任务目录；`makepk
 
 Build 容器必须使用 Docker 自带的 `--init` 处理信号转发和孤儿进程回收；Guest Agent 不得直接充当 PID 1，也不得实现自己的 init 或 reaper。`makepkg` 必须正常继承 Build 镜像提供的标准工具环境，禁止再用 `env -i` 或项目自建环境变量白名单清空环境；Controller、SSH、GPG 等凭据应在创建容器时不传入，而不是在容器内靠清空全部环境补救。
 
+通用 Build 镜像不得为 .NET、Node、Java、Rust、Go、Python 或具体 AUR 包设置环境变量、后台服务开关、编译参数和补丁。唯一的全局 makepkg 覆盖是关闭自动 debug 包，避免产生 `.SRCINFO` 未声明的额外发布输出；除此以外继承 Arch 默认 `makepkg.conf`。只安装实际构建入口需要的通用工具，已经退出主路径的检查器或构建工具不得继续预装。
+
 CPU、内存和磁盘限制可以作为部署默认值，但不建设资源探测、配额、cgroup 合规或调度平台。
 
 ## 7. 远程接收、签名与 keyring
