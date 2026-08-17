@@ -699,13 +699,17 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     .fetch_one(&pool)
     .await?;
     if legacy_publisher_releases != 0 {
-        sqlx::query("INSERT OR IGNORE INTO publisher_release_jobs(release_id, plan_sha256, plan_json, state, manifest_sha256, last_error, created_at, updated_at) SELECT release_id, envelope_sha256, authorization_json, state, manifest_sha256, last_error, created_at, updated_at FROM publisher_releases")
-            .execute(&pool)
-            .await?;
         sqlx::query("DROP TABLE publisher_releases")
             .execute(&pool)
             .await?;
     }
+    sqlx::query(
+        "DELETE FROM publisher_release_jobs \
+         WHERE json_type(plan_json, '$.release_id') IS NULL \
+         AND json_extract(plan_json, '$.payload_type') = 'aursmith.release_authorization'",
+    )
+    .execute(&pool)
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS attempts(\
          job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
@@ -2664,6 +2668,70 @@ fn status_name(status: JobStatus) -> &'static str {
 #[cfg(test)]
 mod transfer_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn publisher_journal_discards_legacy_signed_envelopes() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("worker.db");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .unwrap()
+            .create_if_missing(true);
+        let database = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE publisher_release_jobs(\
+             release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, \
+             state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&database)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE publisher_releases(release_id TEXT PRIMARY KEY)")
+            .execute(&database)
+            .await
+            .unwrap();
+        let current_release = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO publisher_release_jobs(\
+             release_id, plan_sha256, plan_json, state, created_at, updated_at) \
+             VALUES ('legacy', 'legacy', ?, 'published', ?, ?), (?, 'current', ?, 'published', ?, ?)",
+        )
+        .bind(serde_json::json!({
+            "payload_type": "aursmith.release_authorization",
+            "payload": [],
+            "signature": []
+        }).to_string())
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .bind(&current_release)
+        .bind(serde_json::json!({"release_id": current_release}).to_string())
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&database)
+        .await
+        .unwrap();
+        database.close().await;
+
+        let migrated = connect(&database_url).await.unwrap();
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT release_id FROM publisher_release_jobs ORDER BY release_id")
+                .fetch_all(&migrated)
+                .await
+                .unwrap();
+        let old_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'publisher_releases'",
+        )
+        .fetch_one(&migrated)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![current_release]);
+        assert_eq!(old_table, 0);
+    }
 
     #[test]
     fn reported_failed_attempts_do_not_wait_for_publication() {

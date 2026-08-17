@@ -53,6 +53,10 @@ if rg -q 'immutable' deploy/netcup/Caddyfile.snippet \
 fi
 
 builder_json="$(docker compose -f deploy/builder/compose.yaml config --format json)"
+if [[ "$(jq -r '.services.worker.environment.AURSMITH_CONTROLLER_POLL_URL // ""' <<<"${builder_json}")" != */api/v1/builder/poll ]]; then
+  echo "Builder 必须使用固定 /api/v1/builder/poll 端点" >&2
+  exit 1
+fi
 if [[ "$(jq '[.services | to_entries[] | .key as $service | .value.volumes[]? | select(.source == "/var/run/docker.sock" and .target == "/var/run/docker.sock") | $service] | length' <<<"${builder_json}")" != "1" ]] \
   || [[ "$(jq -r '[.services | to_entries[] | .key as $service | .value.volumes[]? | select(.source == "/var/run/docker.sock" and .target == "/var/run/docker.sock") | $service] | first // ""' <<<"${builder_json}")" != "worker" ]]; then
   echo "只有可信 Builder Worker 必须且只能获得一个 Docker Socket" >&2
@@ -74,8 +78,8 @@ if jq -e '.services | has("ssh")' <<<"${builder_json}" >/dev/null \
   echo "反向 Builder 禁止 SSH sidecar 和公网入站端口" >&2
   exit 1
 fi
-if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_push_key" or .source == "publisher_known_hosts")] | length' <<<"${builder_json}")" != "2" ]]; then
-  echo "反向 Builder 必须使用独立 Publisher 推送密钥和固定 known_hosts" >&2
+if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_push_key" or .source == "publisher_known_hosts" or .source == "controller_bearer_token")] | length' <<<"${builder_json}")" != "3" ]]; then
+  echo "反向 Builder 必须使用 Controller Bearer secret、独立 Publisher 推送密钥和固定 known_hosts" >&2
   exit 1
 fi
 
