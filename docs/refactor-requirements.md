@@ -114,6 +114,8 @@ Builder HTTPS credential 是一份部署 secret，只能调用轮询、输入下
 
 Docker 模板只固定：每次使用全新容器和可写任务目录；`makepkg` 使用普通用户；不使用 privileged 或宿主集成；不挂 Docker Socket、真实密钥和无关目录；设置可配置总超时与日志上限；终态后清理容器；Docker 失败时绝不回退到宿主执行 AUR `PKGBUILD`。
 
+Build 容器必须使用 Docker 自带的 `--init` 处理信号转发和孤儿进程回收；Guest Agent 不得直接充当 PID 1，也不得实现自己的 init 或 reaper。`makepkg` 必须正常继承 Build 镜像提供的标准工具环境，禁止再用 `env -i` 或项目自建环境变量白名单清空环境；Controller、SSH、GPG 等凭据应在创建容器时不传入，而不是在容器内靠清空全部环境补救。
+
 CPU、内存和磁盘限制可以作为部署默认值，但不建设资源探测、配额、cgroup 合规或调度平台。
 
 ## 7. 远程接收、签名与 keyring
