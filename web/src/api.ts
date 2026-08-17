@@ -81,7 +81,6 @@ export type Subscription = {
   id: string;
   package_base: string;
   kind: "direct" | "implicit";
-  state: "active" | "paused" | "retained_without_references";
   reference_count: number;
   followed_outputs: string[];
   version: string | null;
@@ -100,14 +99,6 @@ export type PackageDetail = {
   revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; release_state: string | null; created_at: string }>;
   dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
   events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
-};
-export type RebuildRecommendation = {
-  package_base: string;
-  state: "suggested" | "disabled" | "scheduled" | "resolved";
-  reason: string;
-  changes: Array<{ dependency: string; built_with: string; current: string }>;
-  detected_at: string;
-  updated_at: string;
 };
 export type Audit = {
   sha256: string;
@@ -282,25 +273,10 @@ export const api = {
       "/api/v1/subscriptions",
       { method: "POST", body: JSON.stringify({ package_name: packageName }) }
     ),
-  pauseSubscription: (packageBase: string) =>
-    request<{ package_base: string; state: string }>(
-      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/pause`,
-      { method: "POST" }
-    ),
-  resumeSubscription: (packageBase: string) =>
-    request<{ package_base: string; state: string }>(
-      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/resume`,
-      { method: "POST" }
-    ),
-  unsubscribe: (packageBase: string) =>
-    request<{ package_base: string; direct_subscription: boolean }>(
-      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/unsubscribe`,
-      { method: "POST" }
-    ),
-  purgeSubscription: (packageBase: string) =>
-    request<{ package_base: string; state: string }>(
-      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}/purge`,
-      { method: "POST" }
+  deleteSubscription: (packageBase: string) =>
+    request<{ package_base: string; state: string; batch_id: string; removed_package_bases: string[] }>(
+      `/api/v1/subscriptions/${encodeURIComponent(packageBase)}`,
+      { method: "DELETE" }
     ),
   packageDetail: (packageBase: string) =>
     request<PackageDetail>(`/api/v1/packages/${encodeURIComponent(packageBase)}`),
@@ -314,11 +290,6 @@ export const api = {
       `/api/v1/packages/${encodeURIComponent(packageBase)}/providers/${encodeURIComponent(dependencyName)}`,
       { method: "POST", body: JSON.stringify({ selected_package_base: selectedPackageBase }) }
     ),
-  rebuildRecommendations: () => request<{ items: RebuildRecommendation[] }>("/api/v1/rebuild-recommendations"),
-  disableRebuildRecommendation: (packageBase: string) =>
-    request<{ package_base: string; state: string }>(`/api/v1/rebuild-recommendations/${encodeURIComponent(packageBase)}/disable`, { method: "POST" }),
-  scheduleRebuildRecommendation: (packageBase: string) =>
-    request<{ package_base: string; state: string; batch_id: string }>(`/api/v1/rebuild-recommendations/${encodeURIComponent(packageBase)}/schedule`, { method: "POST" }),
   refreshPackage: (packageBase: string) =>
     request<{ package_base: string; batch_id: string | null; batch_state: string }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/refresh`,

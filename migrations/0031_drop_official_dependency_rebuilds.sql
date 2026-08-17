@@ -1,0 +1,2 @@
+DROP TABLE rebuild_recommendations;
+DROP TABLE artifact_official_dependencies;

@@ -110,7 +110,7 @@ describe("AURsmith 控制台", () => {
       let body: unknown;
       if (url.endsWith("/auth/me")) body = { id: "admin-id", username: "admin" };
       else if (url.endsWith("/requirements")) body = { items: [] };
-      else if (url.endsWith("/subscriptions")) body = { items: [{ id: "sub", package_base: "demo", kind: "direct", state: "active", reference_count: 0, followed_outputs: ["demo"], version: "1-1", description: "演示", outputs: ["demo"], maintainer: "tester", out_of_date: null }] };
+      else if (url.endsWith("/subscriptions")) body = { items: [{ id: "sub", package_base: "demo", kind: "direct", reference_count: 0, followed_outputs: ["demo"], version: "1-1", description: "演示", outputs: ["demo"], maintainer: "tester", out_of_date: null }] };
       else if (url.endsWith("/packages/demo/build-policy") && init?.method === "POST") {
         csrfHeader = new Headers(init.headers).get("X-AURsmith-CSRF");
         allowCheck = false;

@@ -13,7 +13,7 @@ use axum::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
@@ -73,18 +73,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/backups", get(list_backups).post(create_backup))
         .route("/api/v1/backups/{id}/verify", post(verify_backup))
         .route("/api/v1/archive-inventories", get(list_archive_inventories))
-        .route(
-            "/api/v1/rebuild-recommendations",
-            get(list_rebuild_recommendations),
-        )
-        .route(
-            "/api/v1/rebuild-recommendations/{package_base}/disable",
-            post(disable_rebuild_recommendation),
-        )
-        .route(
-            "/api/v1/rebuild-recommendations/{package_base}/schedule",
-            post(schedule_rebuild_recommendation),
-        )
         .route("/api/v1/workers", get(list_workers).post(register_worker))
         .route("/api/v1/reverse-workers/poll", post(reverse_worker_poll))
         .route("/api/v1/workers/{id}/drain", post(drain_worker))
@@ -104,20 +92,8 @@ pub fn router(state: AppState) -> Router {
             get(crate::packages::list_subscriptions).post(crate::packages::subscribe),
         )
         .route(
-            "/api/v1/subscriptions/{package_base}/pause",
-            post(crate::packages::pause),
-        )
-        .route(
-            "/api/v1/subscriptions/{package_base}/resume",
-            post(crate::packages::resume),
-        )
-        .route(
-            "/api/v1/subscriptions/{package_base}/unsubscribe",
-            post(crate::packages::unsubscribe),
-        )
-        .route(
-            "/api/v1/subscriptions/{package_base}/purge",
-            post(crate::packages::purge),
+            "/api/v1/subscriptions/{package_base}",
+            delete(crate::packages::delete_subscription),
         )
         .route(
             "/api/v1/packages/{package_base}",
@@ -759,78 +735,6 @@ async fn list_archive_inventories(
         "file_count": row.get::<i64,_>("file_count"), "byte_count": row.get::<i64,_>("byte_count"),
         "failure_count": row.get::<i64,_>("failure_count"), "checked_at": row.get::<String,_>("checked_at"),
     })).collect::<Vec<_>>() })))
-}
-
-async fn list_rebuild_recommendations(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    auth::require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("SELECT package_base, state, reason, changes_json, detected_at, updated_at FROM rebuild_recommendations ORDER BY CASE state WHEN 'suggested' THEN 0 WHEN 'disabled' THEN 1 ELSE 2 END, updated_at DESC")
-        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
-        "package_base": row.get::<String,_>("package_base"), "state": row.get::<String,_>("state"),
-        "reason": row.get::<String,_>("reason"),
-        "changes": serde_json::from_str::<Value>(row.get("changes_json")).unwrap_or_else(|_| json!([])),
-        "detected_at": row.get::<String,_>("detected_at"), "updated_at": row.get::<String,_>("updated_at")
-    })).collect::<Vec<_>>() })))
-}
-
-async fn disable_rebuild_recommendation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(package_base): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
-    let result = sqlx::query("UPDATE rebuild_recommendations SET state = 'disabled', updated_at = ? WHERE package_base = ? AND state = 'suggested'")
-        .bind(Utc::now()).bind(&package_base).execute(&state.database).await.map_err(ApiError::internal)?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::conflict(
-            "REBUILD_NOT_SUGGESTED",
-            "该软件包没有可关闭的重建建议",
-        ));
-    }
-    append_event(
-        &state.database,
-        "package_base",
-        &package_base,
-        "official_dependency_rebuild_disabled",
-        json!({}),
-        &actor,
-    )
-    .await?;
-    Ok(Json(
-        json!({"package_base": package_base, "state": "disabled"}),
-    ))
-}
-
-async fn schedule_rebuild_recommendation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(package_base): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
-    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rebuild_recommendations WHERE package_base = ? AND state = 'suggested'")
-        .bind(&package_base).fetch_one(&state.database).await.map_err(ApiError::internal)?;
-    if exists == 0 {
-        return Err(ApiError::conflict(
-            "REBUILD_NOT_SUGGESTED",
-            "该软件包没有可调度的重建建议",
-        ));
-    }
-    let batch_id = crate::packages::schedule_rebuild_batch(
-        &state.database,
-        BTreeSet::from([package_base.clone()]),
-        &actor,
-        "official_dependency_changed",
-    )
-    .await?
-    .ok_or_else(|| ApiError::internal("重建批次未创建"))?;
-    sqlx::query("UPDATE rebuild_recommendations SET state = 'scheduled', updated_at = ? WHERE package_base = ?")
-        .bind(Utc::now()).bind(&package_base).execute(&state.database).await.map_err(ApiError::internal)?;
-    Ok(Json(
-        json!({"package_base": package_base, "state": "scheduled", "batch_id": batch_id}),
-    ))
 }
 
 async fn manual_rebuild_package(

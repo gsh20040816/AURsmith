@@ -71,11 +71,6 @@ fn run() -> anyhow::Result<()> {
     reset_build_directory()?;
     copy_tree(Path::new(INPUT), Path::new(BUILD), true)?;
     import_declared_pgp_keys(Path::new(BUILD))?;
-    apply_published_pkgrel(
-        Path::new(BUILD),
-        spec.upstream_pkgrel.as_deref(),
-        spec.published_pkgrel.as_deref(),
-    )?;
     disable_debug_packages(Path::new(BUILD))?;
     run_checked("/usr/bin/chown", &["-R", "builder:builder", BUILD], None)?;
     let result = GuestResult::Build(build(&spec)?);
@@ -84,66 +79,6 @@ fn run() -> anyhow::Result<()> {
         serde_json::to_vec(&result)?,
     )?;
     run_checked("/usr/bin/sync", &[], None)?;
-    Ok(())
-}
-
-fn apply_published_pkgrel(
-    build: &Path,
-    upstream_pkgrel: Option<&str>,
-    published_pkgrel: Option<&str>,
-) -> anyhow::Result<()> {
-    let (Some(upstream_pkgrel), Some(published_pkgrel)) = (upstream_pkgrel, published_pkgrel)
-    else {
-        return Ok(());
-    };
-    if upstream_pkgrel == published_pkgrel {
-        return Ok(());
-    }
-    if [upstream_pkgrel, published_pkgrel].iter().any(|pkgrel| {
-        pkgrel.is_empty()
-            || !pkgrel
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || ".+_".contains(value))
-    }) {
-        bail!("签名 JobSpec 中的发布 pkgrel 非法");
-    }
-    let path = build.join("PKGBUILD");
-    let source = fs::read_to_string(&path).context("PKGBUILD 不是有效 UTF-8")?;
-    let mut replacements = 0_u8;
-    let mut rewritten = String::with_capacity(source.len() + published_pkgrel.len());
-    for line in source.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = content.trim_start();
-        if !content.starts_with(char::is_whitespace)
-            && trimmed.starts_with("pkgrel=")
-            && !trimmed.starts_with("pkgrel+=")
-        {
-            replacements = replacements.saturating_add(1);
-            let original = trimmed.strip_prefix("pkgrel=").unwrap_or_default().trim();
-            let original = original
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-                .or_else(|| {
-                    original
-                        .strip_prefix('"')
-                        .and_then(|value| value.strip_suffix('"'))
-                })
-                .unwrap_or(original);
-            if original != upstream_pkgrel {
-                bail!("PKGBUILD pkgrel 与签名 JobSpec 不一致");
-            }
-            rewritten.push_str(&format!("pkgrel={published_pkgrel}"));
-            if line.ends_with('\n') {
-                rewritten.push('\n');
-            }
-        } else {
-            rewritten.push_str(line);
-        }
-    }
-    if replacements != 1 {
-        bail!("PKGBUILD 必须恰好包含一个顶层 pkgrel 赋值，实际为 {replacements}");
-    }
-    fs::write(path, rewritten)?;
     Ok(())
 }
 
@@ -288,12 +223,6 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
                     "disabled"
                 }
                 .into(),
-            ),
-            (
-                "published_pkgrel".into(),
-                spec.published_pkgrel
-                    .clone()
-                    .unwrap_or_else(|| "upstream".into()),
             ),
         ]
         .into_iter()

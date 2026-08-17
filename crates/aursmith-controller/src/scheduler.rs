@@ -60,17 +60,6 @@ pub fn spawn(state: AppState) {
             });
         }
     });
-    let dependency_state = state.clone();
-    tokio::spawn(async move {
-        let mut timer = interval(std::time::Duration::from_secs(6 * 60 * 60));
-        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            timer.tick().await;
-            if let Err(error) = check_official_dependency_updates(&dependency_state).await {
-                tracing::warn!(%error, "官方依赖重建建议检查失败");
-            }
-        }
-    });
     let notification_state = state.clone();
     tokio::spawn(async move {
         let mut timer = interval(std::time::Duration::from_secs(10));
@@ -331,150 +320,6 @@ async fn run_archive_inventory_if_due(state: &AppState) -> Result<(), ApiError> 
         upsert_operational_alert(state, &format!("archive-inventory:{worker_id}"), "critical", "Archiver 库存巡检发现损坏", json!({"worker_id": worker_id, "full_digest": full_digest, "failures": report.failures})).await?;
     }
     Ok(())
-}
-
-async fn check_official_dependency_updates(state: &AppState) -> Result<(), ApiError> {
-    let rows = sqlx::query("SELECT DISTINCT revisions.package_base, artifact_official_dependencies.package_name, artifact_official_dependencies.package_version FROM system_settings JOIN release_artifacts ON release_artifacts.release_id = json_extract(system_settings.value_json, '$') JOIN artifact_official_dependencies ON artifact_official_dependencies.artifact_sha256 = release_artifacts.artifact_sha256 JOIN artifacts ON artifacts.sha256 = release_artifacts.artifact_sha256 JOIN jobs ON jobs.id = artifacts.job_id JOIN revisions ON revisions.id = jobs.revision_id WHERE system_settings.key = 'current_release_id' ORDER BY artifact_official_dependencies.package_name")
-        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let names = rows
-        .iter()
-        .map(|row| row.get::<String, _>("package_name"))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let endpoint: Option<String> = sqlx::query_scalar("SELECT endpoint FROM workers WHERE role = 'publisher' AND state = 'online' ORDER BY name LIMIT 1")
-        .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
-    let Some(endpoint) = endpoint else {
-        return Ok(());
-    };
-    let mut current = BTreeMap::<String, String>::new();
-    for chunk in names.chunks(50) {
-        let reply = transport::official_info(&state.config, &endpoint, chunk).await?;
-        let Some(items) = reply.data.as_object() else {
-            continue;
-        };
-        for (name, packages) in items {
-            let version = packages
-                .as_array()
-                .and_then(|packages| {
-                    packages
-                        .iter()
-                        .find(|package| matches!(package["arch"].as_str(), Some("x86_64" | "any")))
-                })
-                .and_then(official_package_version);
-            if let Some(version) = version {
-                current.insert(name.clone(), version);
-            }
-        }
-    }
-    let observations = rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("package_base"),
-                row.get::<String, _>("package_name"),
-                row.get::<String, _>("package_version"),
-            )
-        })
-        .collect::<Vec<_>>();
-    let changes = official_dependency_changes(&observations, &current);
-    for package_base in resolved_rebuild_packages(&observations, &current, &changes) {
-        sqlx::query("UPDATE rebuild_recommendations SET state = 'resolved', updated_at = ? WHERE package_base = ? AND state != 'resolved'")
-            .bind(Utc::now()).bind(package_base).execute(&state.database).await.map_err(ApiError::internal)?;
-    }
-    for (package_base, package_changes) in changes {
-        let now = Utc::now();
-        sqlx::query("INSERT INTO rebuild_recommendations(package_base, state, reason, changes_json, detected_at, updated_at) VALUES (?, 'suggested', 'official_dependency_changed', ?, ?, ?) ON CONFLICT(package_base) DO UPDATE SET state = CASE WHEN rebuild_recommendations.state IN ('disabled', 'scheduled') THEN rebuild_recommendations.state ELSE 'suggested' END, reason = excluded.reason, changes_json = excluded.changes_json, detected_at = CASE WHEN rebuild_recommendations.state = 'resolved' THEN excluded.detected_at ELSE rebuild_recommendations.detected_at END, updated_at = excluded.updated_at")
-            .bind(&package_base).bind(json!(package_changes).to_string()).bind(now).bind(now)
-            .execute(&state.database).await.map_err(ApiError::internal)?;
-        upsert_operational_alert(state, &format!("official-dependency-rebuild:{package_base}"), "info", "官方依赖变化，建议重建 AUR 软件包", json!({"package_base": package_base, "changes": package_changes, "abi_detection": "conservative"})).await?;
-    }
-    let resolved: Vec<String> = sqlx::query_scalar(
-        "SELECT package_base FROM rebuild_recommendations WHERE state = 'resolved'",
-    )
-    .fetch_all(&state.database)
-    .await
-    .map_err(ApiError::internal)?;
-    for package_base in resolved {
-        resolve_alert(
-            state,
-            &format!("official-dependency-rebuild:{package_base}"),
-        )
-        .await?;
-    }
-    let due: Vec<String> = sqlx::query_scalar("SELECT package_base FROM rebuild_recommendations WHERE state = 'suggested' AND detected_at <= ? ORDER BY package_base")
-        .bind(Utc::now() - Duration::days(7)).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    let due_set = due.into_iter().collect::<BTreeSet<_>>();
-    if let Some(batch_id) = crate::packages::schedule_rebuild_batch(
-        &state.database,
-        due_set.clone(),
-        "scheduler",
-        "official_dependency_changed",
-    )
-    .await?
-    {
-        for package_base in due_set {
-            sqlx::query("UPDATE rebuild_recommendations SET state = 'scheduled', updated_at = ? WHERE package_base = ? AND state = 'suggested'")
-                .bind(Utc::now()).bind(package_base).execute(&state.database).await.map_err(ApiError::internal)?;
-        }
-        tracing::info!(%batch_id, "已创建每周官方依赖重建批次");
-    }
-    Ok(())
-}
-
-fn official_package_version(package: &serde_json::Value) -> Option<String> {
-    let pkgver = package["pkgver"].as_str()?;
-    let pkgrel = package["pkgrel"].as_str()?;
-    let epoch = package["epoch"].as_u64().unwrap_or_default();
-    let pkgver = if epoch == 0 {
-        pkgver.to_owned()
-    } else {
-        format!("{epoch}:{pkgver}")
-    };
-    Some(format!("{pkgver}-{pkgrel}"))
-}
-
-fn official_dependency_changes(
-    observations: &[(String, String, String)],
-    current: &BTreeMap<String, String>,
-) -> BTreeMap<String, Vec<serde_json::Value>> {
-    let mut changes = BTreeMap::<String, Vec<serde_json::Value>>::new();
-    for (package_base, name, before) in observations {
-        if let Some(after) = current.get(name).filter(|after| after.as_str() != before) {
-            changes
-                .entry(package_base.clone())
-                .or_default()
-                .push(json!({"dependency": name, "built_with": before, "current": after}));
-        }
-    }
-    changes
-}
-
-fn resolved_rebuild_packages(
-    observations: &[(String, String, String)],
-    current: &BTreeMap<String, String>,
-    changes: &BTreeMap<String, Vec<serde_json::Value>>,
-) -> BTreeSet<String> {
-    let mut observed_dependencies = BTreeMap::<String, BTreeSet<String>>::new();
-    for (package_base, dependency, _) in observations {
-        observed_dependencies
-            .entry(package_base.clone())
-            .or_default()
-            .insert(dependency.clone());
-    }
-    observed_dependencies
-        .into_iter()
-        .filter_map(|(package_base, dependencies)| {
-            (!changes.contains_key(&package_base)
-                && dependencies
-                    .iter()
-                    .all(|dependency| current.contains_key(dependency)))
-            .then_some(package_base)
-        })
-        .collect()
 }
 
 async fn dispatch_archive_one(state: &AppState) -> Result<(), ApiError> {
@@ -1653,7 +1498,7 @@ async fn dispatch_job_to_worker(
     worker_id: Uuid,
 ) -> Result<SignedEnvelope, ApiError> {
     let job = sqlx::query(
-        "SELECT required_role, revision_sha256, kind, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
+        "SELECT required_role, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
     )
     .bind(job_id)
     .fetch_optional(&state.database)
@@ -1693,8 +1538,6 @@ async fn dispatch_job_to_worker(
             .unwrap_or_else(|| "0".repeat(64)),
         source_manifest_sha256: job.get("source_manifest_sha256"),
         dependency_snapshot_sha256: job.get("dependency_snapshot_sha256"),
-        upstream_pkgrel: job.get("upstream_pkgrel"),
-        published_pkgrel: job.get("published_pkgrel"),
         dependency_attempt_ids: load_batch_dependency_attempts(state, job_id).await?,
         dependencies: load_job_dependencies(state, job_id).await?,
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
@@ -1741,7 +1584,7 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
     let job = sqlx::query(
-        "SELECT id, batch_id, required_role, revision_sha256, kind, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
+        "SELECT id, batch_id, required_role, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, preferred_worker_id, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json FROM jobs WHERE status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
     )
     .bind(Utc::now())
     .fetch_optional(&state.database)
@@ -1845,8 +1688,6 @@ async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
             .unwrap_or_else(|| "0".repeat(64)),
         source_manifest_sha256: job.get("source_manifest_sha256"),
         dependency_snapshot_sha256: job.get("dependency_snapshot_sha256"),
-        upstream_pkgrel: job.get("upstream_pkgrel"),
-        published_pkgrel: job.get("published_pkgrel"),
         dependency_attempt_ids: load_batch_dependency_attempts(state, &job_id).await?,
         dependencies: load_job_dependencies(state, &job_id).await?,
         inputs: serde_json::from_str(job.get("inputs_json")).map_err(ApiError::internal)?,
@@ -1920,7 +1761,7 @@ async fn publication_backpressure(database: &sqlx::SqlitePool) -> Result<bool, A
 
 async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     let row = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.upstream_pkgrel, jobs.published_pkgrel, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
+        "SELECT jobs.id, jobs.kind, jobs.status AS controller_status, jobs.revision_id, jobs.revision_sha256, jobs.batch_id, revisions.upstream_version, workers.endpoint, workers.connection_mode, reverse_worker_reports.response_json FROM jobs JOIN workers ON workers.id = jobs.worker_id LEFT JOIN revisions ON revisions.id = jobs.revision_id LEFT JOIN reverse_worker_reports ON reverse_worker_reports.worker_id = workers.id AND reverse_worker_reports.job_id = jobs.id WHERE jobs.status IN ('uncertain', 'dispatched', 'running') AND (workers.connection_mode = 'reverse' OR jobs.status != 'uncertain' OR jobs.updated_at <= ?) ORDER BY jobs.updated_at LIMIT 1",
     )
     .bind(Utc::now() - Duration::minutes(30))
     .fetch_optional(&state.database)
@@ -2094,39 +1935,7 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
                 "BuildResult 身份与 Controller 的 Job/Attempt/Revision 不一致",
             ));
         }
-        let expected_version = row
-            .get::<Option<String>, _>("upstream_version")
-            .and_then(|version| {
-                version
-                    .rsplit_once('-')
-                    .map(|(pkgver, _)| pkgver.to_owned())
-            })
-            .zip(row.get::<Option<String>, _>("published_pkgrel"))
-            .map(|(pkgver, pkgrel)| format!("{pkgver}-{pkgrel}"));
-        let passthrough_version = row.get::<Option<String>, _>("upstream_pkgrel")
-            == row.get::<Option<String>, _>("published_pkgrel");
-        let actual_version = accepted_build_version(
-            &build_result.artifacts,
-            expected_version.as_deref(),
-            passthrough_version,
-        )?;
-        let resolved_dependencies = if let Some(revision_id) =
-            row.get::<Option<String>, _>("revision_id")
-        {
-            let payload: Option<String> = sqlx::query_scalar("SELECT payload_json FROM audit_bundles WHERE revision_id = ? AND state = 'approved' ORDER BY created_at DESC LIMIT 1")
-                .bind(revision_id).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?;
-            payload
-                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<aursmith_protocol::ResolvedDependency>>(
-                        value["resolved_dependencies"].clone(),
-                    )
-                    .ok()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let actual_version = accepted_build_version(&build_result.artifacts)?;
         for artifact in &build_result.artifacts {
             sqlx::query("INSERT INTO artifacts(sha256, job_id, path, size, package_name, package_version, architecture, provenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sha256) DO NOTHING")
                 .bind(&artifact.sha256).bind(&job_id).bind(&artifact.path)
@@ -2134,15 +1943,9 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
                 .bind(&artifact.package_name).bind(&artifact.package_version).bind(&artifact.architecture)
                 .bind(serde_json::to_string(&build_result.provenance).map_err(ApiError::internal)?)
                 .bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-            for dependency in &resolved_dependencies {
-                sqlx::query("INSERT OR REPLACE INTO artifact_official_dependencies(artifact_sha256, package_name, package_version, package_sha256) VALUES (?, ?, ?, ?)")
-                    .bind(&artifact.sha256).bind(&dependency.name).bind(&dependency.version).bind(&dependency.package.sha256)
-                    .execute(&mut *transaction).await.map_err(ApiError::internal)?;
-            }
         }
         if let Some(revision_id) = row.get::<Option<String>, _>("revision_id") {
-            sqlx::query("UPDATE revisions SET state = 'built', upstream_version = CASE WHEN ? THEN ? ELSE upstream_version END, published_version = ? WHERE id = ?")
-                .bind(passthrough_version)
+            sqlx::query("UPDATE revisions SET state = 'built', upstream_version = ?, published_version = ? WHERE id = ?")
                 .bind(&actual_version)
                 .bind(&actual_version)
                 .bind(revision_id)
@@ -2168,8 +1971,6 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
 
 fn accepted_build_version(
     artifacts: &[aursmith_protocol::ArtifactRecord],
-    expected_version: Option<&str>,
-    passthrough_version: bool,
 ) -> Result<String, ApiError> {
     let Some(actual_version) = artifacts
         .first()
@@ -2187,12 +1988,6 @@ fn accepted_build_version(
         return Err(ApiError::conflict(
             "PUBLISHED_VERSION_INCONSISTENT",
             "同一次 makepkg 构建返回了不一致的软件包版本",
-        ));
-    }
-    if !passthrough_version && expected_version != Some(actual_version) {
-        return Err(ApiError::conflict(
-            "PUBLISHED_VERSION_MISMATCH",
-            "构建产物版本与 Controller 分配的本地重建版本不一致",
         ));
     }
     Ok(actual_version.to_owned())
@@ -2826,58 +2621,14 @@ mod release_tests {
     #[test]
     fn passthrough_build_uses_the_version_reported_by_makepkg() {
         let artifacts = vec![artifact("subtitleedit", "5.1.0-2")];
-        assert_eq!(
-            accepted_build_version(&artifacts, Some("5.1.0-1"), true).unwrap(),
-            "5.1.0-2"
-        );
+        assert_eq!(accepted_build_version(&artifacts).unwrap(), "5.1.0-2");
     }
 
     #[test]
-    fn locally_derived_rebuild_version_must_still_match() {
-        let artifacts = vec![artifact("demo", "1.0-1")];
-        let error = accepted_build_version(&artifacts, Some("1.0-1.1"), false).unwrap_err();
-        assert_eq!(error.code, "PUBLISHED_VERSION_MISMATCH");
-    }
-
-    #[test]
-    fn official_dependency_version_change_is_grouped_by_affected_package() {
-        let observations = vec![
-            ("alpha".into(), "openssl".into(), "3.5.0-1".into()),
-            ("beta".into(), "zlib".into(), "1.3.1-2".into()),
-        ];
-        let current = BTreeMap::from([
-            ("openssl".into(), "3.5.1-1".into()),
-            ("zlib".into(), "1.3.1-2".into()),
-        ]);
-        let changes = official_dependency_changes(&observations, &current);
-        assert_eq!(changes.keys().cloned().collect::<Vec<_>>(), vec!["alpha"]);
-        assert_eq!(changes["alpha"][0]["current"], "3.5.1-1");
-    }
-
-    #[test]
-    fn official_package_version_preserves_nonzero_epoch() {
-        assert_eq!(
-            official_package_version(&json!({"pkgver": "1.0", "pkgrel": "2", "epoch": 3})),
-            Some("3:1.0-2".into())
-        );
-        assert_eq!(
-            official_package_version(&json!({"pkgver": "1.0", "pkgrel": "2", "epoch": 0})),
-            Some("1.0-2".into())
-        );
-    }
-
-    #[test]
-    fn rebuild_suggestion_is_not_resolved_when_upstream_metadata_is_missing() {
-        let observations = vec![("alpha".into(), "openssl".into(), "3.5.0-1".into())];
-        let current = BTreeMap::new();
-        let changes = official_dependency_changes(&observations, &current);
-        assert!(resolved_rebuild_packages(&observations, &current, &changes).is_empty());
-
-        let current = BTreeMap::from([("openssl".into(), "3.5.0-1".into())]);
-        assert_eq!(
-            resolved_rebuild_packages(&observations, &current, &changes),
-            BTreeSet::from(["alpha".into()])
-        );
+    fn split_outputs_must_report_one_upstream_version() {
+        let artifacts = vec![artifact("demo", "1.0-1"), artifact("demo-doc", "1.0-2")];
+        let error = accepted_build_version(&artifacts).unwrap_err();
+        assert_eq!(error.code, "PUBLISHED_VERSION_INCONSISTENT");
     }
 
     #[test]

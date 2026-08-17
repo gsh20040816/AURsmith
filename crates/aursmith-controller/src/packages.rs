@@ -4,9 +4,7 @@ use crate::{
     routes::{AppState, append_event_in_transaction},
     transport,
 };
-use aursmith_domain::{
-    AuditFile, DependencyGraph, FindingSeverity, PublishedVersion, scan_aur_wrapper,
-};
+use aursmith_domain::{AuditFile, DependencyGraph, FindingSeverity, scan_aur_wrapper};
 use aursmith_protocol::{ReleaseRollbackAuthorization, SignedEnvelope};
 use axum::{
     Json,
@@ -462,7 +460,7 @@ async fn apply_snapshot(
 
     let subscription_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO subscriptions(id, package_base, kind, state, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, 'direct', 'active', 0, ?, '{}', ?, ?) ON CONFLICT(package_base, kind) DO UPDATE SET state = 'active', followed_outputs_json = excluded.followed_outputs_json, updated_at = excluded.updated_at",
+        "INSERT INTO subscriptions(id, package_base, kind, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, 'direct', 0, ?, '{}', ?, ?) ON CONFLICT(package_base, kind) DO UPDATE SET followed_outputs_json = excluded.followed_outputs_json, updated_at = excluded.updated_at",
     )
     .bind(&subscription_id)
     .bind(&snapshot.package_base)
@@ -557,7 +555,7 @@ async fn apply_snapshot(
                 .await
                 .map_err(ApiError::internal)?;
             sqlx::query(
-                "INSERT INTO subscriptions(id, package_base, kind, state, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, 'implicit', 'active', 1, '[]', '{}', ?, ?) ON CONFLICT(package_base, kind) DO UPDATE SET state = 'active', updated_at = excluded.updated_at",
+                "INSERT INTO subscriptions(id, package_base, kind, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, 'implicit', 1, '[]', '{}', ?, ?) ON CONFLICT(package_base, kind) DO UPDATE SET updated_at = excluded.updated_at",
             )
             .bind(Uuid::new_v4().to_string())
             .bind(&target)
@@ -683,7 +681,7 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         };
         let revision_id: String = next.get("revision_id");
         let revision_digests = sqlx::query(
-            "SELECT package_base, upstream_version, input_sha256, provider_selection_sha256 FROM revisions WHERE id = ?",
+            "SELECT input_sha256, provider_selection_sha256 FROM revisions WHERE id = ?",
         )
         .bind(&revision_id)
         .fetch_one(&mut *transaction)
@@ -691,13 +689,6 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         .map_err(ApiError::internal)?;
         let source_manifest_sha256: String = revision_digests.get("input_sha256");
         let dependency_snapshot_sha256: String = revision_digests.get("provider_selection_sha256");
-        let published_version = derive_published_version(
-            &mut transaction,
-            &revision_id,
-            revision_digests.get("package_base"),
-            revision_digests.get("upstream_version"),
-        )
-        .await?;
         let snapshot: UpstreamSnapshot =
             serde_json::from_str(next.get("metadata_json")).map_err(ApiError::internal)?;
         let inputs = snapshot
@@ -729,9 +720,9 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         .await
         .map_err(ApiError::internal)?;
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, upstream_pkgrel, published_pkgrel, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)")
             .bind(Uuid::new_v4().to_string()).bind(&batch_id).bind(&revision_id)
-            .bind(next.get::<String,_>("input_sha256")).bind(&published_version.upstream_pkgrel).bind(published_version.published_pkgrel()).bind(source_manifest_sha256)
+            .bind(next.get::<String,_>("input_sha256")).bind(source_manifest_sha256)
             .bind(dependency_snapshot_sha256)
             .bind(serde_json::to_string(&inputs).map_err(ApiError::internal)?)
             .bind(serde_json::to_string(&inline_inputs).map_err(ApiError::internal)?)
@@ -749,49 +740,6 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         transaction.commit().await.map_err(ApiError::internal)?;
     }
     Ok(())
-}
-
-async fn derive_published_version(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    revision_id: &str,
-    package_base: &str,
-    upstream_full_version: &str,
-) -> Result<PublishedVersion, ApiError> {
-    let previous: Vec<String> = sqlx::query_scalar(
-        "SELECT published_version FROM revisions WHERE package_base = ? AND upstream_version = ? AND id != ? AND state IN ('built', 'published') AND published_version IS NOT NULL",
-    )
-    .bind(package_base)
-    .bind(upstream_full_version)
-    .bind(revision_id)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(ApiError::internal)?;
-    let prefix = format!("{upstream_full_version}.");
-    let mut maximum = None;
-    for value in previous {
-        let generation = if value == upstream_full_version {
-            0
-        } else {
-            value
-                .strip_prefix(&prefix)
-                .and_then(|suffix| suffix.parse::<u32>().ok())
-                .ok_or_else(|| {
-                    ApiError::conflict(
-                        "PUBLISHED_VERSION_INVALID",
-                        format!("历史发布版本 {value} 与上游版本 {upstream_full_version} 不一致"),
-                    )
-                })?
-        };
-        maximum = Some(maximum.map_or(generation, |current: u32| current.max(generation)));
-    }
-    let local_rebuild = match maximum {
-        Some(value) => value.checked_add(1).ok_or_else(|| {
-            ApiError::conflict("PUBLISHED_VERSION_OVERFLOW", "本地重建序号已溢出")
-        })?,
-        None => 0,
-    };
-    PublishedVersion::from_full_version(upstream_full_version, local_rebuild)
-        .map_err(ApiError::internal)
 }
 
 pub(crate) async fn schedule_rebuild_batch(
@@ -938,7 +886,7 @@ pub async fn list_subscriptions(
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT subscriptions.id, subscriptions.package_base, subscriptions.kind, subscriptions.state, subscriptions.reference_count, subscriptions.followed_outputs_json, package_bases.version, package_bases.description, package_bases.outputs_json, package_bases.maintainer, package_bases.out_of_date_at FROM subscriptions LEFT JOIN package_bases ON package_bases.name = subscriptions.package_base WHERE subscriptions.state != 'purged' ORDER BY subscriptions.kind, subscriptions.package_base",
+        "SELECT subscriptions.id, subscriptions.package_base, subscriptions.kind, subscriptions.reference_count, subscriptions.followed_outputs_json, package_bases.version, package_bases.description, package_bases.outputs_json, package_bases.maintainer, package_bases.out_of_date_at FROM subscriptions LEFT JOIN package_bases ON package_bases.name = subscriptions.package_base ORDER BY subscriptions.kind, subscriptions.package_base",
     )
     .fetch_all(&state.database)
     .await
@@ -1050,39 +998,7 @@ pub async fn set_build_policy(
     })))
 }
 
-pub async fn pause(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(package_base): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    change_direct_state(
-        &state,
-        &headers,
-        &package_base,
-        "active",
-        "paused",
-        "subscription_paused",
-    )
-    .await
-}
-
-pub async fn resume(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(package_base): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    change_direct_state(
-        &state,
-        &headers,
-        &package_base,
-        "paused",
-        "active",
-        "subscription_resumed",
-    )
-    .await
-}
-
-pub async fn unsubscribe(
+pub async fn delete_subscription(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(package_base): Path<String>,
@@ -1090,112 +1006,90 @@ pub async fn unsubscribe(
     let actor = auth::require_administrator(&state, &headers).await?;
     validate_name(&package_base)?;
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
+    let removed_package_bases = delete_subscription_rows(&mut transaction, &package_base).await?;
+    let batch_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    sqlx::query("INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, 'queued_removal', ?, NULL, ?, ?)")
+        .bind(&batch_id)
+        .bind(json!({"remove": removed_package_bases}).to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    append_event_in_transaction(
+        &mut transaction,
+        "subscription",
+        &package_base,
+        "subscription_deleted",
+        json!({"batch_id": batch_id, "removed_package_bases": removed_package_bases}),
+        &actor,
+    )
+    .await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "package_base": package_base,
+        "batch_id": batch_id,
+        "state": "queued_removal",
+        "removed_package_bases": removed_package_bases
+    })))
+}
+
+async fn delete_subscription_rows(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    package_base: &str,
+) -> Result<Vec<String>, ApiError> {
     let result =
         sqlx::query("DELETE FROM subscriptions WHERE package_base = ? AND kind = 'direct'")
-            .bind(&package_base)
-            .execute(&mut *transaction)
+            .bind(package_base)
+            .execute(&mut **transaction)
             .await
             .map_err(ApiError::internal)?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("不存在直接订阅"));
     }
     sqlx::query("DELETE FROM subscription_references WHERE owner_package_base = ?")
-        .bind(&package_base)
-        .execute(&mut *transaction)
+        .bind(package_base)
+        .execute(&mut **transaction)
         .await
         .map_err(ApiError::internal)?;
-    recalculate_reference_counts(&mut transaction).await?;
-    append_event_in_transaction(
-        &mut transaction,
-        "subscription",
-        &package_base,
-        "subscription_removed",
-        json!({}),
-        &actor,
-    )
-    .await?;
-    transaction.commit().await.map_err(ApiError::internal)?;
-    Ok(Json(
-        json!({"package_base": package_base, "direct_subscription": false}),
-    ))
-}
 
-pub async fn purge(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(package_base): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(&state, &headers).await?;
-    validate_name(&package_base)?;
-    let references: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM subscription_references WHERE dependency_package_base = ?",
+    let orphaned: Vec<String> = sqlx::query_scalar(
+        "WITH RECURSIVE reachable(package_base) AS (\
+             SELECT package_base FROM subscriptions WHERE kind = 'direct' \
+             UNION \
+             SELECT references_table.dependency_package_base \
+             FROM subscription_references AS references_table \
+             JOIN reachable ON reachable.package_base = references_table.owner_package_base\
+         ) \
+         SELECT package_base FROM subscriptions \
+         WHERE kind = 'implicit' AND package_base NOT IN (SELECT package_base FROM reachable) \
+         ORDER BY package_base",
     )
-    .bind(&package_base)
-    .fetch_one(&state.database)
+    .fetch_all(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    if references > 0 {
-        return Err(ApiError::conflict(
-            "PACKAGE_STILL_REQUIRED",
-            format!("仍有 {references} 个订阅依赖该软件包"),
-        ));
-    }
-    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
-    sqlx::query("UPDATE subscriptions SET state = 'purged', updated_at = ? WHERE package_base = ?")
-        .bind(Utc::now())
-        .bind(&package_base)
-        .execute(&mut *transaction)
-        .await
-        .map_err(ApiError::internal)?;
-    let batch_id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, 'queued_removal', ?, NULL, ?, ?)")
-        .bind(&batch_id).bind(json!({"remove": [&package_base]}).to_string()).bind(Utc::now()).bind(Utc::now())
-        .execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    append_event_in_transaction(
-        &mut transaction,
-        "subscription",
-        &package_base,
-        "package_purge_requested",
-        json!({"batch_id": batch_id}),
-        &actor,
-    )
-    .await?;
-    transaction.commit().await.map_err(ApiError::internal)?;
-    Ok(Json(
-        json!({"package_base": package_base, "batch_id": batch_id, "state": "queued_removal"}),
-    ))
-}
 
-async fn change_direct_state(
-    state: &AppState,
-    headers: &HeaderMap,
-    package_base: &str,
-    from: &str,
-    to: &str,
-    event: &str,
-) -> Result<Json<Value>, ApiError> {
-    let actor = auth::require_administrator(state, headers).await?;
-    validate_name(package_base)?;
-    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
-    let result = sqlx::query("UPDATE subscriptions SET state = ?, updated_at = ? WHERE package_base = ? AND kind = 'direct' AND state = ?")
-        .bind(to).bind(Utc::now()).bind(package_base).bind(from).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::conflict(
-            "INVALID_SUBSCRIPTION_STATE",
-            "订阅当前状态不允许此操作",
-        ));
+    for orphan in &orphaned {
+        sqlx::query("DELETE FROM subscription_references WHERE owner_package_base = ? OR dependency_package_base = ?")
+            .bind(orphan)
+            .bind(orphan)
+            .execute(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        sqlx::query("DELETE FROM subscriptions WHERE package_base = ? AND kind = 'implicit'")
+            .bind(orphan)
+            .execute(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
     }
-    append_event_in_transaction(
-        &mut transaction,
-        "subscription",
-        package_base,
-        event,
-        json!({"state": to}),
-        &actor,
-    )
-    .await?;
-    transaction.commit().await.map_err(ApiError::internal)?;
-    Ok(Json(json!({"package_base": package_base, "state": to})))
+    recalculate_reference_counts(transaction).await?;
+
+    let mut removed = orphaned;
+    removed.push(package_base.to_owned());
+    removed.sort();
+    removed.dedup();
+    Ok(removed)
 }
 
 pub async fn list_batches(
@@ -1423,7 +1317,7 @@ pub async fn select_provider(
 
 pub async fn refresh_due(state: &AppState) -> Result<(), ApiError> {
     let rows = sqlx::query(
-        "SELECT subscriptions.package_base FROM subscriptions LEFT JOIN package_sync_state ON package_sync_state.package_base = subscriptions.package_base WHERE subscriptions.kind = 'direct' AND subscriptions.state = 'active' AND (package_sync_state.next_check_at IS NULL OR package_sync_state.next_check_at <= ?) ORDER BY subscriptions.package_base LIMIT 10",
+        "SELECT subscriptions.package_base FROM subscriptions LEFT JOIN package_sync_state ON package_sync_state.package_base = subscriptions.package_base WHERE subscriptions.kind = 'direct' AND (package_sync_state.next_check_at IS NULL OR package_sync_state.next_check_at <= ?) ORDER BY subscriptions.package_base LIMIT 10",
     )
     .bind(Utc::now())
     .fetch_all(&state.database)
@@ -1468,8 +1362,6 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
                     .is_some_and(|packages| !packages.is_empty())
             })
         }) {
-            sqlx::query("UPDATE subscriptions SET state = 'paused', updated_at = ? WHERE package_base = ? AND kind = 'direct'")
-                .bind(now).bind(package_base).execute(&state.database).await.map_err(ApiError::internal)?;
             sqlx::query("INSERT INTO alerts(id, fingerprint, severity, state, title, details_json, opened_at) VALUES (?, ?, 'info', 'open', ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET state = 'open', details_json = excluded.details_json, resolved_at = NULL")
                 .bind(Uuid::new_v4().to_string()).bind(format!("official-promotion:{package_base}"))
                 .bind(format!("软件包已进入 Arch 官方仓库：{package_base}"))
@@ -1618,7 +1510,7 @@ async fn recalculate_reference_counts(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "WITH RECURSIVE reachable(package_base) AS (\
-             SELECT package_base FROM subscriptions WHERE kind = 'direct' AND state IN ('active', 'paused') \
+             SELECT package_base FROM subscriptions WHERE kind = 'direct' \
              UNION \
              SELECT references_table.dependency_package_base \
              FROM subscription_references AS references_table \
@@ -1634,7 +1526,7 @@ async fn recalculate_reference_counts(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("UPDATE subscriptions SET reference_count = (SELECT COUNT(*) FROM subscription_references WHERE dependency_package_base = subscriptions.package_base), state = CASE WHEN kind = 'implicit' AND (SELECT COUNT(*) FROM subscription_references WHERE dependency_package_base = subscriptions.package_base) = 0 THEN 'retained_without_references' WHEN kind = 'implicit' THEN 'active' ELSE state END, updated_at = ? WHERE kind = 'implicit'")
+    sqlx::query("UPDATE subscriptions SET reference_count = (SELECT COUNT(*) FROM subscription_references WHERE dependency_package_base = subscriptions.package_base), updated_at = ? WHERE kind = 'implicit'")
         .bind(Utc::now()).execute(&mut **transaction).await.map_err(ApiError::internal)?;
     Ok(())
 }
@@ -1841,7 +1733,7 @@ async fn upsert_implicit_node(
     .await
     .map_err(ApiError::internal)?;
     sqlx::query(
-        "INSERT INTO subscriptions(id, package_base, kind, state, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, 'implicit', 'active', 0, '[]', '{}', ?, ?) ON CONFLICT(package_base, kind) DO UPDATE SET state = 'active', updated_at = excluded.updated_at",
+        "INSERT INTO subscriptions(id, package_base, kind, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, 'implicit', 0, '[]', '{}', ?, ?) ON CONFLICT(package_base, kind) DO UPDATE SET updated_at = excluded.updated_at",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&snapshot.package_base)
@@ -1939,8 +1831,11 @@ async fn load_dependency_graph(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<DependencyGraph, ApiError> {
     let mut graph = DependencyGraph::default();
-    let packages: Vec<String> = sqlx::query_scalar("SELECT DISTINCT package_base FROM subscriptions WHERE state IN ('active', 'paused', 'retained_without_references')")
-        .fetch_all(&mut **transaction).await.map_err(ApiError::internal)?;
+    let packages: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT package_base FROM subscriptions")
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
     for package in packages {
         graph.add_package(package);
     }
@@ -1962,7 +1857,7 @@ async fn load_dependency_graph(
 fn subscription_json(row: sqlx::sqlite::SqliteRow) -> Result<Value, ApiError> {
     Ok(json!({
         "id": row.get::<String, _>("id"), "package_base": row.get::<String, _>("package_base"),
-        "kind": row.get::<String, _>("kind"), "state": row.get::<String, _>("state"),
+        "kind": row.get::<String, _>("kind"),
         "reference_count": row.get::<i64, _>("reference_count"),
         "followed_outputs": parse_json::<Vec<String>>(row.get("followed_outputs_json"))?,
         "version": row.get::<Option<String>, _>("version"), "description": row.get::<Option<String>, _>("description"),
@@ -2395,7 +2290,7 @@ mod tests {
             &database,
             BTreeSet::from(["demo".into()]),
             "scheduler",
-            "official_dependency_changed",
+            "manual_rebuild",
         )
         .await
         .unwrap()
@@ -2499,52 +2394,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_pkgrel_increments_when_upstream_version_does_not_change() {
-        let database = crate::db::connect("sqlite::memory:").await.unwrap();
-        let first = apply_snapshot(
-            &database,
-            "tester",
-            &package(),
-            &snapshot(),
-            &[],
-            &empty_closure(),
-        )
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE revisions SET state = 'built', published_version = '1.0-1' WHERE id = ?",
-        )
-        .bind(first["revision_id"].as_str().unwrap())
-        .execute(&database)
-        .await
-        .unwrap();
-        let mut changed = snapshot();
-        changed.aur_commit = "c".repeat(40);
-        let second = apply_snapshot(
-            &database,
-            "tester",
-            &package(),
-            &changed,
-            &[],
-            &empty_closure(),
-        )
-        .await
-        .unwrap();
-        let mut transaction = database.begin().await.unwrap();
-        let version = derive_published_version(
-            &mut transaction,
-            second["revision_id"].as_str().unwrap(),
-            "demo",
-            "1.0-1",
-        )
-        .await
-        .unwrap();
-        assert_eq!(version.published_pkgrel(), "1.1");
-        assert_eq!(version.display(), "1.0-1.1");
-        transaction.rollback().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn split_output_filter_must_be_a_subset() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         let result = apply_snapshot(
@@ -2622,15 +2471,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_a_direct_root_releases_its_transitive_implicit_dependencies() {
+    async fn deleting_a_direct_root_removes_only_its_orphaned_dependency_closure() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         let now = Utc::now();
         for (package_base, kind, references) in [
             ("root", "direct", 0_i64),
             ("middle", "implicit", 1),
             ("leaf", "implicit", 1),
+            ("shared-root", "direct", 0),
+            ("shared", "implicit", 2),
         ] {
-            sqlx::query("INSERT INTO subscriptions(id, package_base, kind, state, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, '[]', '{}', ?, ?)")
+            sqlx::query("INSERT INTO subscriptions(id, package_base, kind, reference_count, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES (?, ?, ?, ?, '[]', '{}', ?, ?)")
                 .bind(Uuid::new_v4().to_string())
                 .bind(package_base)
                 .bind(kind)
@@ -2641,7 +2492,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for (owner, dependency) in [("root", "middle"), ("middle", "leaf")] {
+        for (owner, dependency) in [
+            ("root", "middle"),
+            ("middle", "leaf"),
+            ("root", "shared"),
+            ("shared-root", "shared"),
+        ] {
             sqlx::query("INSERT INTO subscription_references(owner_package_base, dependency_package_base, created_at) VALUES (?, ?, ?)")
                 .bind(owner)
                 .bind(dependency)
@@ -2651,29 +2507,27 @@ mod tests {
                 .unwrap();
         }
         let mut transaction = database.begin().await.unwrap();
-        sqlx::query("DELETE FROM subscriptions WHERE package_base = 'root' AND kind = 'direct'")
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM subscription_references WHERE owner_package_base = 'root'")
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-        recalculate_reference_counts(&mut transaction)
+        let removed = delete_subscription_rows(&mut transaction, "root")
             .await
             .unwrap();
         transaction.commit().await.unwrap();
 
-        let retained: Vec<(String, i64)> = sqlx::query_as("SELECT package_base, reference_count FROM subscriptions WHERE state = 'retained_without_references' ORDER BY package_base")
-            .fetch_all(&database)
-            .await
-            .unwrap();
-        assert_eq!(retained, vec![("leaf".into(), 0), ("middle".into(), 0)]);
+        assert_eq!(removed, vec!["leaf", "middle", "root"]);
+        let retained: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT package_base, reference_count FROM subscriptions ORDER BY package_base",
+        )
+        .fetch_all(&database)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            vec![("shared".into(), 1), ("shared-root".into(), 0)]
+        );
         let references: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_references")
             .fetch_one(&database)
             .await
             .unwrap();
-        assert_eq!(references, 0);
+        assert_eq!(references, 1);
     }
 
     #[tokio::test]

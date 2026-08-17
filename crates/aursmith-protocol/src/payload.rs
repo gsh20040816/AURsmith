@@ -27,14 +27,6 @@ pub struct DependencyInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedDependency {
-    pub name: String,
-    pub version: String,
-    pub source: DependencySource,
-    pub package: ManifestEntry,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub cpu_count: u16,
     pub memory_mib: u64,
@@ -65,10 +57,6 @@ pub struct JobSpec {
     pub revision_sha256: String,
     pub source_manifest_sha256: Option<String>,
     pub dependency_snapshot_sha256: Option<String>,
-    #[serde(default)]
-    pub upstream_pkgrel: Option<String>,
-    #[serde(default)]
-    pub published_pkgrel: Option<String>,
     #[serde(default)]
     pub dependency_attempt_ids: Vec<Uuid>,
     #[serde(default)]
@@ -299,8 +287,6 @@ mod tests {
             revision_sha256: "a".repeat(64),
             source_manifest_sha256: None,
             dependency_snapshot_sha256: None,
-            upstream_pkgrel: None,
-            published_pkgrel: None,
             dependency_attempt_ids: Vec::new(),
             dependencies: Vec::new(),
             inputs: Vec::new(),

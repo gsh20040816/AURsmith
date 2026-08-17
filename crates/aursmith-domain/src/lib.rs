@@ -4,11 +4,9 @@ pub mod credentials;
 pub mod dependency;
 pub mod model;
 pub mod requirements;
-pub mod version;
 
 pub use audit::{AgentVerdict, AuditDecision, LowCostRoute};
 pub use audit_scan::{AuditFile, DeterministicFinding, FindingSeverity, scan_aur_wrapper};
 pub use dependency::{DependencyGraph, GraphError};
 pub use model::*;
 pub use requirements::{REQUIREMENTS, Requirement};
-pub use version::{PublishedVersion, VersionError};
