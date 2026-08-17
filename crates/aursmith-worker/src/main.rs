@@ -1965,29 +1965,41 @@ fn activate_committed_release(
     }
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
-    for artifact in manifest
+    let changed_artifacts = manifest
         .artifacts
         .iter()
         .chain(manifest.repository_keyring.iter())
-    {
+        .filter_map(|artifact| {
+            let source = committed.join(&artifact.path);
+            let source_signature = committed.join(format!("{}.sig", artifact.path));
+            let hot = arch_root.join(&artifact.path);
+            let hot_signature = arch_root.join(format!("{}.sig", artifact.path));
+            match (
+                paths_are_same_regular_file(&source, &hot),
+                paths_are_same_regular_file(&source_signature, &hot_signature),
+            ) {
+                (Ok(true), Ok(true)) => None,
+                (Ok(_), Ok(_)) => Some(Ok(artifact)),
+                (Err(error), _) | (_, Err(error)) => Some(Err(error)),
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for artifact in &changed_artifacts {
         let entry = aursmith_protocol::ManifestEntry {
             path: artifact.path.clone(),
             sha256: artifact.sha256.clone(),
             size: artifact.size,
         };
         verify_signed_entry(worker, committed, &entry)?;
-        copy_or_replace_regular(
+    }
+    for artifact in changed_artifacts {
+        replace_with_preverified_regular(
             &committed.join(&artifact.path),
             &arch_root.join(&artifact.path),
         )?;
         let hot_signature = arch_root.join(format!("{}.sig", artifact.path));
-        copy_or_replace_regular(
+        replace_with_preverified_regular(
             &committed.join(format!("{}.sig", artifact.path)),
-            &hot_signature,
-        )?;
-        verify_gpg_signature(
-            &worker.publisher_gpg_home,
-            &arch_root.join(&artifact.path),
             &hot_signature,
         )?;
     }
@@ -2220,6 +2232,9 @@ fn link_or_copy_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
 }
 
 fn copy_or_replace_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if paths_are_same_regular_file(source, target)? {
+        return Ok(());
+    }
     if target.exists() {
         if file_sha256(source)? == file_sha256(target)? {
             return Ok(());
@@ -2229,6 +2244,41 @@ fn copy_or_replace_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("发布目标没有父目录：{}", target.display()))?;
     let temporary = parent.join(format!(".aursmith-publish-{}", Uuid::new_v4()));
+    let result = (|| {
+        link_or_copy_regular(source, &temporary)?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::rename(&temporary, target)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn paths_are_same_regular_file(source: &Path, target: &Path) -> anyhow::Result<bool> {
+    let source_metadata = std::fs::symlink_metadata(source)?;
+    if !source_metadata.file_type().is_file() {
+        bail!("拒绝使用非普通文件：{}", source.display());
+    }
+    let target_metadata = match std::fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !target_metadata.file_type().is_file() {
+        bail!("拒绝替换非普通文件：{}", target.display());
+    }
+    use std::os::unix::fs::MetadataExt;
+    Ok(source_metadata.dev() == target_metadata.dev()
+        && source_metadata.ino() == target_metadata.ino())
+}
+
+fn replace_with_preverified_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("发布目标没有父目录：{}", target.display()))?;
+    let temporary = parent.join(format!(".aursmith-rollback-{}", Uuid::new_v4()));
     let result = (|| {
         link_or_copy_regular(source, &temporary)?;
         std::fs::File::open(&temporary)?.sync_all()?;
@@ -2792,6 +2842,24 @@ mod transfer_tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn rollback_distinguishes_retained_hardlinks_from_changed_files() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release.pkg.tar.zst");
+        let retained = root.path().join("retained.pkg.tar.zst");
+        let changed = root.path().join("changed.pkg.tar.zst");
+        let symlink = root.path().join("symlink.pkg.tar.zst");
+        std::fs::write(&release, b"verified package").unwrap();
+        std::fs::hard_link(&release, &retained).unwrap();
+        std::fs::copy(&release, &changed).unwrap();
+        std::os::unix::fs::symlink(&release, &symlink).unwrap();
+
+        assert!(paths_are_same_regular_file(&release, &retained).unwrap());
+        assert!(!paths_are_same_regular_file(&release, &changed).unwrap());
+        assert!(!paths_are_same_regular_file(&release, &root.path().join("missing")).unwrap());
+        assert!(paths_are_same_regular_file(&release, &symlink).is_err());
     }
 
     #[test]

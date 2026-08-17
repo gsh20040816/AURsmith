@@ -38,7 +38,14 @@ pub async fn authorize_rollback(
     request: &ReleaseRollbackRequest,
 ) -> Result<WorkerReply, ApiError> {
     let body = serde_json::to_vec(request).map_err(ApiError::internal)?;
-    invoke(config, endpoint, "authorize-rollback", Some(body)).await
+    invoke_with_timeout(
+        config,
+        endpoint,
+        "authorize-rollback",
+        Some(body),
+        Duration::from_secs(90),
+    )
+    .await
 }
 
 pub async fn query_release(
@@ -115,6 +122,23 @@ async fn invoke(
     remote_command: &str,
     stdin: Option<Vec<u8>>,
 ) -> Result<WorkerReply, ApiError> {
+    invoke_with_timeout(
+        config,
+        endpoint,
+        remote_command,
+        stdin,
+        Duration::from_secs(20),
+    )
+    .await
+}
+
+async fn invoke_with_timeout(
+    config: &Config,
+    endpoint: &str,
+    remote_command: &str,
+    stdin: Option<Vec<u8>>,
+    command_timeout: Duration,
+) -> Result<WorkerReply, ApiError> {
     let endpoint = ParsedEndpoint::parse(endpoint)?;
     let mut command = Command::new("ssh");
     command
@@ -156,7 +180,7 @@ async fn invoke(
             .await
             .map_err(ApiError::internal)?;
     }
-    let output = timeout(Duration::from_secs(20), child.wait_with_output())
+    let output = timeout(command_timeout, child.wait_with_output())
         .await
         .map_err(|_| ApiError::internal("Worker SSH 调用超时"))?
         .map_err(ApiError::internal)?;
