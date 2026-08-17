@@ -29,19 +29,12 @@ services:
       AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
       AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
       AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:-https://repo.aursmith.lan}
-      AURSMITH_CLIENT_CA_CERTIFICATE_FILE: ${AURSMITH_CLIENT_CA_CERTIFICATE_FILE:-}
-      AURSMITH_WEBHOOK_URL: ${AURSMITH_WEBHOOK_URL:-}
-      AURSMITH_WEBHOOK_HMAC_SECRET_FILE: /run/secrets/webhook_hmac_secret
-      AURSMITH_NTFY_URL: ${AURSMITH_NTFY_URL:-}
-      AURSMITH_BACKUP_DIR: /var/lib/aursmith/backups
-      AURSMITH_BACKUP_EXPORT_DIR: /var/lib/aursmith/transfers
-      AURSMITH_BACKUP_EXPORT_SOCKET: /run/aursmith/worker.sock
+      AURSMITH_BUILDER_TOKEN_SHA256: ${AURSMITH_BUILDER_TOKEN_SHA256:?必须设置固定 Builder Bearer secret 的 SHA-256}
       RUST_LOG: ${RUST_LOG:-aursmith=info}
     secrets:
       - controller_signing_key
       - worker_ssh_key
       - worker_known_hosts
-      - webhook_hmac_secret
     volumes:
       - controller-data:/var/lib/aursmith
       - controller-run:/run/aursmith
@@ -56,40 +49,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    restart: unless-stopped
-
-  backup-ssh:
-    profiles: [external-archiver]
-    build:
-      context: ../..
-      dockerfile: deploy/images/controller.Dockerfile
-      args:
-        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
-    entrypoint: [/usr/local/bin/aursmithctl]
-    command: [run-sshd]
-    user: "0:0"
-    read_only: true
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_READ_SEARCH, SETGID, SETPCAP, SETUID]
-    security_opt: [no-new-privileges:true]
-    volumes:
-      - controller-run:/run/aursmith
-      - controller-data:/jobs:ro
-      - ../common/sshd_config:/etc/ssh/sshd_config:ro
-    secrets:
-      - source: source_ssh_host_ed25519_key
-        target: ssh_host_ed25519_key
-      - source: source_authorized_keys
-        target: authorized_keys
-    tmpfs:
-      - /tmp:size=16m,mode=1777
-      - /run/private:uid=0,gid=0,mode=0755,size=2m
-    ports:
-      - ${AURSMITH_BACKUP_SSH_BIND:-127.0.0.1:2221}:2222
-    networks: [control, edge]
-    depends_on:
-      controller:
-        condition: service_healthy
     restart: unless-stopped
 
   agent-low-1: &agent-runner
@@ -185,12 +144,6 @@ secrets:
     file: ${AURSMITH_WORKER_SSH_KEY_FILE:-./secrets/worker_ssh_key}
   worker_known_hosts:
     file: ${AURSMITH_WORKER_KNOWN_HOSTS_FILE:-./secrets/worker_known_hosts}
-  webhook_hmac_secret:
-    file: ${AURSMITH_WEBHOOK_HMAC_SECRET_FILE:-./secrets/webhook_hmac_secret}
-  source_ssh_host_ed25519_key:
-    file: ${AURSMITH_BACKUP_SSH_HOST_KEY_FILE:-./secrets/backup_ssh_host_ed25519_key}
-  source_authorized_keys:
-    file: ${AURSMITH_BACKUP_AUTHORIZED_KEYS_FILE:-./secrets/backup_authorized_keys}
   low_agent_1_api_key:
     file: ${AURSMITH_LOW_AGENT_1_API_KEY_FILE:-./secrets/low_agent_1_api_key}
   low_agent_2_api_key:

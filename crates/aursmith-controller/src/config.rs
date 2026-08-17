@@ -24,6 +24,7 @@ pub struct Config {
     pub repository_name: String,
     pub source_git_commit: String,
     pub repository_base_url: String,
+    pub builder_token_sha256: String,
 }
 
 impl Config {
@@ -43,6 +44,16 @@ impl Config {
             MAXIMUM_SESSION_ABSOLUTE_HOURS,
         )?;
         validate_session_durations(session_idle_minutes, session_absolute_hours)?;
+        let builder_token_sha256 = env::var("AURSMITH_BUILDER_TOKEN_SHA256").context(
+            "必须设置固定 Builder Bearer secret 的 SHA-256：AURSMITH_BUILDER_TOKEN_SHA256",
+        )?;
+        if builder_token_sha256.len() != 64
+            || !builder_token_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("AURSMITH_BUILDER_TOKEN_SHA256 必须是 64 位十六进制 SHA-256");
+        }
         Ok(Self {
             bind_address: env::var("AURSMITH_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             database_url: env::var("AURSMITH_DATABASE_URL")
@@ -83,6 +94,7 @@ impl Config {
                 .unwrap_or_else(|_| "development".into()),
             repository_base_url: env::var("AURSMITH_REPOSITORY_BASE_URL")
                 .unwrap_or_else(|_| "https://repo.aursmith.lan".into()),
+            builder_token_sha256: builder_token_sha256.to_ascii_lowercase(),
         })
     }
 

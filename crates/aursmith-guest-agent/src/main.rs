@@ -1,7 +1,5 @@
 use anyhow::{Context, bail};
-use aursmith_protocol::{
-    ArtifactRecord, BuildResult, GuestResult, JobKind, JobSpec, SignedEnvelope,
-};
+use aursmith_protocol::{ArtifactRecord, BuildResult, GuestResult, JobKind, JobSpec};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::{
@@ -53,15 +51,9 @@ fn guest_error_code(error: &anyhow::Error) -> &'static str {
 }
 
 fn run() -> anyhow::Result<()> {
-    let controller_key = controller_key()?;
-    let envelope_bytes =
-        fs::read(format!("{INPUT}/.aursmith/job-envelope.json")).context("缺少 Build JobSpec")?;
-    let envelope: SignedEnvelope =
-        serde_json::from_slice(&envelope_bytes).context("Build JobSpec JSON 无效")?;
-    if envelope.verifying_key != controller_key {
-        bail!("Build JobSpec Controller 公钥不匹配");
-    }
-    let spec: JobSpec = envelope.verify("aursmith.job_spec")?;
+    let spec_bytes =
+        fs::read(format!("{INPUT}/.aursmith/job-spec.json")).context("缺少 Build JobSpec")?;
+    let spec: JobSpec = serde_json::from_slice(&spec_bytes).context("Build JobSpec JSON 无效")?;
     if spec.is_expired_at(Utc::now()) {
         bail!("Build JobSpec 已过期");
     }
@@ -421,16 +413,6 @@ fn run_as_builder_status(
             last_progress = Instant::now();
         }
     }
-}
-
-fn controller_key() -> anyhow::Result<Vec<u8>> {
-    let value = std::env::var("AURSMITH_CONTROLLER_VERIFYING_KEY_HEX")
-        .context("缺少 Controller 公钥环境变量")?;
-    let bytes = hex::decode(value)?;
-    if bytes.len() != 32 {
-        bail!("Controller 公钥长度无效");
-    }
-    Ok(bytes)
 }
 
 fn reset_build_directory() -> anyhow::Result<()> {

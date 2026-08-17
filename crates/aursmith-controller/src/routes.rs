@@ -1,6 +1,6 @@
 use crate::{auth, config::Config, error::ApiError};
 use aursmith_domain::credentials;
-use aursmith_protocol::{ReverseWorkerLease, ReverseWorkerPoll, SignedEnvelope};
+use aursmith_protocol::{BuilderLease, BuilderPoll};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -50,7 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/client-bootstrap", get(client_bootstrap))
         .route("/api/v1/doctor", get(doctor_status))
-        .route("/api/v1/reverse-workers/poll", post(reverse_worker_poll))
+        .route("/api/v1/builder/poll", post(builder_poll))
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs/{id}/evidence", get(job_evidence))
         .route("/api/v1/audits", get(crate::audits::list))
@@ -397,19 +397,12 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Va
     Ok(Json(json!({"id": id, "username": username})))
 }
 
-async fn reverse_worker_poll(
+async fn builder_poll(
     State(state): State<AppState>,
-    Json(envelope): Json<SignedEnvelope>,
-) -> Result<Json<ReverseWorkerLease>, ApiError> {
-    if envelope.schema_major != aursmith_protocol::PROTOCOL_MAJOR {
-        return Err(ApiError::conflict(
-            "INCOMPATIBLE_PROTOCOL",
-            "协议 major version 不兼容",
-        ));
-    }
-    let poll: ReverseWorkerPoll = envelope
-        .verify("aursmith.reverse_worker_poll")
-        .map_err(|error| ApiError::conflict("INVALID_WORKER_SIGNATURE", error.to_string()))?;
+    headers: HeaderMap,
+    Json(poll): Json<BuilderPoll>,
+) -> Result<Json<BuilderLease>, ApiError> {
+    auth::require_builder(&state, &headers)?;
     if (Utc::now() - poll.sent_at).num_seconds().unsigned_abs() > 120 {
         return Err(ApiError::conflict(
             "STALE_WORKER_POLL",
@@ -417,39 +410,18 @@ async fn reverse_worker_poll(
         ));
     }
     let worker = sqlx::query(
-        "SELECT identity_signing_key_hex, protocol_version FROM workers WHERE id = ? AND role = 'builder' AND connection_mode = 'reverse'",
+        "SELECT id FROM workers WHERE role = 'builder' AND connection_mode = 'reverse' ORDER BY created_at LIMIT 1",
     )
-    .bind(poll.worker_id.to_string())
     .fetch_optional(&state.database)
     .await
     .map_err(ApiError::internal)?
-    .ok_or_else(|| ApiError::not_found("反向 Builder 尚未注册"))?;
-    let expected_key: String = worker.get("identity_signing_key_hex");
-    if hex::encode(&envelope.verifying_key) != expected_key.to_ascii_lowercase() {
-        return Err(ApiError::conflict(
-            "WORKER_IDENTITY_MISMATCH",
-            "Builder 身份公钥不匹配",
-        ));
-    }
-    let inserted = sqlx::query(
-        "INSERT INTO reverse_worker_nonces(worker_id, nonce, seen_at) VALUES (?, ?, ?)",
-    )
-    .bind(poll.worker_id.to_string())
-    .bind(poll.nonce.to_string())
-    .bind(Utc::now())
-    .execute(&state.database)
-    .await;
-    if inserted.is_err() {
-        return Err(ApiError::conflict(
-            "WORKER_POLL_REPLAY",
-            "Builder 轮询 nonce 已使用",
-        ));
-    }
+    .ok_or_else(|| ApiError::not_found("固定 Builder 尚未初始化"))?;
+    let worker_id = Uuid::parse_str(worker.get("id")).map_err(ApiError::internal)?;
     let mut acknowledged_attempts = Vec::new();
     for report in poll.attempts {
         let result = sqlx::query("INSERT INTO reverse_worker_reports(worker_id, job_id, response_json, updated_at) SELECT ?, id, ?, ? FROM jobs WHERE id = ? AND worker_id = ? ON CONFLICT(worker_id, job_id) DO UPDATE SET response_json = excluded.response_json, updated_at = excluded.updated_at")
-            .bind(poll.worker_id.to_string()).bind(report.response.to_string())
-            .bind(Utc::now()).bind(report.job_id.to_string()).bind(poll.worker_id.to_string())
+            .bind(worker_id.to_string()).bind(report.response.to_string())
+            .bind(Utc::now()).bind(report.job_id.to_string()).bind(worker_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
         if result.rows_affected() > 0 {
             acknowledged_attempts.push(report.job_id);
@@ -458,31 +430,24 @@ async fn reverse_worker_poll(
     for capability_id in poll.completed_transfers {
         sqlx::query("UPDATE transfer_capabilities SET state = 'verified', last_error = NULL, export_cleaned_at = COALESCE(export_cleaned_at, ?), updated_at = ? WHERE id = ? AND source_worker_id = ? AND state IN ('export_ready', 'verified')")
             .bind(Utc::now())
-            .bind(Utc::now()).bind(capability_id.to_string()).bind(poll.worker_id.to_string())
+            .bind(Utc::now()).bind(capability_id.to_string()).bind(worker_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
     }
     let status = &poll.status;
-    if status["instance_id"].as_str() != Some(&poll.worker_id.to_string())
-        || status["role"].as_str() != Some("builder")
-        || status["protocol_major"].as_i64() != Some(worker.get("protocol_version"))
-    {
-        sqlx::query("UPDATE workers SET state = 'incompatible', status_json = ?, updated_at = ? WHERE id = ?")
-            .bind(status.to_string()).bind(Utc::now()).bind(poll.worker_id.to_string())
-            .execute(&state.database).await.map_err(ApiError::internal)?;
+    if status["role"].as_str() != Some("builder") {
         return Err(ApiError::conflict(
-            "WORKER_IDENTITY_MISMATCH",
-            "Builder 状态身份或协议不匹配",
+            "INVALID_BUILDER_STATUS",
+            "Builder 状态角色无效",
         ));
     }
-    sqlx::query("UPDATE workers SET state = 'online', status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ? AND state != 'draining'")
+    sqlx::query("UPDATE workers SET state = 'online', status_json = ?, last_seen_at = ?, updated_at = ? WHERE id = ?")
         .bind(status.to_string())
-        .bind(Utc::now()).bind(Utc::now()).bind(poll.worker_id.to_string())
+        .bind(Utc::now()).bind(Utc::now()).bind(worker_id.to_string())
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    let releasable_attempts = releasable_reverse_attempts(&state.database, poll.worker_id).await?;
-    let job = crate::scheduler::lease_reverse_job(&state, poll.worker_id).await?;
-    let transfer = crate::scheduler::lease_reverse_transfer(&state, poll.worker_id).await?;
-    Ok(Json(ReverseWorkerLease {
-        worker_id: poll.worker_id,
+    let releasable_attempts = releasable_reverse_attempts(&state.database, worker_id).await?;
+    let job = crate::scheduler::lease_reverse_job(&state, worker_id).await?;
+    let transfer = crate::scheduler::lease_reverse_transfer(&state, worker_id).await?;
+    Ok(Json(BuilderLease {
         acknowledged_attempts,
         releasable_attempts,
         job,
@@ -629,6 +594,7 @@ mod tests {
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            builder_token_sha256: auth::sha256("test-builder-token"),
         }
     }
 
@@ -897,45 +863,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_session_does_not_authorize_the_reverse_builder_api() {
+    async fn browser_session_does_not_authorize_the_builder_api() {
         let app = test_router().await;
         let cookie = login_cookie(&app).await;
-        let worker_id = Uuid::new_v4();
-        let poll = ReverseWorkerPoll {
-            worker_id,
-            nonce: Uuid::new_v4(),
-            status: json!({
-                "instance_id": worker_id,
-                "role": "builder",
-                "protocol_major": aursmith_protocol::PROTOCOL_MAJOR,
-            }),
+        let poll = BuilderPoll {
+            status: json!({"role": "builder"}),
             attempts: Vec::new(),
             completed_transfers: Vec::new(),
             sent_at: Utc::now(),
         };
-        let envelope = SignedEnvelope::sign(
-            "aursmith.reverse_worker_poll",
-            &poll,
-            &SigningKey::from_bytes(&[42_u8; 32]),
-        )
-        .unwrap();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/reverse-workers/poll")
+                    .uri("/api/v1/builder/poll")
                     .header("cookie", cookie)
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                    .body(Body::from(serde_json::to_vec(&poll).unwrap()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn reverse_poll_ignores_reports_from_a_previous_control_plane() {
+    async fn builder_poll_ignores_reports_for_unknown_jobs() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         let config = Config {
             bind_address: "127.0.0.1:0".into(),
@@ -956,13 +909,13 @@ mod tests {
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            builder_token_sha256: auth::sha256("test-builder-token"),
         };
-        let worker_key = SigningKey::from_bytes(&[17_u8; 32]);
         let worker_id = Uuid::new_v4();
         let now = Utc::now();
         sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, identity_signing_key_hex, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'degraded', '', '', 1, '[]', ?, 'reverse', ?, ?)")
             .bind(worker_id.to_string())
-            .bind(hex::encode(worker_key.verifying_key().as_bytes()))
+            .bind("00".repeat(32))
             .bind(now)
             .bind(now)
             .execute(&database)
@@ -973,14 +926,8 @@ mod tests {
             config,
             SigningKey::from_bytes(&[9_u8; 32]),
         ));
-        let poll = ReverseWorkerPoll {
-            worker_id,
-            nonce: Uuid::new_v4(),
-            status: json!({
-                "instance_id": worker_id,
-                "role": "builder",
-                "protocol_major": 1,
-            }),
+        let poll = BuilderPoll {
+            status: json!({"role": "builder"}),
             attempts: vec![aursmith_protocol::ReverseAttemptReport {
                 job_id: Uuid::new_v4(),
                 response: json!({"ok": true}),
@@ -988,22 +935,21 @@ mod tests {
             completed_transfers: Vec::new(),
             sent_at: now,
         };
-        let envelope =
-            SignedEnvelope::sign("aursmith.reverse_worker_poll", &poll, &worker_key).unwrap();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/reverse-workers/poll")
+                    .uri("/api/v1/builder/poll")
+                    .header("authorization", "Bearer test-builder-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                    .body(Body::from(serde_json::to_vec(&poll).unwrap()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let lease: ReverseWorkerLease = serde_json::from_slice(&body).unwrap();
+        let lease: BuilderLease = serde_json::from_slice(&body).unwrap();
         assert!(lease.acknowledged_attempts.is_empty());
     }
 

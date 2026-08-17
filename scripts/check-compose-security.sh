@@ -8,10 +8,11 @@ export AURSMITH_JOBS_DIR="${AURSMITH_JOBS_DIR:-/var/lib/aursmith-builder/jobs}"
 export AURSMITH_PUBLIC_ORIGIN="https://aursmith.example.test"
 export AURSMITH_CONTROLLER_VERIFYING_KEY_HEX="${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_TRANSFER_ENDPOINTS_JSON="${AURSMITH_TRANSFER_ENDPOINTS_JSON:-{\"00000000-0000-0000-0000-000000000001\":\"ssh://aursmith@192.0.2.10:2222\"}}"
-export AURSMITH_CONTROLLER_POLL_URL="${AURSMITH_CONTROLLER_POLL_URL:-https://controller.example.test/api/v1/reverse-workers/poll}"
+export AURSMITH_CONTROLLER_POLL_URL="${AURSMITH_CONTROLLER_POLL_URL:-https://controller.example.test/api/v1/builder/poll}"
+export AURSMITH_BUILDER_TOKEN_SHA256="${AURSMITH_BUILDER_TOKEN_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_REVERSE_PUBLISHER_ENDPOINT="${AURSMITH_REVERSE_PUBLISHER_ENDPOINT:-ssh://aursmith@192.0.2.20:2223}"
 
-for stack in controller builder publisher archiver; do
+for stack in controller builder publisher; do
   json="$(docker compose -f "deploy/${stack}/compose.yaml" config --format json)"
   if jq -e '.services[] | select(.privileged == true)' <<<"${json}" >/dev/null; then
     echo "${stack}: 禁止 privileged" >&2
@@ -140,19 +141,4 @@ if [[ "$(jq '(.services.controller.networks | has("edge")) and (.services | has(
   echo "默认 Controller 只能通过非 internal 的 edge 网络发布回环端口" >&2
   exit 1
 fi
-controller_archive_json="$(docker compose --profile external-archiver -f deploy/controller/compose.yaml config --format json)"
-if [[ "$(jq '(.services["backup-ssh"].networks | has("edge"))' <<<"${controller_archive_json}")" != "true" ]]; then
-  echo "可选 backup-ssh 必须通过非 internal 的 edge 网络发布宿主端口" >&2
-  exit 1
-fi
-archiver_json="$(docker compose -f deploy/archiver/compose.yaml config --format json)"
-if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_pull_key" or .source == "publisher_known_hosts")] | length' <<<"${archiver_json}")" != "2" ]]; then
-  echo "Archiver 必须使用独立的 Publisher 只读拉取凭据" >&2
-  exit 1
-fi
-if jq -e '.services.worker.secrets[]? | select(.source | contains("gpg"))' <<<"${archiver_json}" >/dev/null; then
-  echo "Archiver 禁止获得仓库 GPG 密钥" >&2
-  exit 1
-fi
-
 echo "Compose 安全策略检查通过"

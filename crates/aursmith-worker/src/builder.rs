@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use aursmith_protocol::{GuestResult, JobKind, JobSpec, ManifestEntry, SignedEnvelope};
+use aursmith_protocol::{GuestResult, JobKind, JobSpec, ManifestEntry};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -189,24 +189,20 @@ impl BuilderRuntime {
     }
 }
 
-pub fn spawn(database: SqlitePool, controller_key: Vec<u8>, runtime: BuilderRuntime) {
+pub fn spawn(database: SqlitePool, runtime: BuilderRuntime) {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
-            if let Err(error) = execute_one(&database, &controller_key, &runtime).await {
+            if let Err(error) = execute_one(&database, &runtime).await {
                 tracing::warn!(%error, "Builder 执行任务失败");
             }
         }
     });
 }
 
-async fn execute_one(
-    database: &SqlitePool,
-    controller_key: &[u8],
-    runtime: &BuilderRuntime,
-) -> anyhow::Result<()> {
+async fn execute_one(database: &SqlitePool, runtime: &BuilderRuntime) -> anyhow::Result<()> {
     let row = sqlx::query("SELECT attempt_id, spec_json FROM attempts WHERE status = 'queued' ORDER BY received_at LIMIT 1")
         .fetch_optional(database).await?;
     let Some(row) = row else { return Ok(()) };
@@ -221,7 +217,6 @@ async fn execute_one(
         return Ok(());
     }
     let result = execute_attempt(
-        controller_key,
         runtime,
         row.get::<String, _>("spec_json").as_str(),
         &attempt_id,
@@ -264,16 +259,11 @@ fn persist_failure_diagnostics(runtime: &BuilderRuntime, attempt_id: &str) {
 }
 
 async fn execute_attempt(
-    controller_key: &[u8],
     runtime: &BuilderRuntime,
-    envelope_json: &str,
+    spec_json: &str,
     attempt_id: &str,
 ) -> anyhow::Result<String> {
-    let envelope: SignedEnvelope = serde_json::from_str(envelope_json)?;
-    if envelope.verifying_key != controller_key {
-        bail!("UNTRUSTED_CONTROLLER");
-    }
-    let spec: JobSpec = envelope.verify("aursmith.job_spec")?;
+    let spec: JobSpec = serde_json::from_str(spec_json)?;
     if spec.attempt.attempt_id.to_string() != attempt_id {
         bail!("ATTEMPT_MISMATCH");
     }
@@ -284,7 +274,7 @@ async fn execute_attempt(
     verify_inputs(&staging.join("input"), &spec.inputs)?;
     let control_input = staging.join("input/.aursmith");
     fs::create_dir_all(&control_input)?;
-    fs::write(control_input.join("job-envelope.json"), envelope_json)?;
+    fs::write(control_input.join("job-spec.json"), spec_json)?;
 
     let work = runtime.jobs_dir.join("runtime").join(attempt_id);
     if work.exists() {
@@ -296,10 +286,6 @@ async fn execute_attempt(
     let stderr = File::create(work.join("docker.stderr.log"))?;
     let cpus = spec.limits.cpu_count.to_string();
     let memory = format!("{}m", spec.limits.memory_mib);
-    let controller_key_env = format!(
-        "AURSMITH_CONTROLLER_VERIFYING_KEY_HEX={}",
-        hex::encode(controller_key)
-    );
     let input_mount = format!("{}:/mnt/aursmith-input:ro", staging.join("input").display());
     let output_mount = format!("{}:/mnt/aursmith-output:rw", work.join("output").display());
     let mut command = Command::new("/usr/bin/docker");
@@ -316,8 +302,6 @@ async fn execute_attempt(
             &cpus,
             "--memory",
             &memory,
-            "--env",
-            &controller_key_env,
             "--volume",
             &input_mount,
             "--volume",

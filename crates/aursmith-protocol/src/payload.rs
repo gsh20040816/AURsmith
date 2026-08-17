@@ -134,9 +134,7 @@ pub struct ReverseAttemptReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReverseWorkerPoll {
-    pub worker_id: Uuid,
-    pub nonce: Uuid,
+pub struct BuilderPoll {
     pub status: serde_json::Value,
     #[serde(default)]
     pub attempts: Vec<ReverseAttemptReport>,
@@ -146,14 +144,13 @@ pub struct ReverseWorkerPoll {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReverseWorkerLease {
-    pub worker_id: Uuid,
+pub struct BuilderLease {
     #[serde(default)]
     pub acknowledged_attempts: Vec<Uuid>,
     #[serde(default)]
     pub releasable_attempts: Vec<Uuid>,
     #[serde(default)]
-    pub job: Option<SignedEnvelope>,
+    pub job: Option<JobSpec>,
     #[serde(default)]
     pub transfer: Option<SignedEnvelope>,
     pub issued_at: DateTime<Utc>,
@@ -313,36 +310,27 @@ mod tests {
     }
 
     #[test]
-    fn reverse_worker_poll_and_lease_keep_signed_identity_and_job() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
-        let worker_id = Uuid::new_v4();
-        let poll = ReverseWorkerPoll {
-            worker_id,
-            nonce: Uuid::new_v4(),
+    fn builder_poll_and_lease_are_plain_bearer_protocol_messages() {
+        let poll = BuilderPoll {
             status: serde_json::json!({"role": "builder"}),
             attempts: Vec::new(),
             completed_transfers: Vec::new(),
             sent_at: Utc::now(),
         };
-        let envelope = SignedEnvelope::sign("aursmith.reverse_worker_poll", &poll, &key).unwrap();
-        assert_eq!(
-            envelope
-                .verify::<ReverseWorkerPoll>("aursmith.reverse_worker_poll")
-                .unwrap(),
-            poll
-        );
-        let lease = ReverseWorkerLease {
-            worker_id,
+        let lease = BuilderLease {
             acknowledged_attempts: Vec::new(),
             releasable_attempts: Vec::new(),
-            job: Some(envelope.clone()),
+            job: None,
             transfer: None,
             issued_at: Utc::now(),
             next_poll_seconds: 15,
         };
         let encoded = serde_json::to_vec(&lease).unwrap();
-        let decoded: ReverseWorkerLease = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.worker_id, worker_id);
-        assert_eq!(decoded.job.unwrap().payload_sha256, envelope.payload_sha256);
+        let decoded: BuilderLease = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, lease);
+        assert_eq!(
+            serde_json::to_value(poll).unwrap()["status"]["role"],
+            "builder"
+        );
     }
 }

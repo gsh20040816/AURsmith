@@ -4,9 +4,9 @@ mod builder;
 use anyhow::{Context, bail};
 use aursmith_domain::{ArchiveState, JobStatus, WorkerRole, WorkerState};
 use aursmith_protocol::{
-    ArchiveInventory, ArchiveReceipt, ArtifactRecord, BackupArchiveReceipt, ControlPlaneBackup,
-    JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization, ReleaseManifest, ReleaseRollbackAuthorization,
-    ReverseAttemptReport, ReverseWorkerLease, ReverseWorkerPoll, SignedEnvelope,
+    ArchiveInventory, ArchiveReceipt, ArtifactRecord, BackupArchiveReceipt, BuilderLease,
+    BuilderPoll, ControlPlaneBackup, JobSpec, PROTOCOL_MAJOR, ReleaseAuthorization,
+    ReleaseManifest, ReleaseRollbackAuthorization, ReverseAttemptReport, SignedEnvelope,
     TransferCapability,
 };
 use axum::Router;
@@ -105,12 +105,15 @@ struct Cli {
     archive_dir: PathBuf,
     #[arg(long, env = "AURSMITH_CONTROLLER_POLL_URL")]
     controller_poll_url: Option<String>,
+    #[arg(long, env = "AURSMITH_CONTROLLER_BEARER_TOKEN_FILE")]
+    controller_bearer_token_file: Option<PathBuf>,
     #[arg(long, env = "AURSMITH_REVERSE_PUBLISHER_ENDPOINT")]
     reverse_publisher_endpoint: Option<String>,
     #[arg(long, env = "AURSMITH_REVERSE_PUSH_SSH_IDENTITY_FILE")]
     reverse_push_ssh_identity_file: Option<PathBuf>,
     #[arg(long, env = "AURSMITH_REVERSE_PUSH_SSH_KNOWN_HOSTS_FILE")]
     reverse_push_ssh_known_hosts_file: Option<PathBuf>,
+    controller_bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -158,6 +161,7 @@ struct Worker {
     reverse_publisher_endpoint: Option<String>,
     reverse_push_ssh_identity_file: Option<PathBuf>,
     reverse_push_ssh_known_hosts_file: Option<PathBuf>,
+    controller_bearer_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +255,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let controller_bearer_token = cli
+        .controller_bearer_token_file
+        .as_deref()
+        .map(read_builder_token)
+        .transpose()?;
     let worker = Arc::new(Worker {
         name: cli.name,
         role: cli.role.into(),
@@ -282,11 +291,11 @@ async fn main() -> anyhow::Result<()> {
         reverse_publisher_endpoint: cli.reverse_publisher_endpoint,
         reverse_push_ssh_identity_file: cli.reverse_push_ssh_identity_file,
         reverse_push_ssh_known_hosts_file: cli.reverse_push_ssh_known_hosts_file,
+        controller_bearer_token,
     });
     if worker.builder.is_some() {
         builder::spawn(
             worker.database.clone(),
-            worker.trusted_controller_key.clone(),
             worker.builder.clone().expect("已检查 Builder runtime"),
         );
     }
@@ -380,6 +389,21 @@ fn spawn_reverse_poll(worker: Arc<Worker>, poll_url: url::Url) {
     });
 }
 
+fn read_builder_token(path: &Path) -> anyhow::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("无法检查 Builder Bearer secret {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() < 32 || metadata.len() > 4096 {
+        bail!("Builder Bearer secret 必须是 32 到 4096 字节的普通文件");
+    }
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("无法读取 Builder Bearer secret {}", path.display()))?;
+    let token = token.trim().to_owned();
+    if token.len() < 32 || token.chars().any(char::is_whitespace) {
+        bail!("Builder Bearer secret 必须至少 32 字符且不能包含空白");
+    }
+    Ok(token)
+}
+
 async fn reverse_poll_once(
     client: &reqwest::Client,
     worker: &Worker,
@@ -389,10 +413,6 @@ async fn reverse_poll_once(
     if !status_response.ok {
         bail!("无法生成 Builder 状态：{}", status_response.message);
     }
-    let worker_id = status_response.data["instance_id"]
-        .as_str()
-        .context("Builder 状态缺少 instance_id")?
-        .parse::<uuid::Uuid>()?;
     let rows = sqlx::query(
         "SELECT job_id FROM attempts WHERE reported_at IS NULL AND status IN ('succeeded', 'failed', 'cancelled') ORDER BY received_at DESC LIMIT 1",
     )
@@ -415,20 +435,22 @@ async fn reverse_poll_once(
     .into_iter()
     .filter_map(|value: String| value.parse().ok())
     .collect();
-    let poll = ReverseWorkerPoll {
-        worker_id,
-        nonce: uuid::Uuid::new_v4(),
+    let poll = BuilderPoll {
         status: status_response.data,
         attempts: attempts.clone(),
         completed_transfers: completed_transfers.clone(),
         sent_at: Utc::now(),
     };
-    let envelope = SignedEnvelope::sign(
-        "aursmith.reverse_worker_poll",
-        &poll,
-        &worker.identity_signing_key,
-    )?;
-    let response = client.post(poll_url.clone()).json(&envelope).send().await?;
+    let token = worker
+        .controller_bearer_token
+        .as_deref()
+        .context("反向 Builder 未配置 Controller Bearer secret")?;
+    let response = client
+        .post(poll_url.clone())
+        .bearer_auth(token)
+        .json(&poll)
+        .send()
+        .await?;
     if !response.status().is_success() {
         bail!(
             "Controller 拒绝 Builder 轮询：HTTP {} {}",
@@ -442,10 +464,7 @@ async fn reverse_poll_once(
                 .collect::<String>()
         );
     }
-    let lease: ReverseWorkerLease = response.json().await?;
-    if lease.worker_id != worker_id {
-        bail!("Controller 返回了其他 Worker 的租约");
-    }
+    let lease: BuilderLease = response.json().await?;
     for job_id in &lease.acknowledged_attempts {
         sqlx::query("UPDATE attempts SET reported_at = ? WHERE job_id = ?")
             .bind(Utc::now())
@@ -455,7 +474,7 @@ async fn reverse_poll_once(
     }
     cleanup_reported_unsuccessful_attempts(worker).await?;
     if let Some(job) = lease.job {
-        let accepted = submit(worker, job).await;
+        let accepted = submit_job(worker, job).await;
         if !accepted.ok {
             bail!(
                 "Builder 拒绝领取任务：{} {}",
@@ -3402,6 +3421,10 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
         Ok(spec) => spec,
         Err(error) => return WorkerResponse::error("INVALID_ENVELOPE", error.to_string()),
     };
+    submit_job(worker, spec).await
+}
+
+async fn submit_job(worker: &Worker, spec: JobSpec) -> WorkerResponse {
     if spec.required_role != worker.role {
         return WorkerResponse::error("WRONG_ROLE", "任务角色与 Worker 不匹配");
     }
@@ -3418,11 +3441,11 @@ async fn submit(worker: &Worker, envelope: SignedEnvelope) -> WorkerResponse {
     if !matches!(state.as_deref(), Ok("online")) {
         return WorkerResponse::error("WORKER_DRAINING", "Worker 当前不接收新任务");
     }
-    let envelope_sha256 = hex::encode(Sha256::digest(&envelope.payload));
-    let spec_json = match serde_json::to_string(&envelope) {
+    let spec_json = match serde_json::to_string(&spec) {
         Ok(value) => value,
-        Err(error) => return WorkerResponse::error("INVALID_ENVELOPE", error.to_string()),
+        Err(error) => return WorkerResponse::error("INVALID_JOB_SPEC", error.to_string()),
     };
+    let envelope_sha256 = hex::encode(Sha256::digest(spec_json.as_bytes()));
     let existing = sqlx::query(
         "SELECT attempt_id, generation, envelope_sha256, status FROM attempts WHERE job_id = ? ORDER BY generation DESC LIMIT 1",
     )
@@ -4009,6 +4032,7 @@ mod transfer_tests {
             reverse_publisher_endpoint: None,
             reverse_push_ssh_identity_file: None,
             reverse_push_ssh_known_hosts_file: None,
+            controller_bearer_token: None,
         };
         let envelope = archive_release(&worker, &capability, &imported)
             .await

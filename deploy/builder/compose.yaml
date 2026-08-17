@@ -31,6 +31,7 @@ services:
       AURSMITH_CONTROLLER_VERIFYING_KEY_HEX: ${AURSMITH_CONTROLLER_VERIFYING_KEY_HEX:?必须固定 Controller 公钥}
       AURSMITH_JOBS_DIR: ${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}
       AURSMITH_CONTROLLER_POLL_URL: ${AURSMITH_CONTROLLER_POLL_URL:?必须设置公网 Controller HTTPS 轮询地址}
+      AURSMITH_CONTROLLER_BEARER_TOKEN_FILE: /run/secrets/controller_bearer_token
       AURSMITH_REVERSE_PUBLISHER_ENDPOINT: ${AURSMITH_REVERSE_PUBLISHER_ENDPOINT:?必须设置 Publisher SSH 推送端点}
       AURSMITH_REVERSE_PUSH_SSH_IDENTITY_FILE: /run/secrets/publisher_push_key
       AURSMITH_REVERSE_PUSH_SSH_KNOWN_HOSTS_FILE: /run/secrets/publisher_known_hosts
@@ -38,6 +39,7 @@ services:
     secrets:
       - publisher_push_key
       - publisher_known_hosts
+      - controller_bearer_token
     volumes:
       - worker-run:/run/aursmith
       - builder-state:/var/lib/aursmith
@@ -58,6 +60,8 @@ secrets:
     file: ${AURSMITH_PUBLISHER_PUSH_KEY_FILE:-./secrets/publisher_push_key}
   publisher_known_hosts:
     file: ${AURSMITH_PUBLISHER_KNOWN_HOSTS_FILE:-./secrets/publisher_known_hosts}
+  controller_bearer_token:
+    file: ${AURSMITH_CONTROLLER_BEARER_TOKEN_FILE:-./secrets/controller_bearer_token}
 
 volumes:
   worker-run:

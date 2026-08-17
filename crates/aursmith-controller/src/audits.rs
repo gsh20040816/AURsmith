@@ -637,6 +637,7 @@ mod tests {
             repository_name: "aursmith".into(),
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
+            builder_token_sha256: crate::auth::sha256("test-builder-token"),
         };
         AppState::new(
             database,

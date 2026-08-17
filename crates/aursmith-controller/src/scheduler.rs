@@ -885,7 +885,7 @@ async fn probe_all_workers(state: &AppState) -> Result<(), ApiError> {
 pub(crate) async fn lease_reverse_job(
     state: &AppState,
     worker_id: Uuid,
-) -> Result<Option<SignedEnvelope>, ApiError> {
+) -> Result<Option<JobSpec>, ApiError> {
     if publication_backpressure(&state.database).await? {
         return Ok(None);
     }
@@ -938,9 +938,9 @@ pub(crate) async fn lease_reverse_job(
         return Ok(None);
     };
     let job_id: String = selected.get("id");
-    let envelope = dispatch_job_to_worker(state, &job_id, worker_id).await?;
+    let spec = dispatch_job_to_worker(state, &job_id, worker_id).await?;
     resolve_alert(state, &format!("no-eligible-worker:{job_id}")).await?;
-    Ok(Some(envelope))
+    Ok(Some(spec))
 }
 
 async fn reverse_worker_has_active_job(
@@ -1011,7 +1011,7 @@ async fn dispatch_job_to_worker(
     state: &AppState,
     job_id: &str,
     worker_id: Uuid,
-) -> Result<SignedEnvelope, ApiError> {
+) -> Result<JobSpec, ApiError> {
     let job = sqlx::query(
         "SELECT required_role, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
     )
@@ -1065,20 +1065,20 @@ async fn dispatch_job_to_worker(
         issued_at: now,
         expires_at: now + Duration::minutes(10),
     };
-    let envelope = SignedEnvelope::sign("aursmith.job_spec", &spec, &state.signing_key)
-        .map_err(ApiError::internal)?;
+    let spec_json = serde_json::to_string(&spec).map_err(ApiError::internal)?;
+    let spec_sha256 = hex::encode(Sha256::digest(spec_json.as_bytes()));
     let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("INSERT INTO attempts(id, job_id, generation, token_sha256, status) VALUES (?, ?, ?, ?, 'dispatched')")
         .bind(attempt_id.to_string())
         .bind(job_id)
         .bind(generation)
-        .bind(&envelope.payload_sha256)
+        .bind(spec_sha256)
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
     let updated = sqlx::query("UPDATE jobs SET worker_id = ?, status = 'dispatched', failure_code = NULL, next_attempt_at = NULL, signed_spec_json = ?, updated_at = ? WHERE id = ? AND status IN ('queued', 'no_eligible_worker')")
         .bind(worker_id.to_string())
-        .bind(serde_json::to_string(&envelope).map_err(ApiError::internal)?)
+        .bind(spec_json)
         .bind(now)
         .bind(job_id)
         .execute(&mut *transaction)
@@ -1091,7 +1091,7 @@ async fn dispatch_job_to_worker(
         ));
     }
     transaction.commit().await.map_err(ApiError::internal)?;
-    Ok(envelope)
+    Ok(spec)
 }
 
 async fn dispatch_one(state: &AppState) -> Result<(), ApiError> {
@@ -1881,6 +1881,7 @@ mod release_tests {
                 repository_name: "aursmith".into(),
                 source_git_commit: "test".into(),
                 repository_base_url: "https://repo.test".into(),
+                builder_token_sha256: crate::auth::sha256("test-builder-token"),
             },
             ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
         )

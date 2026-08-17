@@ -1,7 +1,10 @@
 use crate::{error::ApiError, routes::AppState};
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, Method, header::ORIGIN},
+    http::{
+        HeaderMap, Method,
+        header::{AUTHORIZATION, ORIGIN},
+    },
     middleware::Next,
     response::Response,
 };
@@ -15,6 +18,28 @@ pub const CSRF_HEADER_VALUE: &str = "1";
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+pub fn require_builder(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthorized("缺少 Builder Bearer 凭据"))?;
+    let actual = sha256(token);
+    let matches = actual
+        .as_bytes()
+        .iter()
+        .zip(state.config.builder_token_sha256.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0;
+    if !matches {
+        return Err(ApiError::unauthorized("Builder Bearer 凭据无效"));
+    }
+    Ok(())
 }
 
 pub async fn create_session(state: &AppState, administrator_id: &str) -> Result<String, ApiError> {
@@ -64,9 +89,7 @@ pub async fn authorize_management_request(
     next: Next,
 ) -> Result<Response, ApiError> {
     let path = request.uri().path();
-    if !path.starts_with("/api/")
-        || path == "/api/v1/auth/login"
-        || path == "/api/v1/reverse-workers/poll"
+    if !path.starts_with("/api/") || path == "/api/v1/auth/login" || path == "/api/v1/builder/poll"
     {
         return Ok(next.run(request).await);
     }
