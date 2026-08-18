@@ -140,47 +140,20 @@ struct Worker {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum WorkerCommand {
     Status,
-    Query {
-        job_id: String,
-    },
-    AurSearch {
-        query: String,
-    },
-    AurInfo {
-        names: Vec<String>,
-    },
-    AurProviders {
-        names: Vec<String>,
-    },
-    OfficialInfo {
-        names: Vec<String>,
-    },
+    Query { job_id: String },
+    AurSearch { query: String },
+    AurInfo { names: Vec<String> },
+    AurProviders { names: Vec<String> },
+    OfficialInfo { names: Vec<String> },
     PublisherDoctor,
-    AurSnapshot {
-        package_base: String,
-    },
-    PreparePushImport {
-        envelope: BuilderUpload,
-    },
-    ResolveImport {
-        #[serde(alias = "capability_id")]
-        upload_id: String,
-    },
-    FinalizePushImport {
-        envelope: BuilderUpload,
-    },
-    AuthorizeRelease {
-        envelope: ReleasePlan,
-    },
-    QueryRelease {
-        release_id: String,
-    },
-    ReleaseFiles {
-        release_id: String,
-    },
-    AuthorizeRollback {
-        envelope: ReleaseRollbackRequest,
-    },
+    AurSnapshot { package_base: String },
+    PreparePushImport { envelope: BuilderUpload },
+    ResolveImport { upload_id: String },
+    FinalizePushImport { envelope: BuilderUpload },
+    AuthorizeRelease { envelope: ReleasePlan },
+    QueryRelease { release_id: String },
+    ReleaseFiles { release_id: String },
+    AuthorizeRollback { envelope: ReleaseRollbackRequest },
 }
 
 #[derive(Debug, Serialize)]
@@ -725,11 +698,6 @@ async fn connect(database_url: &str, role: RoleArg) -> anyhow::Result<SqlitePool
             )
             .execute(&pool)
             .await?;
-            if table_exists(&pool, "transfer_exports").await? {
-                sqlx::query("INSERT OR IGNORE INTO builder_uploads(upload_id, expires_at, directory, manifest_json, state) SELECT capability_id, expires_at, directory, manifest_json, state FROM transfer_exports")
-                    .execute(&pool)
-                    .await?;
-            }
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS attempts(\
                  job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
@@ -738,18 +706,6 @@ async fn connect(database_url: &str, role: RoleArg) -> anyhow::Result<SqlitePool
             )
             .execute(&pool)
             .await?;
-            for statement in [
-                "ALTER TABLE attempts ADD COLUMN spec_json TEXT",
-                "ALTER TABLE attempts ADD COLUMN failure_code TEXT",
-                "ALTER TABLE attempts ADD COLUMN reported_at TEXT",
-                "ALTER TABLE attempts ADD COLUMN workspace_cleaned_at TEXT",
-            ] {
-                if let Err(error) = sqlx::query(statement).execute(&pool).await
-                    && !error.to_string().contains("duplicate column name")
-                {
-                    return Err(error.into());
-                }
-            }
             sqlx::query(
                 "UPDATE attempts SET status = 'failed', failure_code = 'WORKER_RESTARTED' WHERE status = 'running'",
             )
@@ -762,52 +718,11 @@ async fn connect(database_url: &str, role: RoleArg) -> anyhow::Result<SqlitePool
             )
             .execute(&pool)
             .await?;
-            if table_exists(&pool, "transfer_imports").await? {
-                sqlx::query("INSERT OR IGNORE INTO publisher_uploads(upload_id, expires_at, directory, manifest_json, state) SELECT capability_id, expires_at, directory, manifest_json, state FROM transfer_imports")
-                    .execute(&pool)
-                    .await?;
-            }
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS publisher_release_jobs(release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
             )
             .execute(&pool)
             .await?;
-            if table_exists(&pool, "publisher_releases").await? {
-                sqlx::query("DROP TABLE publisher_releases")
-                    .execute(&pool)
-                    .await?;
-            }
-            sqlx::query(
-                "DELETE FROM publisher_release_jobs \
-                 WHERE json_type(plan_json, '$.release_id') IS NULL \
-                 AND json_extract(plan_json, '$.payload_type') = 'aursmith.release_authorization'",
-            )
-            .execute(&pool)
-            .await?;
-        }
-    }
-    for legacy_table in [
-        "transfer_exports",
-        "transfer_imports",
-        "archive_receipts",
-        "backup_archive_receipts",
-        "publisher_releases",
-    ] {
-        if table_exists(&pool, legacy_table).await? {
-            sqlx::query(&format!("DROP TABLE {legacy_table}"))
-                .execute(&pool)
-                .await?;
-        }
-    }
-    let irrelevant_tables: &[&str] = match role {
-        RoleArg::Builder => &["publisher_uploads", "publisher_release_jobs"],
-        RoleArg::Publisher => &["builder_uploads", "attempts"],
-    };
-    for table in irrelevant_tables {
-        if table_exists(&pool, table).await? {
-            sqlx::query(&format!("DROP TABLE {table}"))
-                .execute(&pool)
-                .await?;
         }
     }
     sqlx::query(
@@ -817,15 +732,6 @@ async fn connect(database_url: &str, role: RoleArg) -> anyhow::Result<SqlitePool
     .execute(&pool)
     .await?;
     Ok(pool)
-}
-
-async fn table_exists(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
-    Ok(count != 0)
 }
 
 async fn prepare_socket(socket: &str) -> anyhow::Result<()> {
@@ -2813,135 +2719,6 @@ fn status_name(status: JobStatus) -> &'static str {
 #[cfg(test)]
 mod transfer_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn publisher_journal_discards_legacy_signed_envelopes() {
-        let root = tempfile::tempdir().unwrap();
-        let database_path = root.path().join("worker.db");
-        let database_url = format!("sqlite://{}", database_path.display());
-        let options = SqliteConnectOptions::from_str(&database_url)
-            .unwrap()
-            .create_if_missing(true);
-        let database = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE publisher_release_jobs(\
-             release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, \
-             state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, \
-             created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
-        )
-        .execute(&database)
-        .await
-        .unwrap();
-        sqlx::query("CREATE TABLE publisher_releases(release_id TEXT PRIMARY KEY)")
-            .execute(&database)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE transfer_imports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL)")
-            .execute(&database)
-            .await
-            .unwrap();
-        let upload_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO transfer_imports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, '/landing/fixture', '[]', 'verified')")
-            .bind(&upload_id)
-            .bind(Utc::now())
-            .execute(&database)
-            .await
-            .unwrap();
-        let current_release = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO publisher_release_jobs(\
-             release_id, plan_sha256, plan_json, state, created_at, updated_at) \
-             VALUES ('legacy', 'legacy', ?, 'published', ?, ?), (?, 'current', ?, 'published', ?, ?)",
-        )
-        .bind(serde_json::json!({
-            "payload_type": "aursmith.release_authorization",
-            "payload": [],
-            "signature": []
-        }).to_string())
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .bind(&current_release)
-        .bind(serde_json::json!({"release_id": current_release}).to_string())
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .execute(&database)
-        .await
-        .unwrap();
-        database.close().await;
-
-        let migrated = connect(&database_url, RoleArg::Publisher).await.unwrap();
-        let remaining: Vec<String> =
-            sqlx::query_scalar("SELECT release_id FROM publisher_release_jobs ORDER BY release_id")
-                .fetch_all(&migrated)
-                .await
-                .unwrap();
-        let old_table: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'publisher_releases'",
-        )
-        .fetch_one(&migrated)
-        .await
-        .unwrap();
-        let migrated_upload: String = sqlx::query_scalar("SELECT upload_id FROM publisher_uploads")
-            .fetch_one(&migrated)
-            .await
-            .unwrap();
-        assert_eq!(remaining, vec![current_release]);
-        assert_eq!(old_table, 0);
-        assert_eq!(migrated_upload, upload_id);
-        assert!(!table_exists(&migrated, "transfer_imports").await.unwrap());
-        assert!(!table_exists(&migrated, "attempts").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn builder_journal_migrates_only_outbound_uploads() {
-        let root = tempfile::tempdir().unwrap();
-        let database_path = root.path().join("worker.db");
-        let database_url = format!("sqlite://{}", database_path.display());
-        let options = SqliteConnectOptions::from_str(&database_url)
-            .unwrap()
-            .create_if_missing(true);
-        let database = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE transfer_exports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL)")
-            .execute(&database)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE publisher_release_jobs(release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
-            .execute(&database)
-            .await
-            .unwrap();
-        let upload_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO transfer_exports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, '/jobs/transfers/fixture', '[]', 'pushed')")
-            .bind(&upload_id)
-            .bind(Utc::now())
-            .execute(&database)
-            .await
-            .unwrap();
-        database.close().await;
-
-        let migrated = connect(&database_url, RoleArg::Builder).await.unwrap();
-        let migrated_state: String =
-            sqlx::query_scalar("SELECT state FROM builder_uploads WHERE upload_id = ?")
-                .bind(&upload_id)
-                .fetch_one(&migrated)
-                .await
-                .unwrap();
-        assert_eq!(migrated_state, "pushed");
-        assert!(table_exists(&migrated, "attempts").await.unwrap());
-        assert!(!table_exists(&migrated, "transfer_exports").await.unwrap());
-        assert!(
-            !table_exists(&migrated, "publisher_release_jobs")
-                .await
-                .unwrap()
-        );
-    }
 
     #[test]
     fn reported_failed_attempts_do_not_wait_for_publication() {

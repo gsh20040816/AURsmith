@@ -39,31 +39,22 @@ pub struct InlineInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobSpec {
     pub job_id: Uuid,
     pub attempt: AttemptRef,
-    #[serde(default)]
     pub kind: JobKind,
     pub revision_sha256: String,
     pub source_manifest_sha256: Option<String>,
     pub dependency_snapshot_sha256: Option<String>,
-    #[serde(default)]
     pub dependency_attempt_ids: Vec<Uuid>,
-    #[serde(default)]
     pub dependencies: Vec<DependencyInput>,
     pub inputs: Vec<ManifestEntry>,
-    #[serde(default)]
     pub inline_inputs: Vec<InlineInput>,
-    #[serde(default)]
     pub expected_outputs: Vec<String>,
-    #[serde(default = "default_allow_check")]
     pub allow_check: bool,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-}
-
-fn default_allow_check() -> bool {
-    true
 }
 
 impl JobSpec {
@@ -108,18 +99,17 @@ pub struct ReverseAttemptReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuilderPoll {
     pub status: serde_json::Value,
-    #[serde(default)]
     pub attempts: Vec<ReverseAttemptReport>,
-    #[serde(default, alias = "completed_transfers")]
     pub completed_uploads: Vec<Uuid>,
     pub sent_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuilderUpload {
-    #[serde(alias = "id")]
     pub upload_id: Uuid,
     pub attempt: AttemptRef,
     pub files: Vec<ManifestEntry>,
@@ -127,14 +117,11 @@ pub struct BuilderUpload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuilderLease {
-    #[serde(default)]
     pub acknowledged_attempts: Vec<Uuid>,
-    #[serde(default)]
     pub releasable_attempts: Vec<Uuid>,
-    #[serde(default)]
     pub job: Option<JobSpec>,
-    #[serde(default, alias = "transfer")]
     pub upload: Option<BuilderUpload>,
     pub issued_at: DateTime<Utc>,
     pub next_poll_seconds: u16,
@@ -215,12 +202,13 @@ mod tests {
         };
         assert!(!spec.is_expired_at(now));
         assert!(spec.is_expired_at(now + Duration::minutes(6)));
-        let mut legacy = serde_json::to_value(&spec).unwrap();
-        legacy.as_object_mut().unwrap().remove("expected_outputs");
-        legacy.as_object_mut().unwrap().remove("allow_check");
-        let decoded: JobSpec = serde_json::from_value(legacy).unwrap();
-        assert!(decoded.allow_check, "旧 JobSpec 必须保持默认执行 check()");
-        assert!(decoded.expected_outputs.is_empty());
+        let mut incomplete = serde_json::to_value(&spec).unwrap();
+        incomplete
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_outputs");
+        incomplete.as_object_mut().unwrap().remove("allow_check");
+        assert!(serde_json::from_value::<JobSpec>(incomplete).is_err());
     }
 
     #[test]
@@ -249,38 +237,28 @@ mod tests {
     }
 
     #[test]
-    fn builder_messages_accept_legacy_transfer_field_names() {
+    fn removed_transfer_field_names_are_rejected() {
         let upload_id = Uuid::new_v4();
-        let attempt_id = Uuid::new_v4();
-        let job_id = Uuid::new_v4();
         let now = Utc::now();
-        let poll: BuilderPoll = serde_json::from_value(serde_json::json!({
-            "status": {"role": "builder"},
-            "attempts": [],
-            "completed_transfers": [upload_id],
-            "sent_at": now,
-        }))
-        .unwrap();
-        assert_eq!(poll.completed_uploads, vec![upload_id]);
-
-        let lease: BuilderLease = serde_json::from_value(serde_json::json!({
-            "acknowledged_attempts": [],
-            "releasable_attempts": [],
-            "job": null,
-            "transfer": {
-                "id": upload_id,
-                "attempt": {
-                    "job_id": job_id,
-                    "attempt_id": attempt_id,
-                    "generation": 0
-                },
-                "files": [],
-                "expires_at": now,
-            },
-            "issued_at": now,
-            "next_poll_seconds": 15,
-        }))
-        .unwrap();
-        assert_eq!(lease.upload.unwrap().upload_id, upload_id);
+        assert!(
+            serde_json::from_value::<BuilderPoll>(serde_json::json!({
+                "status": {"role": "builder"},
+                "attempts": [],
+                "completed_transfers": [upload_id],
+                "sent_at": now,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<BuilderLease>(serde_json::json!({
+                "acknowledged_attempts": [],
+                "releasable_attempts": [],
+                "job": null,
+                "transfer": null,
+                "issued_at": now,
+                "next_poll_seconds": 15,
+            }))
+            .is_err()
+        );
     }
 }
