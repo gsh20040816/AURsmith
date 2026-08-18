@@ -9,7 +9,6 @@ use sqlx::{
 };
 use std::{
     env,
-    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{IsTerminal, Read, Write},
     os::unix::{
@@ -68,11 +67,6 @@ enum Command {
         private_directory: PathBuf,
         #[arg(long, default_value = "/etc/ssh/sshd_config")]
         config: PathBuf,
-    },
-    /// 仅供 Publisher 的 rsync 固定 remote-shell 使用。
-    RsyncSsh {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        arguments: Vec<OsString>,
     },
 }
 
@@ -200,7 +194,6 @@ async fn main() -> anyhow::Result<()> {
             &private_directory,
             &config,
         )?,
-        Command::RsyncSsh { arguments } => rsync_ssh(arguments)?,
     }
     Ok(())
 }
@@ -358,162 +351,6 @@ async fn revoke_administrator_sessions(database: &SqlitePool) -> anyhow::Result<
     }))
 }
 
-fn rsync_ssh(arguments: Vec<OsString>) -> anyhow::Result<()> {
-    if arguments.len() < 3 {
-        bail!("rsync ssh 参数不足");
-    }
-    let command_offset = arguments
-        .iter()
-        .position(|value| value == "rsync")
-        .context("rsync ssh 缺少远端 rsync 命令")?;
-    let remote_parts = &arguments[..command_offset];
-    let remote = if remote_parts.len() == 3 && remote_parts[0] == "-l" {
-        format!(
-            "{}@{}",
-            remote_parts[1].to_string_lossy(),
-            remote_parts[2].to_string_lossy()
-        )
-    } else if remote_parts.len() == 2 && !remote_parts[0].to_string_lossy().contains('@') {
-        format!(
-            "{}@{}",
-            remote_parts[0].to_string_lossy(),
-            remote_parts[1].to_string_lossy()
-        )
-    } else if remote_parts.len() == 1 {
-        remote_parts[0].to_string_lossy().into_owned()
-    } else {
-        bail!("rsync ssh 远端参数形态无效：{arguments:?}");
-    };
-    if remote.is_empty()
-        || !remote
-            .chars()
-            .all(|value| value.is_ascii_alphanumeric() || "@._:-[]".contains(value))
-    {
-        bail!("rsync ssh 远端无效");
-    }
-    let remote_command = arguments[command_offset..]
-        .iter()
-        .map(|value| value.to_string_lossy())
-        .collect::<Vec<_>>();
-    if remote_command.get(2).map(|value| value.as_ref()) != Some("--sender") {
-        return rsync_receiver_ssh(arguments, command_offset, remote);
-    }
-    let option_cluster = remote_command.get(3).map(|value| value.as_ref());
-    let path_offset = if remote_command.get(4).map(|value| value.as_ref()) == Some("--numeric-ids")
-    {
-        5
-    } else {
-        4
-    };
-    let transfer_path = remote_command
-        .get(path_offset + 1)
-        .map(|value| value.as_ref());
-    let capability_id = transfer_path
-        .and_then(|value| value.strip_prefix("/jobs/transfers/"))
-        .and_then(|value| value.strip_suffix('/'));
-    let allowed_cluster = matches!(
-        option_cluster,
-        Some("-logDtpre.iLsfxCIvu") | Some("-logDtpre.LsfxCIvu")
-    );
-    if remote_command.first().map(|value| value.as_ref()) != Some("rsync")
-        || remote_command.get(1).map(|value| value.as_ref()) != Some("--server")
-        || remote_command.get(2).map(|value| value.as_ref()) != Some("--sender")
-        || !allowed_cluster
-        || remote_command.get(path_offset).map(|value| value.as_ref()) != Some(".")
-        || remote_command.len() != path_offset + 2
-        || capability_id
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .is_none()
-    {
-        bail!("rsync ssh 远端命令未被允许：{remote_command:?}");
-    }
-    let identity = env::var("AURSMITH_RSYNC_SSH_IDENTITY_FILE")?;
-    let known_hosts = env::var("AURSMITH_RSYNC_SSH_KNOWN_HOSTS_FILE")?;
-    let port = env::var("AURSMITH_RSYNC_SSH_PORT")?
-        .parse::<u16>()
-        .context("rsync SSH 端口无效")?;
-    let error = ProcessCommand::new("/usr/bin/ssh")
-        .arg("-T")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-i")
-        .arg(identity)
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={known_hosts}"))
-        .arg(&remote)
-        .args(&arguments[command_offset..])
-        .exec();
-    Err(error).context("无法启动固定 rsync SSH")
-}
-
-fn rsync_receiver_ssh(
-    arguments: Vec<OsString>,
-    command_offset: usize,
-    remote: String,
-) -> anyhow::Result<()> {
-    let remote_command = arguments[command_offset..]
-        .iter()
-        .map(|value| value.to_string_lossy())
-        .collect::<Vec<_>>();
-    let option_cluster = remote_command.get(2).map(|value| value.as_ref());
-    let path_offset = if remote_command.get(3).map(|value| value.as_ref()) == Some("--numeric-ids")
-    {
-        4
-    } else {
-        3
-    };
-    let transfer_path = remote_command
-        .get(path_offset + 1)
-        .map(|value| value.as_ref());
-    let capability_id = transfer_path
-        .and_then(|value| value.strip_prefix("/landing/."))
-        .and_then(|value| value.strip_suffix(".partial/"));
-    let allowed_cluster = matches!(
-        option_cluster,
-        Some("-logDtpre.iLsfxCIvu") | Some("-logDtpre.LsfxCIvu")
-    );
-    if remote_command.first().map(|value| value.as_ref()) != Some("rsync")
-        || remote_command.get(1).map(|value| value.as_ref()) != Some("--server")
-        || !allowed_cluster
-        || remote_command.get(path_offset).map(|value| value.as_ref()) != Some(".")
-        || remote_command.len() != path_offset + 2
-        || capability_id
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .is_none()
-    {
-        bail!("rsync ssh receiver 命令未被允许：{remote_command:?}");
-    }
-    let identity = env::var("AURSMITH_RSYNC_SSH_IDENTITY_FILE")?;
-    let known_hosts = env::var("AURSMITH_RSYNC_SSH_KNOWN_HOSTS_FILE")?;
-    let port = env::var("AURSMITH_RSYNC_SSH_PORT")?
-        .parse::<u16>()
-        .context("rsync SSH 端口无效")?;
-    let error = ProcessCommand::new("/usr/bin/ssh")
-        .arg("-T")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-i")
-        .arg(identity)
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={known_hosts}"))
-        .arg(&remote)
-        .args(&arguments[command_offset..])
-        .exec();
-    Err(error).context("无法启动固定 rsync receiver SSH")
-}
-
 fn run_sshd(
     host_key_source: &Path,
     authorized_keys_source: &Path,
@@ -578,155 +415,11 @@ fn materialize_private_file(source: &Path, target: &Path, maximum_size: u64) -> 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sqlite_url(path: &Path) -> String {
-        format!("sqlite://{}", path.display())
-    }
-
-    async fn create_test_admin_schema(path: &Path) {
-        let database = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::from_str(&sqlite_url(path))
-                    .unwrap()
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE administrators(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)",
-        )
-        .execute(&database)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE sessions(token_sha256 TEXT PRIMARY KEY, administrator_id TEXT NOT NULL REFERENCES administrators(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL)",
-        )
-        .execute(&database)
-        .await
-        .unwrap();
-        database.close().await;
-    }
-
-    #[test]
-    fn builder_jobs_directory_must_be_absolute_and_writable() {
-        let directory = tempfile::tempdir().unwrap();
-        assert!(jobs_directory_usable(directory.path()));
-        assert!(!jobs_directory_usable(Path::new("relative/jobs")));
-    }
-
-    #[tokio::test]
-    async fn local_admin_commands_enforce_one_administrator_and_revoke_sessions() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("controller.db");
-        create_test_admin_schema(&database_path).await;
-        let database = connect_admin_database(&sqlite_url(&database_path))
-            .await
-            .unwrap();
-        initialize_administrator(&database, "admin", "第一段足够长的密码-123456")
-            .await
-            .unwrap();
-        assert!(
-            initialize_administrator(&database, "other", "另一段足够长的密码-123456")
-                .await
-                .is_err()
-        );
-        let row: (String, String) = sqlx::query_as("SELECT id, password_hash FROM administrators")
-            .fetch_one(&database)
-            .await
-            .unwrap();
-        assert!(credentials::verify_password(
-            "第一段足够长的密码-123456",
-            &row.1
-        ));
-        sqlx::query("INSERT INTO sessions(token_sha256, administrator_id, created_at, expires_at, last_seen_at) VALUES ('token', ?, ?, ?, ?)")
-            .bind(&row.0)
-            .bind(Utc::now())
-            .bind(Utc::now() + chrono::Duration::hours(1))
-            .bind(Utc::now())
-            .execute(&database)
-            .await
-            .unwrap();
-
-        let reset = reset_administrator_password(&database, "重置后足够长的密码-123456")
-            .await
-            .unwrap();
-        assert_eq!(reset["revoked_sessions"], 1);
-        let password_hash: String = sqlx::query_scalar("SELECT password_hash FROM administrators")
-            .fetch_one(&database)
-            .await
-            .unwrap();
-        assert!(!credentials::verify_password(
-            "第一段足够长的密码-123456",
-            &password_hash
-        ));
-        assert!(credentials::verify_password(
-            "重置后足够长的密码-123456",
-            &password_hash
-        ));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
-                .fetch_one(&database)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            revoke_administrator_sessions(&database).await.unwrap()["revoked_sessions"],
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn local_admin_commands_refuse_missing_database_or_schema() {
-        let directory = tempfile::tempdir().unwrap();
-        let missing = directory.path().join("missing.db");
-        assert!(connect_admin_database(&sqlite_url(&missing)).await.is_err());
-        assert!(!missing.exists(), "管理员命令不得静默创建数据库");
-
-        let empty = directory.path().join("empty.db");
-        let database = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::from_str(&sqlite_url(&empty))
-                    .unwrap()
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        database.close().await;
-        assert!(connect_admin_database(&sqlite_url(&empty)).await.is_err());
-    }
-
-    #[test]
-    fn password_files_must_be_private_regular_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let password = directory.path().join("password");
-        fs::write(&password, "足够长的文件密码-123456\n").unwrap();
-        fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            read_password(Some(&password)).unwrap(),
-            "足够长的文件密码-123456"
-        );
-        fs::set_permissions(&password, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_password(Some(&password)).is_err());
-    }
-
-    #[test]
-    fn terminal_password_input_is_rejected_before_reading() {
-        assert!(reject_terminal_password_input(true).is_err());
-        assert!(reject_terminal_password_input(false).is_ok());
-    }
-}
-
 async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
     let original = env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
     let parts: Vec<_> = original.split_ascii_whitespace().collect();
     if parts.first() == Some(&"rsync") {
-        return rsync_gateway(socket, &parts).await;
+        return rsync_gateway(&parts);
     }
     let request = match parts.as_slice() {
         ["status"] => json!({"command": "status"}),
@@ -785,71 +478,14 @@ async fn ssh_gateway(socket: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn rsync_gateway(socket: &PathBuf, parts: &[&str]) -> anyhow::Result<()> {
-    if !parts.contains(&"--sender") {
-        let error = ProcessCommand::new("/usr/sbin/rrsync")
-            .args(["-wo", "/landing"])
-            .exec();
-        return Err(error).context("无法启动官方 rrsync 收件器");
+fn rsync_gateway(parts: &[&str]) -> anyhow::Result<()> {
+    if parts.contains(&"--sender") {
+        bail!("Publisher 的 rsync 入口只允许写入");
     }
-    let valid_shape = matches!(
-        parts,
-        [
-            "rsync",
-            "--server",
-            "--sender",
-            "-logDtpre.iLsfxCIvu",
-            "--numeric-ids",
-            ".",
-            _
-        ] | [
-            "rsync",
-            "--server",
-            "--sender",
-            "-logDtpre.iLsfxCIvu",
-            ".",
-            _
-        ] | [
-            "rsync",
-            "--server",
-            "--sender",
-            "-logDtpre.LsfxCIvu",
-            "--numeric-ids",
-            ".",
-            _
-        ] | [
-            "rsync",
-            "--server",
-            "--sender",
-            "-logDtpre.LsfxCIvu",
-            ".",
-            _
-        ]
-    );
-    if !valid_shape {
-        bail!("rsync 参数未被允许");
-    }
-    let requested = parts.last().context("rsync 缺少导出路径")?;
-    let normalized = requested.trim_end_matches('/');
-    let prefix = "/jobs/transfers/";
-    let capability_id = normalized
-        .strip_prefix(prefix)
-        .filter(|value| uuid_like(value))
-        .context("rsync 导出路径未绑定 Capability")?;
-    let response = worker_request(
-        socket,
-        json!({"command": "resolve_export", "capability_id": capability_id}),
-    )
-    .await?;
-    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false)
-        || response["data"]["directory"].as_str() != Some(normalized)
-    {
-        bail!("Worker 未授权该 rsync 导出");
-    }
-    let error = ProcessCommand::new("/usr/bin/rsync")
-        .args(&parts[1..])
+    let error = ProcessCommand::new("/usr/sbin/rrsync")
+        .args(["-wo", "/landing"])
         .exec();
-    Err(error).context("无法启动受限 rsync sender")
+    Err(error).context("无法启动官方 rrsync 收件器")
 }
 
 async fn read_limited_json_command(command: &str) -> anyhow::Result<Value> {
@@ -941,3 +577,6 @@ fn jobs_directory_usable(path: &Path) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+mod tests;

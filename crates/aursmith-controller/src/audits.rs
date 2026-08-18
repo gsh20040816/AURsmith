@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -339,11 +340,34 @@ pub async fn list(
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query("SELECT audit_bundles.sha256, audit_bundles.revision_id, audit_bundles.state, audit_bundles.policy_version, audit_bundles.deterministic_findings_json, audit_bundles.coverage_json, audit_bundles.created_at, revisions.package_base, revisions.aur_commit FROM audit_bundles JOIN revisions ON revisions.id = audit_bundles.revision_id ORDER BY audit_bundles.created_at DESC LIMIT 200")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let run_rows = sqlx::query("SELECT agent_runs.audit_bundle_sha256, agent_runs.tier, agent_runs.slot, agent_runs.attempt, agent_runs.adapter, agent_runs.provider, agent_runs.model, agent_runs.adapter_version, agent_runs.status, agent_runs.verdict, agent_runs.report_json, agent_runs.started_at, agent_runs.finished_at FROM agent_runs JOIN audit_bundles ON audit_bundles.sha256 = agent_runs.audit_bundle_sha256 WHERE audit_bundles.sha256 IN (SELECT sha256 FROM audit_bundles ORDER BY created_at DESC LIMIT 200) ORDER BY audit_bundles.created_at DESC, agent_runs.tier, agent_runs.slot, agent_runs.attempt")
+        .fetch_all(&state.database).await.map_err(ApiError::internal)?;
+    let mut runs = BTreeMap::<String, Vec<Value>>::new();
+    for row in run_rows {
+        runs.entry(row.get("audit_bundle_sha256"))
+            .or_default()
+            .push(json!({
+                "tier": row.get::<String,_>("tier"),
+                "slot": row.get::<i64,_>("slot"),
+                "attempt": row.get::<i64,_>("attempt"),
+                "adapter": row.get::<String,_>("adapter"),
+                "provider": row.get::<String,_>("provider"),
+                "model": row.get::<String,_>("model"),
+                "adapter_version": row.get::<String,_>("adapter_version"),
+                "status": row.get::<String,_>("status"),
+                "verdict": row.get::<Option<String>,_>("verdict"),
+                "report": row.get::<Option<String>,_>("report_json").and_then(|value| serde_json::from_str::<Value>(&value).ok()),
+                "started_at": row.get::<Option<String>,_>("started_at"),
+                "finished_at": row.get::<Option<String>,_>("finished_at"),
+            }));
+    }
     Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
         "sha256": row.get::<String,_>("sha256"), "revision_id": row.get::<String,_>("revision_id"), "state": row.get::<String,_>("state"),
         "policy_version": row.get::<String,_>("policy_version"), "package_base": row.get::<String,_>("package_base"), "aur_commit": row.get::<String,_>("aur_commit"),
         "findings": parse_json::<Value>(row.get("deterministic_findings_json")).unwrap_or(Value::Null),
-        "coverage": parse_json::<Value>(row.get("coverage_json")).unwrap_or(Value::Null), "created_at": row.get::<String,_>("created_at")
+        "coverage": parse_json::<Value>(row.get("coverage_json")).unwrap_or(Value::Null),
+        "runs": runs.remove(&row.get::<String,_>("sha256")).unwrap_or_default(),
+        "created_at": row.get::<String,_>("created_at")
     })).collect::<Vec<_>>() })))
 }
 
@@ -560,9 +584,6 @@ mod tests {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             public_origin: "https://aursmith.test".into(),
-            ssh_identity_source_file: "/不存在".into(),
-            ssh_identity_file: "/不存在".into(),
-            ssh_known_hosts_file: "/不存在".into(),
             session_idle_minutes: 30,
             session_absolute_hours: 1,
             low_agent_endpoints: vec![],
@@ -571,7 +592,9 @@ mod tests {
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
             builder_token_sha256: crate::auth::sha256("test-builder-token"),
-            publisher_endpoint: "ssh://publisher.test:22".into(),
+            builder_max_concurrent: 1,
+            update_interval_minutes: 30,
+            publisher_socket: "/run/aursmith-publisher/worker.sock".into(),
         };
         AppState::new(database, config)
     }

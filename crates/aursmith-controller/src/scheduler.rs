@@ -2,7 +2,6 @@ use crate::{error::ApiError, routes::AppState, transport};
 use aursmith_domain::AttemptRef;
 use aursmith_protocol::{
     ArtifactRecord, DependencyInput, DependencySource, GuestResult, JobKind, JobSpec, ReleasePlan,
-    ResourceLimits,
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
@@ -16,14 +15,15 @@ use uuid::Uuid;
 pub fn spawn(state: AppState) {
     let upstream_state = state.clone();
     tokio::spawn(async move {
-        let initial_jitter = 300 + u64::from(std::process::id() % 600);
-        tokio::time::sleep(std::time::Duration::from_secs(initial_jitter)).await;
         let mut timer = interval(std::time::Duration::from_secs(60));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
             if let Err(error) = crate::packages::refresh_due(&upstream_state).await {
                 tracing::warn!(%error, "AUR 到期订阅轮询失败");
+            }
+            if let Err(error) = schedule_keyring_refresh(&upstream_state).await {
+                tracing::warn!(%error, "keyring 周期刷新检查失败");
             }
         }
     });
@@ -77,13 +77,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         if authorization_state == "issued" {
             let plan: ReleasePlan =
                 serde_json::from_str(row.get("plan_json")).map_err(ApiError::internal)?;
-            match transport::authorize_release(
-                &state.config,
-                &state.config.publisher_endpoint,
-                &plan,
-            )
-            .await
-            {
+            match transport::authorize_release(&state.config, &plan).await {
                 Ok(_) => {
                     sqlx::query("UPDATE release_jobs SET state = 'signing', last_error = NULL, updated_at = ? WHERE release_id = ?")
                         .bind(Utc::now()).bind(release_id).execute(&state.database).await.map_err(ApiError::internal)?;
@@ -100,13 +94,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
                 }
             }
         } else {
-            match transport::query_release(
-                &state.config,
-                &state.config.publisher_endpoint,
-                &release_id,
-            )
-            .await
-            {
+            match transport::query_release(&state.config, &release_id).await {
                 Ok(reply) if reply.data["state"].as_str() == Some("published") => {
                     let manifest_sha256 = reply.data["manifest_sha256"]
                         .as_str()
@@ -126,6 +114,10 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
                         .bind(&release_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
                     sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('current_release_id', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
                         .bind(json!(release_id).to_string()).bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    if !reply.data["keyring"].is_null() {
+                        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('keyring_state', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
+                            .bind(reply.data["keyring"].to_string()).bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+                    }
                     transaction.commit().await.map_err(ApiError::internal)?;
                 }
                 Ok(reply) if reply.data["state"].as_str() == Some("failed") => {
@@ -148,7 +140,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     }
 
-    let batch = sqlx::query("SELECT id, state, graph_json FROM release_batches WHERE state IN ('artifacts_ready', 'queued_removal') AND NOT EXISTS (SELECT 1 FROM releases WHERE releases.batch_id = release_batches.id) ORDER BY created_at LIMIT 1")
+    let batch = sqlx::query("SELECT id, state, graph_json FROM release_batches WHERE state IN ('artifacts_ready', 'queued_removal', 'keyring_refresh') AND NOT EXISTS (SELECT 1 FROM releases WHERE releases.batch_id = release_batches.id) ORDER BY created_at LIMIT 1")
         .fetch_optional(&state.database).await.map_err(ApiError::internal)?;
     let Some(batch) = batch else {
         return Ok(());
@@ -203,7 +195,10 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
     };
     let artifact_rows = sqlx::query("SELECT artifacts.path, artifacts.sha256, artifacts.size, artifacts.package_name, artifacts.package_version, artifacts.architecture FROM artifacts JOIN jobs ON jobs.id = artifacts.job_id WHERE jobs.batch_id = ? AND jobs.kind = 'build' AND jobs.status = 'succeeded' ORDER BY artifacts.path")
         .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    if artifact_rows.is_empty() && batch_state != "queued_removal" {
+    if artifact_rows.is_empty()
+        && batch_state != "queued_removal"
+        && batch_state != "keyring_refresh"
+    {
         return Err(ApiError::conflict(
             "ARTIFACTS_MISSING",
             "ReleaseBatch 没有可发布 Artifact",
@@ -237,39 +232,6 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         .map(parse_artifact)
         .collect::<Result<Vec<_>, _>>()?;
     let artifacts = merge_release_artifacts(previous_artifacts, changed_artifacts);
-    let revision_sha256s = sqlx::query_scalar::<_, String>("SELECT DISTINCT revisions.input_sha256 FROM revisions JOIN jobs ON jobs.revision_id = revisions.id WHERE jobs.batch_id = ? ORDER BY revisions.input_sha256")
-        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    let audit_report_sha256s = sqlx::query_scalar::<_, String>("SELECT DISTINCT audit_decisions.report_sha256 FROM audit_decisions JOIN jobs ON jobs.revision_id = audit_decisions.revision_id WHERE jobs.batch_id = ? ORDER BY audit_decisions.report_sha256")
-        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    let mut evidence_files = Vec::new();
-    let current_evidence = sqlx::query("SELECT job_evidence_files.path, job_evidence_files.sha256, job_evidence_files.size FROM job_evidence_files JOIN jobs ON jobs.id = job_evidence_files.job_id WHERE jobs.batch_id = ? AND jobs.kind = 'build' AND jobs.status = 'succeeded' ORDER BY job_evidence_files.path")
-        .bind(&batch_id).fetch_all(&state.database).await.map_err(ApiError::internal)?;
-    evidence_files.extend(current_evidence.into_iter().map(|entry| {
-        aursmith_protocol::ManifestEntry {
-            path: entry.get("path"),
-            sha256: entry.get("sha256"),
-            size: u64::try_from(entry.get::<i64, _>("size")).unwrap_or_default(),
-        }
-    }));
-    evidence_files.sort_by(|left, right| left.path.cmp(&right.path));
-    let unique_count = evidence_files
-        .iter()
-        .map(|entry| entry.path.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    if unique_count != evidence_files.len()
-        || evidence_files.iter().any(|entry| {
-            aursmith_protocol::validate_relative_path(&entry.path).is_err()
-                || !entry.path.starts_with("evidence/")
-                || entry.sha256.len() != 64
-                || entry.size == 0
-        })
-    {
-        return Err(ApiError::conflict(
-            "RELEASE_EVIDENCE_FILES_INVALID",
-            "Release 的证据文件清单为空、重复或元数据无效",
-        ));
-    }
     let release_id = Uuid::new_v4();
     let now = Utc::now();
     let authorization = ReleasePlan {
@@ -277,10 +239,7 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         batch_id: Uuid::parse_str(&batch_id).map_err(ApiError::internal)?,
         repository_name: state.config.repository_name.clone(),
         source_git_commit: state.config.source_git_commit.clone(),
-        revision_sha256s,
-        audit_report_sha256s,
         artifacts,
-        evidence_files,
         removed_package_names: removed_package_names.into_iter().collect(),
         include_repository_keyring: true,
         issued_at: now,
@@ -310,6 +269,33 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         .await
         .map_err(ApiError::internal)?;
     transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn schedule_keyring_refresh(state: &AppState) -> Result<(), ApiError> {
+    let reply = transport::publisher_status(&state.config).await?;
+    if let Some(fingerprint) = reply.data["repository_gpg_fingerprint"]
+        .as_str()
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        sqlx::query("INSERT INTO system_settings(key, value_json, updated_at) VALUES ('repository_gpg_fingerprint', ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at")
+            .bind(json!(fingerprint).to_string()).bind(Utc::now()).execute(&state.database).await.map_err(ApiError::internal)?;
+    }
+    let keyring = &reply.data["keyring"];
+    if keyring["repository_initialized"].as_bool() != Some(true)
+        || keyring["refresh_due"].as_bool() != Some(true)
+    {
+        return Ok(());
+    }
+    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_batches WHERE json_extract(graph_json, '$.keyring_only') = 1 AND state IN ('keyring_refresh', 'publishing', 'publish_failed')")
+        .fetch_one(&state.database).await.map_err(ApiError::internal)?;
+    if existing != 0 {
+        return Ok(());
+    }
+    let now = Utc::now();
+    sqlx::query("INSERT INTO release_batches(id, state, graph_json, created_at, updated_at) VALUES (?, 'keyring_refresh', '{\"keyring_only\":true}', ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(now).bind(now)
+        .execute(&state.database).await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -387,7 +373,7 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
                 "成功 Build Job 没有 Artifact 记录",
             ));
         }
-        let mut files = artifacts
+        let files = artifacts
             .into_iter()
             .map(|artifact| aursmith_protocol::ManifestEntry {
                 path: artifact.get("path"),
@@ -395,27 +381,11 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
                 size: u64::try_from(artifact.get::<i64, _>("size")).unwrap_or_default(),
             })
             .collect::<Vec<_>>();
-        let evidence_files = sqlx::query(
-            "SELECT path, sha256, size FROM job_evidence_files WHERE job_id = ? ORDER BY path",
-        )
-        .bind(&job_id)
-        .fetch_all(&state.database)
-        .await
-        .map_err(ApiError::internal)?;
-        files.extend(
-            evidence_files
-                .into_iter()
-                .map(|entry| aursmith_protocol::ManifestEntry {
-                    path: entry.get("path"),
-                    sha256: entry.get("sha256"),
-                    size: u64::try_from(entry.get::<i64, _>("size")).unwrap_or_default(),
-                }),
-        );
-        let transfer_id = Uuid::new_v4();
+        let upload_id = Uuid::new_v4();
         let now = Utc::now();
         let expires_at = now + Duration::hours(1);
         let upload = aursmith_protocol::BuilderUpload {
-            id: transfer_id,
+            upload_id,
             attempt: AttemptRef {
                 job_id: Uuid::parse_str(&job_id).map_err(ApiError::internal)?,
                 attempt_id: Uuid::parse_str(attempt.get("id")).map_err(ApiError::internal)?,
@@ -426,7 +396,7 @@ async fn dispatch_transfer_one(state: &AppState) -> Result<(), ApiError> {
             expires_at,
         };
         sqlx::query("INSERT INTO uploads(id, batch_id, source_job_id, state, request_json, expires_at, created_at, updated_at) VALUES (?, ?, ?, 'issued', ?, ?, ?, ?)")
-            .bind(transfer_id.to_string()).bind(row.get::<String,_>("batch_id")).bind(&job_id)
+            .bind(upload_id.to_string()).bind(row.get::<String,_>("batch_id")).bind(&job_id)
             .bind(serde_json::to_string(&upload).map_err(ApiError::internal)?)
             .bind(expires_at).bind(now).bind(now).execute(&state.database).await.map_err(ApiError::internal)?;
         return Ok(());
@@ -451,11 +421,11 @@ pub(crate) async fn lease_reverse_job(state: &AppState) -> Result<Option<JobSpec
     if publication_backpressure(&state.database).await? {
         return Ok(None);
     }
-    if builder_has_active_job(&state.database).await? {
+    if builder_slots_are_full(state).await? {
         return Ok(None);
     }
     let selected = sqlx::query(
-        "SELECT id FROM jobs WHERE required_role = 'builder' AND status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
+        "SELECT id FROM jobs WHERE status IN ('queued', 'no_eligible_worker') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at LIMIT 1",
     )
     .bind(Utc::now())
     .fetch_optional(&state.database)
@@ -469,17 +439,17 @@ pub(crate) async fn lease_reverse_job(state: &AppState) -> Result<Option<JobSpec
     Ok(Some(spec))
 }
 
-async fn builder_has_active_job(database: &sqlx::SqlitePool) -> Result<bool, ApiError> {
+async fn builder_slots_are_full(state: &AppState) -> Result<bool, ApiError> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE status IN ('dispatched', 'running', 'uncertain')",
     )
-    .fetch_one(database)
+    .fetch_one(&state.database)
     .await
     .map_err(ApiError::internal)?;
-    Ok(count > 0)
+    Ok(count >= i64::from(state.config.builder_max_concurrent))
 }
 
-pub(crate) async fn lease_reverse_transfer(
+pub(crate) async fn lease_reverse_upload(
     state: &AppState,
 ) -> Result<Option<aursmith_protocol::BuilderUpload>, ApiError> {
     let existing: Option<String> = sqlx::query_scalar(
@@ -507,17 +477,16 @@ pub(crate) async fn lease_reverse_transfer(
     let value: String = issued.get("request_json");
     let upload: aursmith_protocol::BuilderUpload =
         serde_json::from_str(&value).map_err(ApiError::internal)?;
-    transport::prepare_push_import(&state.config, &state.config.publisher_endpoint, &upload)
-        .await?;
+    transport::prepare_push_import(&state.config, &upload).await?;
     sqlx::query("UPDATE uploads SET state = 'export_ready', updated_at = ? WHERE id = ? AND state = 'issued'")
-        .bind(Utc::now()).bind(upload.id.to_string())
+        .bind(Utc::now()).bind(upload.upload_id.to_string())
         .execute(&state.database).await.map_err(ApiError::internal)?;
     Ok(Some(upload))
 }
 
 async fn dispatch_job_to_builder(state: &AppState, job_id: &str) -> Result<JobSpec, ApiError> {
     let job = sqlx::query(
-        "SELECT required_role, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, limits_json FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
+        "SELECT revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check FROM jobs WHERE id = ? AND status IN ('queued', 'no_eligible_worker')",
     )
     .bind(job_id)
     .fetch_optional(&state.database)
@@ -539,14 +508,6 @@ async fn dispatch_job_to_builder(state: &AppState, job_id: &str) -> Result<JobSp
         generation: u32::try_from(generation).map_err(ApiError::internal)?,
     };
     let now = Utc::now();
-    let limits: ResourceLimits = serde_json::from_str(
-        job.get::<Option<String>, _>("limits_json")
-            .as_deref()
-            .unwrap_or(
-                "{\"cpu_count\":1,\"memory_mib\":1024,\"disk_mib\":4096,\"timeout_seconds\":600}",
-            ),
-    )
-    .map_err(ApiError::internal)?;
     let spec = JobSpec {
         job_id: parsed_job_id,
         attempt: attempt.clone(),
@@ -564,7 +525,6 @@ async fn dispatch_job_to_builder(state: &AppState, job_id: &str) -> Result<JobSp
         expected_outputs: serde_json::from_str(job.get("expected_outputs_json"))
             .map_err(ApiError::internal)?,
         allow_check: job.get::<i64, _>("allow_check") != 0,
-        limits,
         issued_at: now,
         expires_at: now + Duration::minutes(10),
     };
@@ -579,8 +539,7 @@ async fn dispatch_job_to_builder(state: &AppState, job_id: &str) -> Result<JobSp
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
-    let updated = sqlx::query("UPDATE jobs SET worker_id = NULL, status = 'dispatched', failure_code = NULL, next_attempt_at = NULL, signed_spec_json = ?, updated_at = ? WHERE id = ? AND status IN ('queued', 'no_eligible_worker')")
-        .bind(spec_json)
+    let updated = sqlx::query("UPDATE jobs SET status = 'dispatched', failure_code = NULL, next_attempt_at = NULL, updated_at = ? WHERE id = ? AND status IN ('queued', 'no_eligible_worker')")
         .bind(now)
         .bind(job_id)
         .execute(&mut *transaction)
@@ -676,14 +635,11 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
     } else {
         None
     };
-    let evidence_logs = if matches!(status, "succeeded" | "failed") {
-        validate_evidence_logs(&reply.data["evidence_logs"])?
+    let logs = if matches!(status, "succeeded" | "failed") {
+        validate_build_logs(&reply.data["logs"])?
     } else {
         json!([])
     };
-    let job_kind = row.get::<String, _>("kind");
-    let evidence_files =
-        validate_evidence_files(&reply.data["evidence_files"], &job_kind, status, attempt_id)?;
     let mut advance_build_batch = false;
     let retry_scheduled =
         status == "failed" && generation < 2 && failure.is_some_and(infrastructure_failure);
@@ -711,31 +667,19 @@ async fn reconcile_one(state: &AppState) -> Result<(), ApiError> {
         .execute(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
-    if status == "succeeded"
-        || evidence_logs
-            .as_array()
-            .is_some_and(|logs| !logs.is_empty())
-    {
+    if status == "succeeded" || logs.as_array().is_some_and(|logs| !logs.is_empty()) {
         let document = json!({
             "schema_version": 1,
             "status": status,
             "failure_code": failure,
             "guest_result": guest_result,
-            "logs": evidence_logs
+            "logs": logs
         });
         let bytes = serde_json::to_vec(&document).map_err(ApiError::internal)?;
-        sqlx::query("INSERT OR REPLACE INTO job_evidence(job_id, kind, document_json, sha256, created_at) VALUES (?, ?, ?, ?, ?)")
+        sqlx::query("INSERT OR REPLACE INTO job_logs(job_id, kind, document_json, sha256, created_at) VALUES (?, ?, ?, ?, ?)")
             .bind(&job_id).bind(row.get::<String, _>("kind")).bind(document.to_string())
             .bind(hex::encode(Sha256::digest(bytes))).bind(Utc::now())
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    }
-    if status == "succeeded" && job_kind == "build" {
-        for entry in &evidence_files {
-            sqlx::query("INSERT OR REPLACE INTO job_evidence_files(job_id, path, sha256, size, created_at) VALUES (?, ?, ?, ?, ?)")
-                .bind(&job_id).bind(&entry.path).bind(&entry.sha256)
-                .bind(i64::try_from(entry.size).map_err(ApiError::internal)?)
-                .bind(Utc::now()).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        }
     }
     if row.get::<String, _>("kind") == "build" && status == "succeeded" {
         let Some(GuestResult::Build(build_result)) = guest_result.as_ref() else {
@@ -826,7 +770,7 @@ fn infrastructure_failure(code: &str) -> bool {
     )
 }
 
-fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+fn validate_build_logs(value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
     const ALLOWED_PATHS: [&str; 4] = [
         "docker.stdout.log",
         "docker.stderr.log",
@@ -835,36 +779,36 @@ fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value
     ];
     let logs = value
         .as_array()
-        .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志证据不是数组"))?;
+        .ok_or_else(|| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志不是数组"))?;
     if logs.len() > ALLOWED_PATHS.len()
         || serde_json::to_vec(value).map_err(ApiError::internal)?.len() > 1024 * 1024
     {
         return Err(ApiError::conflict(
-            "INVALID_EVIDENCE_LOGS",
-            "Worker 日志证据超过数量或 1 MiB 上限",
+            "INVALID_BUILD_LOGS",
+            "Builder 日志超过数量或 1 MiB 上限",
         ));
     }
     let mut seen = BTreeSet::new();
     for log in logs {
         let path = log["path"]
             .as_str()
-            .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少路径"))?;
+            .ok_or_else(|| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志缺少路径"))?;
         if !ALLOWED_PATHS.contains(&path) || !seen.insert(path) {
             return Err(ApiError::conflict(
-                "INVALID_EVIDENCE_LOGS",
-                "Worker 日志路径不允许或重复",
+                "INVALID_BUILD_LOGS",
+                "Builder 日志路径不允许或重复",
             ));
         }
         let size = log["size"]
             .as_u64()
-            .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志大小无效"))?;
+            .ok_or_else(|| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志大小无效"))?;
         if size > 64 * 1024 * 1024 {
             if !log["sha256"].is_null()
                 || log["omitted_reason"].as_str().is_none()
                 || log["truncated"].as_bool() != Some(true)
             {
                 return Err(ApiError::conflict(
-                    "INVALID_EVIDENCE_LOGS",
+                    "INVALID_BUILD_LOGS",
                     "超大日志必须明确省略原因",
                 ));
             }
@@ -872,26 +816,26 @@ fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value
         }
         let sha256 = log["sha256"]
             .as_str()
-            .ok_or_else(|| ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少摘要"))?;
+            .ok_or_else(|| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志缺少摘要"))?;
         if sha256.len() != 64
             || !sha256
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
         {
             return Err(ApiError::conflict(
-                "INVALID_EVIDENCE_LOGS",
-                "Worker 日志摘要无效",
+                "INVALID_BUILD_LOGS",
+                "Builder 日志摘要无效",
             ));
         }
-        let content = log["content_base64"].as_str().ok_or_else(|| {
-            ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少有界内容")
-        })?;
-        let decoded = BASE64.decode(content).map_err(|_| {
-            ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志内容不是 Base64")
-        })?;
-        let truncated = log["truncated"].as_bool().ok_or_else(|| {
-            ApiError::conflict("INVALID_EVIDENCE_LOGS", "Worker 日志缺少截断标记")
-        })?;
+        let content = log["content_base64"]
+            .as_str()
+            .ok_or_else(|| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志缺少有界内容"))?;
+        let decoded = BASE64
+            .decode(content)
+            .map_err(|_| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志内容不是 Base64"))?;
+        let truncated = log["truncated"]
+            .as_bool()
+            .ok_or_else(|| ApiError::conflict("INVALID_BUILD_LOGS", "Builder 日志缺少截断标记"))?;
         let content_shape_valid = if size <= 128 * 1024 {
             decoded.len() as u64 == size && !truncated
         } else {
@@ -899,62 +843,26 @@ fn validate_evidence_logs(value: &serde_json::Value) -> Result<serde_json::Value
         };
         if !content_shape_valid {
             return Err(ApiError::conflict(
-                "INVALID_EVIDENCE_LOGS",
-                "Worker 日志内容长度与截断标记不一致",
+                "INVALID_BUILD_LOGS",
+                "Builder 日志内容长度与截断标记不一致",
             ));
         }
         if let Some(text) = log["content_utf8"].as_str()
             && text.as_bytes() != decoded
         {
             return Err(ApiError::conflict(
-                "INVALID_EVIDENCE_LOGS",
-                "Worker 日志文本与 Base64 内容不一致",
+                "INVALID_BUILD_LOGS",
+                "Builder 日志文本与 Base64 内容不一致",
             ));
         }
         if size <= 128 * 1024 && hex::encode(Sha256::digest(&decoded)) != sha256 {
             return Err(ApiError::conflict(
-                "INVALID_EVIDENCE_LOGS",
-                "完整 Worker 日志内容与摘要不一致",
+                "INVALID_BUILD_LOGS",
+                "完整 Builder 日志内容与摘要不一致",
             ));
         }
     }
     Ok(value.clone())
-}
-
-fn validate_evidence_files(
-    value: &serde_json::Value,
-    job_kind: &str,
-    status: &str,
-    _attempt_id: &str,
-) -> Result<Vec<aursmith_protocol::ManifestEntry>, ApiError> {
-    let entries = serde_json::from_value::<Vec<aursmith_protocol::ManifestEntry>>(value.clone())
-        .map_err(|_| ApiError::conflict("INVALID_EVIDENCE_FILES", "Worker 证据文件清单无效"))?;
-    if job_kind != "build" || status != "succeeded" {
-        if entries.is_empty() {
-            return Ok(entries);
-        }
-        return Err(ApiError::conflict(
-            "UNEXPECTED_EVIDENCE_FILES",
-            "只有成功 Build Job 可以返回证据文件",
-        ));
-    }
-    let expected: [String; 0] = [];
-    let mut paths = BTreeSet::new();
-    for entry in &entries {
-        aursmith_protocol::validate_relative_path(&entry.path).map_err(ApiError::internal)?;
-        if !expected.contains(&entry.path)
-            || !paths.insert(entry.path.clone())
-            || entry.sha256.len() != 64
-            || !entry.sha256.chars().all(|value| value.is_ascii_hexdigit())
-            || entry.size == 0
-        {
-            return Err(ApiError::conflict(
-                "INVALID_EVIDENCE_FILES",
-                "Build 证据文件路径、摘要或大小无效",
-            ));
-        }
-    }
-    Ok(entries)
 }
 
 fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
@@ -1019,24 +927,88 @@ mod release_tests {
     use super::*;
 
     #[tokio::test]
+    async fn due_keyring_schedules_exactly_one_local_publisher_release() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("publisher.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut request = String::new();
+                let mut reader = tokio::io::BufReader::new(stream);
+                tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut request)
+                    .await
+                    .unwrap();
+                requests.push(request);
+                let response = json!({
+                    "ok": true,
+                    "code": "STATUS",
+                    "message": "",
+                    "data": {
+                        "repository_gpg_fingerprint": "A".repeat(40),
+                        "keyring": {
+                            "repository_initialized": true,
+                            "refresh_due": true
+                        }
+                    }
+                });
+                tokio::io::AsyncWriteExt::write_all(
+                    reader.get_mut(),
+                    format!("{response}\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            }
+            requests
+        });
+        let mut state = state(database.clone());
+        std::sync::Arc::make_mut(&mut state.config).publisher_socket =
+            socket.to_string_lossy().into_owned();
+
+        schedule_keyring_refresh(&state).await.unwrap();
+        schedule_keyring_refresh(&state).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM release_batches WHERE state = 'keyring_refresh'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let fingerprint: String = sqlx::query_scalar(
+            "SELECT value_json FROM system_settings WHERE key = 'repository_gpg_fingerprint'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(fingerprint, json!("A".repeat(40)).to_string());
+        for request in server.await.unwrap() {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["command"],
+                "status"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn reverse_worker_does_not_lease_while_an_attempt_is_active() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
-        let worker_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let now = Utc::now();
-        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', 'reverse', ?, ?)")
-            .bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
-        sqlx::query("INSERT INTO jobs(id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, 'builder', ?, 'dispatched', 1, 'build', '[]', '[]', '[]', ?, ?)")
-            .bind(job_id.to_string()).bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO jobs(id, status, priority, kind, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, 'dispatched', 1, 'build', '[]', '[]', ?, ?)")
+            .bind(job_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+        let state = state(database.clone());
 
-        assert!(builder_has_active_job(&database).await.unwrap());
+        assert!(builder_slots_are_full(&state).await.unwrap());
 
         sqlx::query("UPDATE jobs SET status = 'succeeded' WHERE id = ?")
             .bind(job_id.to_string())
             .execute(&database)
             .await
             .unwrap();
-        assert!(!builder_has_active_job(&database).await.unwrap());
+        assert!(!builder_slots_are_full(&state).await.unwrap());
     }
 
     #[test]
@@ -1064,9 +1036,6 @@ mod release_tests {
                 bind_address: "127.0.0.1:0".into(),
                 database_url: "sqlite::memory:".into(),
                 public_origin: "https://aursmith.test".into(),
-                ssh_identity_source_file: "/不存在".into(),
-                ssh_identity_file: "/不存在".into(),
-                ssh_known_hosts_file: "/不存在".into(),
                 session_idle_minutes: 30,
                 session_absolute_hours: 1,
                 low_agent_endpoints: vec![],
@@ -1075,7 +1044,9 @@ mod release_tests {
                 source_git_commit: "test".into(),
                 repository_base_url: "https://repo.test".into(),
                 builder_token_sha256: crate::auth::sha256("test-builder-token"),
-                publisher_endpoint: "ssh://publisher.test:22".into(),
+                builder_max_concurrent: 1,
+                update_interval_minutes: 30,
+                publisher_socket: "/run/aursmith-publisher/worker.sock".into(),
             },
         )
     }
@@ -1186,7 +1157,7 @@ mod release_tests {
             .bind(&old_batch).bind(now).bind(now).bind(&removal_batch)
             .bind(json!({"remove": ["demo"]}).to_string()).bind(now).bind(now)
             .execute(&database).await.unwrap();
-        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'succeeded', 1, ?, 'build', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, status, priority, revision_sha256, kind, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, ?, ?, 'succeeded', 1, ?, 'build', '[]', '[]', ?, ?)")
             .bind(&old_job).bind(&old_batch).bind(&revision).bind("c".repeat(64)).bind(now).bind(now)
             .execute(&database).await.unwrap();
         sqlx::query("INSERT INTO releases(id, batch_id, state, manifest_sha256, source_git_commit, committed_at, created_at) VALUES (?, ?, 'committed', ?, 'test', ?, ?)")
@@ -1255,7 +1226,7 @@ mod release_tests {
     }
 
     #[test]
-    fn evidence_logs_require_allowed_paths_and_matching_complete_digest() {
+    fn build_logs_require_allowed_paths_and_matching_complete_digest() {
         let content = b"build output";
         let valid = json!([{
             "path": "output/build.log",
@@ -1264,9 +1235,9 @@ mod release_tests {
             "truncated": false,
             "content_base64": BASE64.encode(content)
         }]);
-        assert!(validate_evidence_logs(&valid).is_ok());
+        assert!(validate_build_logs(&valid).is_ok());
         let mut invalid = valid;
         invalid[0]["path"] = json!("../controller-secret");
-        assert!(validate_evidence_logs(&invalid).is_err());
+        assert!(validate_build_logs(&invalid).is_err());
     }
 }

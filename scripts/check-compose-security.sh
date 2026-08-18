@@ -10,7 +10,7 @@ export AURSMITH_CONTROLLER_POLL_URL="${AURSMITH_CONTROLLER_POLL_URL:-https://con
 export AURSMITH_BUILDER_TOKEN_SHA256="${AURSMITH_BUILDER_TOKEN_SHA256:-0000000000000000000000000000000000000000000000000000000000000000}"
 export AURSMITH_REVERSE_PUBLISHER_ENDPOINT="${AURSMITH_REVERSE_PUBLISHER_ENDPOINT:-ssh://aursmith@192.0.2.20:2223}"
 
-for stack in controller builder publisher; do
+for stack in controller builder; do
   json="$(docker compose -f "deploy/${stack}/compose.yaml" config --format json)"
   if jq -e '.services[] | select(.privileged == true)' <<<"${json}" >/dev/null; then
     echo "${stack}: 禁止 privileged" >&2
@@ -83,10 +83,11 @@ if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "publisher_push_ke
   exit 1
 fi
 
-publisher_json="$(docker compose -f deploy/publisher/compose.yaml config --format json)"
+controller_json="$(docker compose -f deploy/controller/compose.yaml config --format json)"
+publisher_json="${controller_json}"
 if jq -e '.services | has("repository")' <<<"${publisher_json}" >/dev/null \
-  || [[ "$(jq -r '.services.worker.environment.AURSMITH_REPOSITORY_HTTP_BIND // ""' <<<"${publisher_json}")" != "0.0.0.0:8080" ]] \
-  || [[ "$(jq '[.services.worker.ports[]? | select(.target == 8080 and .host_ip == "127.0.0.1")] | length' <<<"${publisher_json}")" != "1" ]]; then
+  || [[ "$(jq -r '.services.publisher.environment.AURSMITH_REPOSITORY_HTTP_BIND // ""' <<<"${publisher_json}")" != "0.0.0.0:8080" ]] \
+  || [[ "$(jq '[.services.publisher.ports[]? | select(.target == 8080 and .host_ip == "127.0.0.1")] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "Publisher 必须自行提供只绑定宿主回环地址的仓库 HTTP 服务" >&2
   exit 1
 fi
@@ -94,15 +95,15 @@ if jq -e '.services | has("signer")' <<<"${publisher_json}" >/dev/null; then
   echo "Publisher 不得再拆分独立 Signer 服务" >&2
   exit 1
 fi
-if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_private_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
+if [[ "$(jq '[.services.publisher.secrets[]? | select(.source == "repository_gpg_private_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "固定 Publisher 必须直接持有仓库 GPG 私钥" >&2
   exit 1
 fi
-if [[ "$(jq '[.services.worker.secrets[]? | select(.source == "repository_gpg_public_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
+if [[ "$(jq '[.services.publisher.secrets[]? | select(.source == "repository_gpg_public_key")] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "Publisher Worker 必须只获得仓库 GPG 公钥" >&2
   exit 1
 fi
-if [[ "$(jq '[.services.ssh.volumes[]? | select(.target == "/landing" and .source == "publisher-landing" and (.read_only // false) == false)] | length' <<<"${publisher_json}")" != "1" ]]; then
+if [[ "$(jq '[.services["publisher-ssh"].volumes[]? | select(.target == "/landing" and .source == "publisher-landing" and (.read_only // false) == false)] | length' <<<"${publisher_json}")" != "1" ]]; then
   echo "Publisher SSH 必须只通过 Publisher landing 卷接收受限 Builder 推送" >&2
   exit 1
 fi
@@ -111,7 +112,6 @@ if jq -e '.services | has("pacoloco")' <<<"${publisher_json}" >/dev/null; then
   exit 1
 fi
 
-controller_json="$(docker compose -f deploy/controller/compose.yaml config --format json)"
 if jq -e '.services | has("web")' <<<"${controller_json}" >/dev/null \
   || [[ "$(jq '[.services.controller.ports[]? | select(.target == 8080 and .host_ip == "127.0.0.1")] | length' <<<"${controller_json}")" != "1" ]]; then
   echo "Controller 必须自行提供 Web/API，并只绑定宿主回环地址" >&2
@@ -132,6 +132,11 @@ fi
 if [[ "$(jq '(.services.controller.networks | has("edge")) and (.services | has("backup-ssh") | not)' <<<"${controller_json}")" != "true" ]] \
   || [[ "$(jq -r '.networks.edge.internal // false' <<<"${controller_json}")" != "false" ]]; then
   echo "默认 Controller 只能通过非 internal 的 edge 网络发布回环端口" >&2
+  exit 1
+fi
+if [[ "$(jq '(.services.controller.volumes | any(.target == "/run/aursmith-publisher")) and (.services.publisher.volumes | any(.target == "/run/aursmith"))' <<<"${controller_json}")" != "true" ]] \
+  || [[ "$(jq -r '.services.controller.environment.AURSMITH_PUBLISHER_SOCKET // ""' <<<"${controller_json}")" != "/run/aursmith-publisher/worker.sock" ]]; then
+  echo "Controller 与固定 Publisher 必须只通过共享 Unix Socket 通信" >&2
   exit 1
 fi
 echo "Compose 安全策略检查通过"

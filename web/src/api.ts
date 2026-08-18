@@ -37,14 +37,12 @@ export type Session = { id: string; username: string };
 export type Job = {
   id: string;
   kind: "build";
-  required_role: "builder";
   status: string;
   priority: number;
   failure_code: string | null;
   revision_sha256: string | null;
-  worker_name: string | null;
   attempt_count: number;
-  has_evidence: boolean;
+  has_logs: boolean;
   next_attempt_at: string | null;
   created_at: string;
   updated_at: string;
@@ -98,6 +96,20 @@ export type Audit = {
     aur_wrapper?: { mode: string; files: string[] };
     upstream_source?: { mode: string; statement: string };
   };
+  runs: Array<{
+    tier: "low" | "high";
+    slot: number;
+    attempt: number;
+    adapter: string;
+    provider: string;
+    model: string;
+    adapter_version: string;
+    status: string;
+    verdict: string | null;
+    report: { summary?: string; findings?: unknown[]; files_read?: string[] } | null;
+    started_at: string | null;
+    finished_at: string | null;
+  }>;
   created_at: string;
 };
 export type Release = {
@@ -114,6 +126,9 @@ export type ClientBootstrap = {
   repository_config: string;
   gpg_fingerprint: string;
   gpg_key_url: string;
+  keyring_generation: number | null;
+  keyring_published_at: string | null;
+  keyring_next_due_at: string | null;
   client_ca_url: string | null;
   commands: string[];
   warnings: string[];
@@ -132,7 +147,7 @@ export const api = {
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   me: () => request<Session>("/api/v1/auth/me"),
   jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
-  jobEvidence: (id: string) => request<{ job_id: string; kind: string; sha256: string; document: unknown; created_at: string }>(`/api/v1/jobs/${encodeURIComponent(id)}/evidence`),
+  jobLogs: (id: string) => request<{ job_id: string; kind: string; sha256: string; document: unknown; created_at: string }>(`/api/v1/jobs/${encodeURIComponent(id)}/logs`),
   searchAur: (query: string) =>
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),
@@ -149,6 +164,11 @@ export const api = {
     request<{ bundle_sha256: string; decision: string }>(
       `/api/v1/audits/${encodeURIComponent(bundle)}/manual-decision`,
       { method: "POST", body: JSON.stringify({ approve, rationale }) }
+    ),
+  retryAudit: (bundle: string) =>
+    request<{ bundle_sha256: string; state: string }>(
+      `/api/v1/audits/${encodeURIComponent(bundle)}/retry`,
+      { method: "POST" }
     ),
   subscribe: (packageName: string) =>
     request<{ package_base: string; revision_id: string; batch_id: string | null; batch_state: string }>(

@@ -58,6 +58,18 @@ struct Cli {
     aur_base_url: String,
     #[arg(long, env = "AURSMITH_JOBS_DIR", default_value = "/jobs")]
     jobs_dir: String,
+    #[arg(long, env = "AURSMITH_BUILDER_MAX_CONCURRENT", default_value_t = 1)]
+    builder_max_concurrent: u16,
+    #[arg(long, env = "AURSMITH_BUILD_CPU_COUNT", default_value_t = 4)]
+    build_cpu_count: u16,
+    #[arg(long, env = "AURSMITH_BUILD_MEMORY_MIB", default_value_t = 8192)]
+    build_memory_mib: u64,
+    #[arg(long, env = "AURSMITH_BUILD_TIMEOUT_SECONDS", default_value_t = 3600)]
+    build_timeout_seconds: u64,
+    #[arg(long, env = "AURSMITH_BUILD_MAX_OUTPUT_MIB", default_value_t = 8192)]
+    build_max_output_mib: u64,
+    #[arg(long, env = "AURSMITH_BUILD_MAX_LOG_MIB", default_value_t = 64)]
+    build_max_log_mib: u64,
     #[arg(long, env = "AURSMITH_LANDING_DIR", default_value = "/landing")]
     landing_dir: PathBuf,
     #[arg(
@@ -128,20 +140,47 @@ struct Worker {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum WorkerCommand {
     Status,
-    Query { job_id: String },
-    AurSearch { query: String },
-    AurInfo { names: Vec<String> },
-    AurProviders { names: Vec<String> },
-    OfficialInfo { names: Vec<String> },
+    Query {
+        job_id: String,
+    },
+    AurSearch {
+        query: String,
+    },
+    AurInfo {
+        names: Vec<String>,
+    },
+    AurProviders {
+        names: Vec<String>,
+    },
+    OfficialInfo {
+        names: Vec<String>,
+    },
     PublisherDoctor,
-    AurSnapshot { package_base: String },
-    PreparePushImport { envelope: BuilderUpload },
-    ResolveImport { capability_id: String },
-    FinalizePushImport { envelope: BuilderUpload },
-    AuthorizeRelease { envelope: ReleasePlan },
-    QueryRelease { release_id: String },
-    ReleaseFiles { release_id: String },
-    AuthorizeRollback { envelope: ReleaseRollbackRequest },
+    AurSnapshot {
+        package_base: String,
+    },
+    PreparePushImport {
+        envelope: BuilderUpload,
+    },
+    ResolveImport {
+        #[serde(alias = "capability_id")]
+        upload_id: String,
+    },
+    FinalizePushImport {
+        envelope: BuilderUpload,
+    },
+    AuthorizeRelease {
+        envelope: ReleasePlan,
+    },
+    QueryRelease {
+        release_id: String,
+    },
+    ReleaseFiles {
+        release_id: String,
+    },
+    AuthorizeRollback {
+        envelope: ReleaseRollbackRequest,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -179,11 +218,19 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
     let cli = Cli::parse();
-    let database = connect(&cli.database).await?;
+    let database = connect(&cli.database, cli.role).await?;
     let jobs_dir = PathBuf::from(&cli.jobs_dir);
     if matches!(cli.role, RoleArg::Builder) && !jobs_dir.is_absolute() {
         bail!("Builder jobs 目录必须是绝对路径");
     }
+    let build_limits = builder::BuildLimits::new(
+        cli.builder_max_concurrent,
+        cli.build_cpu_count,
+        cli.build_memory_mib,
+        cli.build_timeout_seconds,
+        cli.build_max_output_mib,
+        cli.build_max_log_mib,
+    )?;
     let aur = aur::AurClient::new(&cli.aur_base_url)?;
     let repository_public_key = cli.repository_gpg_public_key_file.clone();
     let repository_gpg_fingerprint = if matches!(cli.role, RoleArg::Publisher) {
@@ -219,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
         database,
         aur,
         builder: if matches!(cli.role, RoleArg::Builder) {
-            Some(builder::BuilderRuntime::new(jobs_dir.clone()))
+            Some(builder::BuilderRuntime::new(jobs_dir.clone(), build_limits))
         } else {
             None
         },
@@ -370,8 +417,8 @@ async fn reverse_poll_once(
             response: serde_json::to_value(response)?,
         });
     }
-    let completed_transfers: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT capability_id FROM transfer_exports WHERE state = 'pushed' ORDER BY capability_id",
+    let completed_uploads: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT upload_id FROM builder_uploads WHERE state = 'pushed' ORDER BY upload_id",
     )
     .fetch_all(&worker.database)
     .await?
@@ -381,7 +428,7 @@ async fn reverse_poll_once(
     let poll = BuilderPoll {
         status: status_response.data,
         attempts: attempts.clone(),
-        completed_transfers: completed_transfers.clone(),
+        completed_uploads: completed_uploads.clone(),
         sent_at: Utc::now(),
     };
     let token = worker
@@ -426,16 +473,16 @@ async fn reverse_poll_once(
             );
         }
     }
-    if let Some(transfer) = lease.transfer {
-        push_transfer(worker, transfer).await?;
+    if let Some(upload) = lease.upload {
+        push_upload(worker, upload).await?;
     }
-    for capability_id in completed_transfers {
-        sqlx::query("UPDATE transfer_exports SET state = 'completed' WHERE capability_id = ? AND state = 'pushed'")
-            .bind(capability_id.to_string()).execute(&worker.database).await?;
+    for upload_id in completed_uploads {
+        sqlx::query("UPDATE builder_uploads SET state = 'completed' WHERE upload_id = ? AND state = 'pushed'")
+            .bind(upload_id.to_string()).execute(&worker.database).await?;
         let directory = worker
             .jobs_dir
             .join("transfers")
-            .join(capability_id.to_string());
+            .join(upload_id.to_string());
         if directory.exists() {
             std::fs::remove_dir_all(directory)?;
         }
@@ -499,10 +546,10 @@ async fn cleanup_releasable_attempt(worker: &Worker, attempt_id: Uuid) -> anyhow
     Ok(())
 }
 
-async fn push_transfer(worker: &Worker, upload: BuilderUpload) -> anyhow::Result<()> {
+async fn push_upload(worker: &Worker, upload: BuilderUpload) -> anyhow::Result<()> {
     let local_state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM transfer_exports WHERE capability_id = ?")
-            .bind(upload.id.to_string())
+        sqlx::query_scalar("SELECT state FROM builder_uploads WHERE upload_id = ?")
+            .bind(upload.upload_id.to_string())
             .fetch_optional(&worker.database)
             .await?;
     if matches!(local_state.as_deref(), Some("pushed" | "completed")) {
@@ -544,8 +591,8 @@ async fn push_transfer(worker: &Worker, upload: BuilderUpload) -> anyhow::Result
     let source = worker
         .jobs_dir
         .join("transfers")
-        .join(upload.id.to_string());
-    let destination = format!("{remote}:.{}.partial/", upload.id);
+        .join(upload.upload_id.to_string());
+    let destination = format!("{remote}:.{}.partial/", upload.upload_id);
     let private_key = tempfile::NamedTempFile::new()?;
     std::fs::copy(identity, private_key.path()).context("复制 Publisher 推送私钥失败")?;
     std::fs::set_permissions(private_key.path(), std::fs::Permissions::from_mode(0o600))?;
@@ -559,12 +606,6 @@ async fn push_transfer(worker: &Worker, upload: BuilderUpload) -> anyhow::Result
         ))
         .arg(format!("{}/", source.display()))
         .arg(destination)
-        .env("AURSMITH_RSYNC_SSH_IDENTITY_FILE", identity)
-        .env("AURSMITH_RSYNC_SSH_KNOWN_HOSTS_FILE", known_hosts)
-        .env(
-            "AURSMITH_RSYNC_SSH_PORT",
-            endpoint.port().unwrap_or(22).to_string(),
-        )
         .stdin(std::process::Stdio::null())
         .output()
         .await?;
@@ -616,8 +657,8 @@ async fn push_transfer(worker: &Worker, upload: BuilderUpload) -> anyhow::Result
                 .collect::<String>()
         );
     }
-    sqlx::query("UPDATE transfer_exports SET state = 'pushed' WHERE capability_id = ?")
-        .bind(upload.id.to_string())
+    sqlx::query("UPDATE builder_uploads SET state = 'pushed' WHERE upload_id = ?")
+        .bind(upload.upload_id.to_string())
         .execute(&worker.database)
         .await?;
     Ok(())
@@ -631,15 +672,14 @@ async fn prepare_builder_upload(worker: &Worker, upload: &BuilderUpload) -> anyh
     let directory = runtime
         .jobs_dir()
         .join("transfers")
-        .join(upload.id.to_string());
+        .join(upload.upload_id.to_string());
     let manifest_json = serde_json::to_string(&upload.files)?;
     if directory.exists() {
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT manifest_json FROM transfer_exports WHERE capability_id = ?",
-        )
-        .bind(upload.id.to_string())
-        .fetch_optional(&worker.database)
-        .await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT manifest_json FROM builder_uploads WHERE upload_id = ?")
+                .bind(upload.upload_id.to_string())
+                .fetch_optional(&worker.database)
+                .await?;
         if existing.as_deref() == Some(manifest_json.as_str()) {
             return Ok(());
         }
@@ -654,8 +694,8 @@ async fn prepare_builder_upload(worker: &Worker, upload: &BuilderUpload) -> anyh
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
-    sqlx::query("INSERT INTO transfer_exports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, ?, ?, 'ready')")
-        .bind(upload.id.to_string())
+    sqlx::query("INSERT INTO builder_uploads(upload_id, expires_at, directory, manifest_json, state) VALUES (?, ?, ?, ?, 'ready')")
+        .bind(upload.upload_id.to_string())
         .bind(upload.expires_at)
         .bind(directory.to_string_lossy().as_ref())
         .bind(manifest_json)
@@ -664,7 +704,7 @@ async fn prepare_builder_upload(worker: &Worker, upload: &BuilderUpload) -> anyh
     Ok(())
 }
 
-async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
+async fn connect(database_url: &str, role: RoleArg) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
@@ -678,63 +718,98 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS transfer_exports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL);",
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS transfer_imports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL);",
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS publisher_release_jobs(release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
-    )
-    .execute(&pool)
-    .await?;
-    let legacy_publisher_releases: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'publisher_releases'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    if legacy_publisher_releases != 0 {
-        sqlx::query("DROP TABLE publisher_releases")
+    match role {
+        RoleArg::Builder => {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS builder_uploads(upload_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL);",
+            )
             .execute(&pool)
             .await?;
-    }
-    sqlx::query(
-        "DELETE FROM publisher_release_jobs \
-         WHERE json_type(plan_json, '$.release_id') IS NULL \
-         AND json_extract(plan_json, '$.payload_type') = 'aursmith.release_authorization'",
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS attempts(\
-         job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
-         envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
-         result_sha256 TEXT, spec_json TEXT, failure_code TEXT, reported_at TEXT, workspace_cleaned_at TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
-    )
-    .execute(&pool)
-    .await?;
-    for statement in [
-        "ALTER TABLE attempts ADD COLUMN spec_json TEXT",
-        "ALTER TABLE attempts ADD COLUMN failure_code TEXT",
-        "ALTER TABLE attempts ADD COLUMN reported_at TEXT",
-        "ALTER TABLE attempts ADD COLUMN workspace_cleaned_at TEXT",
-    ] {
-        if let Err(error) = sqlx::query(statement).execute(&pool).await
-            && !error.to_string().contains("duplicate column name")
-        {
-            return Err(error.into());
+            if table_exists(&pool, "transfer_exports").await? {
+                sqlx::query("INSERT OR IGNORE INTO builder_uploads(upload_id, expires_at, directory, manifest_json, state) SELECT capability_id, expires_at, directory, manifest_json, state FROM transfer_exports")
+                    .execute(&pool)
+                    .await?;
+            }
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS attempts(\
+                 job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, \
+                 envelope_sha256 TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, \
+                 result_sha256 TEXT, spec_json TEXT, failure_code TEXT, reported_at TEXT, workspace_cleaned_at TEXT, PRIMARY KEY(job_id, generation), UNIQUE(attempt_id));",
+            )
+            .execute(&pool)
+            .await?;
+            for statement in [
+                "ALTER TABLE attempts ADD COLUMN spec_json TEXT",
+                "ALTER TABLE attempts ADD COLUMN failure_code TEXT",
+                "ALTER TABLE attempts ADD COLUMN reported_at TEXT",
+                "ALTER TABLE attempts ADD COLUMN workspace_cleaned_at TEXT",
+            ] {
+                if let Err(error) = sqlx::query(statement).execute(&pool).await
+                    && !error.to_string().contains("duplicate column name")
+                {
+                    return Err(error.into());
+                }
+            }
+            sqlx::query(
+                "UPDATE attempts SET status = 'failed', failure_code = 'WORKER_RESTARTED' WHERE status = 'running'",
+            )
+            .execute(&pool)
+            .await?;
+        }
+        RoleArg::Publisher => {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS publisher_uploads(upload_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL);",
+            )
+            .execute(&pool)
+            .await?;
+            if table_exists(&pool, "transfer_imports").await? {
+                sqlx::query("INSERT OR IGNORE INTO publisher_uploads(upload_id, expires_at, directory, manifest_json, state) SELECT capability_id, expires_at, directory, manifest_json, state FROM transfer_imports")
+                    .execute(&pool)
+                    .await?;
+            }
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS publisher_release_jobs(release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+            )
+            .execute(&pool)
+            .await?;
+            if table_exists(&pool, "publisher_releases").await? {
+                sqlx::query("DROP TABLE publisher_releases")
+                    .execute(&pool)
+                    .await?;
+            }
+            sqlx::query(
+                "DELETE FROM publisher_release_jobs \
+                 WHERE json_type(plan_json, '$.release_id') IS NULL \
+                 AND json_extract(plan_json, '$.payload_type') = 'aursmith.release_authorization'",
+            )
+            .execute(&pool)
+            .await?;
         }
     }
-    sqlx::query(
-        "UPDATE attempts SET status = 'failed', failure_code = 'WORKER_RESTARTED' WHERE status = 'running'",
-    )
-    .execute(&pool)
-    .await?;
+    for legacy_table in [
+        "transfer_exports",
+        "transfer_imports",
+        "archive_receipts",
+        "backup_archive_receipts",
+        "publisher_releases",
+    ] {
+        if table_exists(&pool, legacy_table).await? {
+            sqlx::query(&format!("DROP TABLE {legacy_table}"))
+                .execute(&pool)
+                .await?;
+        }
+    }
+    let irrelevant_tables: &[&str] = match role {
+        RoleArg::Builder => &["publisher_uploads", "publisher_release_jobs"],
+        RoleArg::Publisher => &["builder_uploads", "attempts"],
+    };
+    for table in irrelevant_tables {
+        if table_exists(&pool, table).await? {
+            sqlx::query(&format!("DROP TABLE {table}"))
+                .execute(&pool)
+                .await?;
+        }
+    }
     sqlx::query(
         "INSERT INTO worker_state(key, value) VALUES ('instance_id', ?) ON CONFLICT(key) DO NOTHING",
     )
@@ -742,6 +817,15 @@ async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
     Ok(pool)
+}
+
+async fn table_exists(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+    Ok(count != 0)
 }
 
 async fn prepare_socket(socket: &str) -> anyhow::Result<()> {
@@ -784,9 +868,7 @@ async fn execute_command(worker: &Worker, command: WorkerCommand) -> WorkerRespo
         WorkerCommand::PreparePushImport { envelope } => {
             prepare_push_import(worker, envelope).await
         }
-        WorkerCommand::ResolveImport { capability_id } => {
-            resolve_import(worker, &capability_id).await
-        }
+        WorkerCommand::ResolveImport { upload_id } => resolve_import(worker, &upload_id).await,
         WorkerCommand::FinalizePushImport { envelope } => {
             finalize_push_import(worker, envelope).await
         }
@@ -847,36 +929,41 @@ async fn prepare_push_import(worker: &Worker, upload: BuilderUpload) -> WorkerRe
     if upload.expires_at < Utc::now() || upload.files.is_empty() {
         return WorkerResponse::error("INVALID_UPLOAD", "Builder 上传任务无效或已过期");
     }
-    let final_directory = worker.landing_dir.join(upload.id.to_string());
+    let final_directory = worker.landing_dir.join(upload.upload_id.to_string());
     if final_directory.exists() {
         return match verify_manifest_directory(&final_directory, &upload.files) {
             Ok(()) => WorkerResponse::ok(
                 "IDEMPOTENT_IMPORT",
-                serde_json::json!({"upload_id": upload.id}),
+                serde_json::json!({"upload_id": upload.upload_id}),
             ),
-            Err(error) => WorkerResponse::error("CAPABILITY_CONFLICT", error.to_string()),
+            Err(error) => WorkerResponse::error("UPLOAD_CONFLICT", error.to_string()),
         };
     }
-    let staging = worker.landing_dir.join(format!(".{}.partial", upload.id));
+    let staging = worker
+        .landing_dir
+        .join(format!(".{}.partial", upload.upload_id));
     if let Err(error) = std::fs::create_dir_all(&staging) {
         return WorkerResponse::error("LANDING_ERROR", error.to_string());
     }
-    let result = sqlx::query("INSERT INTO transfer_imports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, ?, ?, 'receiving') ON CONFLICT(capability_id) DO UPDATE SET expires_at = excluded.expires_at, manifest_json = excluded.manifest_json WHERE transfer_imports.state = 'receiving'")
-        .bind(upload.id.to_string()).bind(upload.expires_at)
+    let result = sqlx::query("INSERT INTO publisher_uploads(upload_id, expires_at, directory, manifest_json, state) VALUES (?, ?, ?, ?, 'receiving') ON CONFLICT(upload_id) DO UPDATE SET expires_at = excluded.expires_at, manifest_json = excluded.manifest_json WHERE publisher_uploads.state = 'receiving'")
+        .bind(upload.upload_id.to_string()).bind(upload.expires_at)
         .bind(staging.to_string_lossy().as_ref()).bind(serde_json::to_string(&upload.files).unwrap_or_default())
         .execute(&worker.database).await;
     match result {
-        Ok(_) => WorkerResponse::ok("IMPORT_READY", serde_json::json!({"upload_id": upload.id})),
+        Ok(_) => WorkerResponse::ok(
+            "IMPORT_READY",
+            serde_json::json!({"upload_id": upload.upload_id}),
+        ),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
 }
 
-async fn resolve_import(worker: &Worker, capability_id: &str) -> WorkerResponse {
-    if Uuid::parse_str(capability_id).is_err() {
-        return WorkerResponse::error("INVALID_CAPABILITY", "Capability ID 无效");
+async fn resolve_import(worker: &Worker, upload_id: &str) -> WorkerResponse {
+    if Uuid::parse_str(upload_id).is_err() {
+        return WorkerResponse::error("INVALID_UPLOAD", "Upload ID 无效");
     }
-    let row = sqlx::query("SELECT directory, expires_at FROM transfer_imports WHERE capability_id = ? AND state = 'receiving'")
-        .bind(capability_id).fetch_optional(&worker.database).await;
+    let row = sqlx::query("SELECT directory, expires_at FROM publisher_uploads WHERE upload_id = ? AND state = 'receiving'")
+        .bind(upload_id).fetch_optional(&worker.database).await;
     match row {
         Ok(Some(row))
             if row
@@ -889,8 +976,8 @@ async fn resolve_import(worker: &Worker, capability_id: &str) -> WorkerResponse 
                 serde_json::json!({"directory": row.get::<String, _>("directory")}),
             )
         }
-        Ok(Some(_)) => WorkerResponse::error("CAPABILITY_EXPIRED", "Capability 已过期"),
-        Ok(None) => WorkerResponse::error("CAPABILITY_NOT_FOUND", "Capability 未准备接收"),
+        Ok(Some(_)) => WorkerResponse::error("UPLOAD_EXPIRED", "上传任务已过期"),
+        Ok(None) => WorkerResponse::error("UPLOAD_NOT_FOUND", "上传任务未准备接收"),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
 }
@@ -903,22 +990,22 @@ async fn finalize_push_import(worker: &Worker, upload: BuilderUpload) -> WorkerR
         return WorkerResponse::error("INVALID_UPLOAD", "Builder 上传通知无效或已过期");
     }
     let row = sqlx::query(
-        "SELECT directory, manifest_json, state FROM transfer_imports WHERE capability_id = ?",
+        "SELECT directory, manifest_json, state FROM publisher_uploads WHERE upload_id = ?",
     )
-    .bind(upload.id.to_string())
+    .bind(upload.upload_id.to_string())
     .fetch_optional(&worker.database)
     .await;
     let row = match row {
         Ok(Some(value)) => value,
-        Ok(None) => return WorkerResponse::error("CAPABILITY_NOT_FOUND", "Capability 未准备接收"),
+        Ok(None) => return WorkerResponse::error("UPLOAD_NOT_FOUND", "上传任务未准备接收"),
         Err(error) => return WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     };
     let state: String = row.get("state");
-    let final_directory = worker.landing_dir.join(upload.id.to_string());
+    let final_directory = worker.landing_dir.join(upload.upload_id.to_string());
     if state == "verified" {
         return WorkerResponse::ok(
             "IDEMPOTENT_IMPORT",
-            serde_json::json!({"upload_id": upload.id}),
+            serde_json::json!({"upload_id": upload.upload_id}),
         );
     }
     if row.get::<String, _>("manifest_json")
@@ -934,16 +1021,16 @@ async fn finalize_push_import(worker: &Worker, upload: BuilderUpload) -> WorkerR
         return WorkerResponse::error("LANDING_ERROR", error.to_string());
     }
     match sqlx::query(
-        "UPDATE transfer_imports SET state = 'verified', directory = ? WHERE capability_id = ?",
+        "UPDATE publisher_uploads SET state = 'verified', directory = ? WHERE upload_id = ?",
     )
     .bind(final_directory.to_string_lossy().as_ref())
-    .bind(upload.id.to_string())
+    .bind(upload.upload_id.to_string())
     .execute(&worker.database)
     .await
     {
         Ok(_) => WorkerResponse::ok(
             "IMPORT_VERIFIED",
-            serde_json::json!({"upload_id": upload.id}),
+            serde_json::json!({"upload_id": upload.upload_id}),
         ),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
@@ -1023,19 +1110,6 @@ fn validate_release_plan(authorization: &ReleasePlan) -> anyhow::Result<()> {
     if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
         bail!("aursmith-keyring 是 Publisher 生成的保留包名");
     }
-    if authorization.evidence_files.len() > 4096 {
-        bail!("Release 证据文件数量超过上限");
-    }
-    for entry in &authorization.evidence_files {
-        aursmith_protocol::validate_relative_path(&entry.path)?;
-        if !entry.path.starts_with("evidence/")
-            || !paths.insert(entry.path.clone())
-            || entry.sha256.len() != 64
-            || entry.size == 0
-        {
-            bail!("Release 证据文件元数据无效：{}", entry.path);
-        }
-    }
     let mut removed = std::collections::BTreeSet::new();
     for package_name in &authorization.removed_package_names {
         if package_name.is_empty()
@@ -1058,7 +1132,7 @@ async fn materialize_release_inbox(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(staging)?;
     let imports = sqlx::query(
-        "SELECT directory, manifest_json FROM transfer_imports WHERE state = 'verified'",
+        "SELECT directory, manifest_json FROM publisher_uploads WHERE state = 'verified'",
     )
     .fetch_all(&worker.database)
     .await?;
@@ -1088,7 +1162,7 @@ async fn materialize_release_inbox(
                 break;
             }
         }
-        let source = source.context("Release Artifact 没有已验证的 TransferCapability")?;
+        let source = source.context("Release Artifact 没有对应的已验证上传")?;
         let metadata = std::fs::symlink_metadata(&source)?;
         if !metadata.file_type().is_file() || metadata.len() != artifact.size {
             bail!("Release Artifact 落地内容不匹配：{}", artifact.path);
@@ -1099,47 +1173,6 @@ async fn materialize_release_inbox(
         }
         std::fs::copy(source, &target)?;
     }
-    for evidence in &authorization.evidence_files {
-        aursmith_protocol::validate_relative_path(&evidence.path)?;
-        if !used_paths.insert(evidence.path.clone()) {
-            bail!("Release 包含重复证据路径：{}", evidence.path);
-        }
-        let mut source = None;
-        for row in &imports {
-            let manifest: Vec<aursmith_protocol::ManifestEntry> =
-                serde_json::from_str(row.get("manifest_json"))?;
-            if manifest.iter().any(|entry| entry == evidence) {
-                source =
-                    Some(PathBuf::from(row.get::<String, _>("directory")).join(&evidence.path));
-                break;
-            }
-        }
-        if source.is_none() {
-            let releases = worker
-                .repository_dir
-                .join(&worker.repository_arch)
-                .join("releases");
-            source = std::fs::read_dir(releases)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                .map(|entry| entry.path().join(&evidence.path))
-                .find(|path| path.is_file());
-        }
-        let source = source.context("Release 证据文件没有已验证的 TransferCapability")?;
-        let metadata = std::fs::symlink_metadata(&source)?;
-        if !metadata.file_type().is_file() || metadata.len() != evidence.size {
-            bail!("Release 证据文件落地内容不匹配：{}", evidence.path);
-        }
-        let target = staging.join(&evidence.path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(source, target)?;
-    }
-    std::fs::write(staging.join("artifact-inspections.json"), b"[]")?;
     std::fs::write(
         staging.join("release-plan.json"),
         serde_json::to_vec(authorization)?,
@@ -1193,13 +1226,35 @@ async fn query_release(worker: &Worker, release_id: &str) -> WorkerResponse {
     match sqlx::query("SELECT state, manifest_sha256, last_error, updated_at FROM publisher_release_jobs WHERE release_id = ?")
         .bind(release_id).fetch_optional(&worker.database).await
     {
-        Ok(Some(row)) => WorkerResponse::ok("RELEASE_STATUS", serde_json::json!({
-            "release_id": release_id,
-            "state": row.get::<String,_>("state"),
-            "manifest_sha256": row.get::<Option<String>,_>("manifest_sha256"),
-            "last_error": row.get::<Option<String>,_>("last_error"),
-            "updated_at": row.get::<String,_>("updated_at"),
-        })),
+        Ok(Some(row)) => {
+            let state: String = row.get("state");
+            let keyring = if state == "published" {
+                let manifest_path = worker.repository_dir.join(&worker.repository_arch)
+                    .join("releases").join(release_id).join("release-manifest.json");
+                std::fs::read(manifest_path).ok()
+                    .and_then(|bytes| serde_json::from_slice::<ReleaseManifest>(&bytes).ok())
+                    .map(|manifest| {
+                        let refresh_days = worker.publisher_signing.as_ref()
+                            .map_or(30, aursmith_repository::PublisherSigning::keyring_refresh_days);
+                        serde_json::json!({
+                            "generation": manifest.keyring_generation,
+                            "fingerprint": manifest.keyring_fingerprint,
+                            "published_at": manifest.keyring_published_at,
+                            "next_due_at": manifest.keyring_published_at.map(|published| published + chrono::Duration::days(refresh_days)),
+                        })
+                    })
+            } else {
+                None
+            };
+            WorkerResponse::ok("RELEASE_STATUS", serde_json::json!({
+                "release_id": release_id,
+                "state": state,
+                "manifest_sha256": row.get::<Option<String>,_>("manifest_sha256"),
+                "last_error": row.get::<Option<String>,_>("last_error"),
+                "updated_at": row.get::<String,_>("updated_at"),
+                "keyring": keyring,
+            }))
+        }
         Ok(None) => WorkerResponse::error("RELEASE_NOT_FOUND", "Release 不存在"),
         Err(error) => WorkerResponse::error("JOURNAL_ERROR", error.to_string()),
     }
@@ -1428,11 +1483,11 @@ async fn reconcile_publisher_workspaces(worker: &Worker) -> anyhow::Result<()> {
         let authorization: ReleasePlan = serde_json::from_str(row.get("plan_json"))?;
         cleanup_published_release_workspace(worker, &release_id, &authorization).await?;
     }
-    prune_expired_transfer_imports(worker).await?;
+    prune_expired_publisher_uploads(worker).await?;
     Ok(())
 }
 
-async fn prune_expired_transfer_imports(worker: &Worker) -> anyhow::Result<()> {
+async fn prune_expired_publisher_uploads(worker: &Worker) -> anyhow::Result<()> {
     let active_rows = sqlx::query(
         "SELECT plan_json FROM publisher_release_jobs WHERE state IN ('queued', 'signing')",
     )
@@ -1444,7 +1499,7 @@ async fn prune_expired_transfer_imports(worker: &Worker) -> anyhow::Result<()> {
     }
 
     let expired = sqlx::query(
-        "SELECT capability_id, directory, manifest_json FROM transfer_imports WHERE state IN ('receiving', 'verified') AND expires_at < ?",
+        "SELECT upload_id, directory, manifest_json FROM publisher_uploads WHERE state IN ('receiving', 'verified') AND expires_at < ?",
     )
     .bind(Utc::now())
     .fetch_all(&worker.database)
@@ -1463,9 +1518,9 @@ async fn prune_expired_transfer_imports(worker: &Worker) -> anyhow::Result<()> {
             std::fs::remove_dir_all(&directory)?;
         }
         sqlx::query(
-            "UPDATE transfer_imports SET state = 'expired', directory = '' WHERE capability_id = ? AND state IN ('receiving', 'verified')",
+            "UPDATE publisher_uploads SET state = 'expired', directory = '' WHERE upload_id = ? AND state IN ('receiving', 'verified')",
         )
-        .bind(row.get::<String, _>("capability_id"))
+        .bind(row.get::<String, _>("upload_id"))
         .execute(&worker.database)
         .await?;
     }
@@ -1486,7 +1541,6 @@ async fn cleanup_published_release_workspace(
     let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(&committed_manifest)?)?;
     if manifest.release_id.to_string() != release_id
         || manifest.artifacts != authorization.artifacts
-        || manifest.evidence_files != authorization.evidence_files
     {
         bail!("拒绝清理尚未完整提交的 Release 工作区：{release_id}");
     }
@@ -1499,7 +1553,7 @@ async fn cleanup_published_release_workspace(
     }
 
     let imports = sqlx::query(
-        "SELECT capability_id, directory, manifest_json FROM transfer_imports WHERE state = 'verified'",
+        "SELECT upload_id, directory, manifest_json FROM publisher_uploads WHERE state = 'verified'",
     )
     .fetch_all(&worker.database)
     .await?;
@@ -1514,9 +1568,9 @@ async fn cleanup_published_release_workspace(
             std::fs::remove_dir_all(&directory)?;
         }
         sqlx::query(
-            "UPDATE transfer_imports SET state = 'consumed', directory = '' WHERE capability_id = ? AND state = 'verified'",
+            "UPDATE publisher_uploads SET state = 'consumed', directory = '' WHERE upload_id = ? AND state = 'verified'",
         )
-        .bind(row.get::<String, _>("capability_id"))
+        .bind(row.get::<String, _>("upload_id"))
         .execute(&worker.database)
         .await?;
     }
@@ -1610,10 +1664,7 @@ fn transfer_manifest_is_consumed(
                 artifact.path == entry.path
                     && artifact.sha256 == entry.sha256
                     && artifact.size == entry.size
-            }) || authorization
-                .evidence_files
-                .iter()
-                .any(|evidence| evidence == entry)
+            })
         })
 }
 
@@ -1649,49 +1700,29 @@ fn verify_and_publish_release(
         || manifest.source_git_commit != authorization.source_git_commit
         || manifest.artifacts != authorization.artifacts
         || manifest.repository_keyring.is_some() != authorization.include_repository_keyring
-        || manifest.evidence_files != authorization.evidence_files
         || manifest.removed_package_names != authorization.removed_package_names
     {
         bail!("ReleaseManifest 与 Controller 授权不一致");
+    }
+    if authorization.include_repository_keyring
+        && (manifest
+            .keyring_generation
+            .is_none_or(|generation| generation == 0)
+            || manifest.keyring_fingerprint.as_deref()
+                != worker.repository_gpg_fingerprint.as_deref()
+            || manifest.keyring_published_at.is_none())
+    {
+        bail!("ReleaseManifest keyring generation 或指纹无效");
     }
     let database_name = format!("{}.db.tar.gz", authorization.repository_name);
     let files_name = format!("{}.files.tar.gz", authorization.repository_name);
     if manifest.repository_database.path != database_name
         || manifest.repository_files.path != files_name
-        || manifest
-            .artifact_inspections
-            .as_ref()
-            .map(|entry| entry.path.as_str())
-            != Some("artifact-inspections.json")
-        || manifest
-            .release_plan
-            .as_ref()
-            .map(|entry| entry.path.as_str())
-            != Some("release-plan.json")
     {
         bail!("ReleaseManifest 仓库数据库名称无效");
     }
     for entry in [&manifest.repository_database, &manifest.repository_files] {
         verify_signed_entry(worker, signed, entry)?;
-    }
-    verify_manifest_entry(
-        signed,
-        manifest
-            .artifact_inspections
-            .as_ref()
-            .context("ReleaseManifest 缺少 Artifact 检查报告")?,
-    )?;
-    let authorization_entry = manifest
-        .release_plan
-        .as_ref()
-        .context("ReleaseManifest 缺少 ReleasePlan")?;
-    verify_manifest_entry(signed, authorization_entry)?;
-    for evidence in &manifest.evidence_files {
-        verify_manifest_entry(signed, evidence)?;
-    }
-    if std::fs::read(signed.join(&authorization_entry.path))? != serde_json::to_vec(authorization)?
-    {
-        bail!("Publisher 输出的 ReleasePlan 与请求不一致");
     }
     let mut package_names = std::collections::BTreeSet::new();
     let mut changed_artifact_paths = std::collections::BTreeSet::new();
@@ -1769,19 +1800,11 @@ fn verify_and_publish_release(
         format!("{files_name}.sig"),
         "release-manifest.json".into(),
         "release-manifest.json.sig".into(),
-        "artifact-inspections.json".into(),
-        "release-plan.json".into(),
     ];
     for name in &package_names {
         release_files.push(name.clone());
         release_files.push(format!("{name}.sig"));
     }
-    release_files.extend(
-        manifest
-            .evidence_files
-            .iter()
-            .map(|entry| entry.path.clone()),
-    );
     for name in &release_files {
         if let Some(parent) = staging.join(name).parent() {
             std::fs::create_dir_all(parent)?;
@@ -1951,17 +1974,14 @@ fn activate_committed_release(
     let manifest: ReleaseManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     verify_signed_entry(worker, committed, &manifest.repository_database)?;
     verify_signed_entry(worker, committed, &manifest.repository_files)?;
-    if let Some(inspection) = &manifest.artifact_inspections {
-        verify_manifest_entry(committed, inspection)?;
-    }
-    if let Some(plan) = &manifest.release_plan {
-        verify_manifest_entry(committed, plan)?;
-    }
-    for evidence in &manifest.evidence_files {
-        verify_manifest_entry(committed, evidence)?;
-    }
     if let Some(keyring) = &manifest.repository_keyring {
         validate_repository_keyring_package(worker, &committed.join(&keyring.path), keyring)?;
+        if manifest.keyring_generation.is_some()
+            && manifest.keyring_fingerprint.as_deref()
+                != worker.repository_gpg_fingerprint.as_deref()
+        {
+            bail!("拒绝激活与当前 Publisher 信任指纹不兼容的 Release");
+        }
     }
     let arch_root = worker.repository_dir.join(&worker.repository_arch);
     std::fs::create_dir_all(&arch_root)?;
@@ -2235,10 +2255,8 @@ fn copy_or_replace_regular(source: &Path, target: &Path) -> anyhow::Result<()> {
     if paths_are_same_regular_file(source, target)? {
         return Ok(());
     }
-    if target.exists() {
-        if file_sha256(source)? == file_sha256(target)? {
-            return Ok(());
-        }
+    if target.exists() && file_sha256(source)? == file_sha256(target)? {
+        return Ok(());
     }
     let parent = target
         .parent()
@@ -2424,10 +2442,61 @@ async fn publisher_doctor(worker: &Worker) -> WorkerResponse {
         Ok(_) => serde_json::json!({"ok": true, "message": "AUR RPC 可达"}),
         Err(error) => serde_json::json!({"ok": false, "message": format!("AUR RPC 失败：{error}")}),
     };
+    let keyring = active_keyring_status(worker).unwrap_or_else(
+        |error| serde_json::json!({"error": error.to_string(), "refresh_due": true}),
+    );
     WorkerResponse::ok(
         "PUBLISHER_DOCTOR",
-        serde_json::json!({"checks": {"aur": aur}}),
+        serde_json::json!({
+            "checks": {"aur": aur},
+            "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
+            "keyring": keyring,
+        }),
     )
+}
+
+fn active_keyring_status(worker: &Worker) -> anyhow::Result<serde_json::Value> {
+    let Some(manifest) = active_release_manifest(worker)? else {
+        return Ok(serde_json::json!({"repository_initialized": false}));
+    };
+    let refresh_days = worker
+        .publisher_signing
+        .as_ref()
+        .context("Publisher signing 不可用")?
+        .keyring_refresh_days();
+    let next_due_at = manifest
+        .keyring_published_at
+        .map(|published| published + chrono::Duration::days(refresh_days));
+    let fingerprint_matches =
+        manifest.keyring_fingerprint.as_deref() == worker.repository_gpg_fingerprint.as_deref();
+    Ok(serde_json::json!({
+        "repository_initialized": true,
+        "generation": manifest.keyring_generation,
+        "fingerprint": manifest.keyring_fingerprint,
+        "published_at": manifest.keyring_published_at,
+        "next_due_at": next_due_at,
+        "refresh_due": manifest.keyring_generation.is_none()
+            || !fingerprint_matches
+            || next_due_at.is_none_or(|due| due <= Utc::now()),
+    }))
+}
+
+fn active_release_manifest(worker: &Worker) -> anyhow::Result<Option<ReleaseManifest>> {
+    let arch_root = worker.repository_dir.join(&worker.repository_arch);
+    let releases_root = arch_root.join("releases");
+    if !releases_root.is_dir() {
+        return Ok(None);
+    }
+    let repository_name = worker_repository_name(&releases_root)?;
+    let target = std::fs::read_link(arch_root.join(format!("{repository_name}.db")))?;
+    let manifest_path = arch_root
+        .join(target)
+        .parent()
+        .context("当前仓库链接缺少 Release 目录")?
+        .join("release-manifest.json");
+    Ok(Some(serde_json::from_slice(&std::fs::read(
+        manifest_path,
+    )?)?))
 }
 
 async fn aur_snapshot(worker: &Worker, package_base: &str) -> WorkerResponse {
@@ -2451,6 +2520,32 @@ async fn status(worker: &Worker) -> WorkerResponse {
                 RoleArg::Builder => &worker.jobs_dir,
                 RoleArg::Publisher => &worker.repository_dir,
             };
+            let builder = if let Some(runtime) = &worker.builder {
+                let running: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM attempts WHERE status = 'running'")
+                        .fetch_one(&worker.database)
+                        .await
+                        .unwrap_or_default();
+                let last_error: Option<String> = sqlx::query_scalar(
+                    "SELECT failure_code FROM attempts WHERE failure_code IS NOT NULL ORDER BY received_at DESC LIMIT 1",
+                )
+                .fetch_optional(&worker.database)
+                .await
+                .unwrap_or_default()
+                .flatten();
+                Some(serde_json::json!({
+                    "max_concurrent": runtime.max_concurrent(),
+                    "running": running,
+                    "last_error": last_error,
+                }))
+            } else {
+                None
+            };
+            let keyring = if worker.role == RoleArg::Publisher {
+                active_keyring_status(worker).ok()
+            } else {
+                None
+            };
             WorkerResponse::ok(
                 "STATUS",
                 serde_json::json!({
@@ -2459,6 +2554,8 @@ async fn status(worker: &Worker) -> WorkerResponse {
                     "role": role_name(worker.role),
                     "protocol_major": PROTOCOL_MAJOR,
                     "repository_gpg_fingerprint": worker.repository_gpg_fingerprint,
+                    "builder": builder,
+                    "keyring": keyring,
                     "storage": disk_usage(storage_path),
                     "cgroup_v2": Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
                     "time": Utc::now(),
@@ -2490,7 +2587,7 @@ fn disk_usage(path: &Path) -> Option<serde_json::Value> {
         "path": path,
         "total_bytes": total,
         "available_bytes": available,
-        "available_percent": if total == 0 { 0 } else { available.saturating_mul(100) / total },
+        "available_percent": available.saturating_mul(100).checked_div(total).unwrap_or(0),
     }))
 }
 
@@ -2634,7 +2731,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
         Ok(Some(row)) => {
             let attempt_id = row.get::<String, _>("attempt_id");
             let status = row.get::<String, _>("status");
-            let (guest_result_json, evidence_logs, evidence_files) = if status == "succeeded" {
+            let (guest_result_json, logs) = if status == "succeeded" {
                 let Some(builder) = &worker.builder else {
                     return WorkerResponse::error(
                         "RESULT_UNAVAILABLE",
@@ -2642,15 +2739,9 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     );
                 };
                 match builder.completed_result_json(&attempt_id) {
-                    Ok(result) => match (
-                        builder.attempt_logs(&attempt_id, true),
-                        builder.completed_evidence_files(&attempt_id),
-                    ) {
-                        (Ok(logs), Ok(files)) => (Some(result), logs, files),
-                        (Err(error), _) => {
-                            return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
-                        }
-                        (_, Err(error)) => {
+                    Ok(result) => match builder.attempt_logs(&attempt_id, true) {
+                        Ok(logs) => (Some(result), logs),
+                        Err(error) => {
                             return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
                         }
                     },
@@ -2666,13 +2757,13 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     );
                 };
                 match builder.attempt_logs(&attempt_id, false) {
-                    Ok(logs) => (None, logs, Vec::new()),
+                    Ok(logs) => (None, logs),
                     Err(error) => {
                         return WorkerResponse::error("RESULT_UNAVAILABLE", error.to_string());
                     }
                 }
             } else {
-                (None, Vec::new(), Vec::new())
+                (None, Vec::new())
             };
             WorkerResponse::ok(
                 "JOB_STATUS",
@@ -2685,8 +2776,7 @@ async fn query(worker: &Worker, job_id: &str) -> WorkerResponse {
                     "result_sha256": row.get::<Option<String>, _>("result_sha256"),
                     "failure_code": row.get::<Option<String>, _>("failure_code"),
                     "guest_result_json": guest_result_json,
-                    "evidence_logs": evidence_logs,
-                    "evidence_files": evidence_files,
+                    "logs": logs,
                 }),
             )
         }
@@ -2745,6 +2835,17 @@ mod transfer_tests {
             .execute(&database)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE transfer_imports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL)")
+            .execute(&database)
+            .await
+            .unwrap();
+        let upload_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO transfer_imports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, '/landing/fixture', '[]', 'verified')")
+            .bind(&upload_id)
+            .bind(Utc::now())
+            .execute(&database)
+            .await
+            .unwrap();
         let current_release = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO publisher_release_jobs(\
@@ -2767,7 +2868,7 @@ mod transfer_tests {
         .unwrap();
         database.close().await;
 
-        let migrated = connect(&database_url).await.unwrap();
+        let migrated = connect(&database_url, RoleArg::Publisher).await.unwrap();
         let remaining: Vec<String> =
             sqlx::query_scalar("SELECT release_id FROM publisher_release_jobs ORDER BY release_id")
                 .fetch_all(&migrated)
@@ -2779,8 +2880,62 @@ mod transfer_tests {
         .fetch_one(&migrated)
         .await
         .unwrap();
+        let migrated_upload: String = sqlx::query_scalar("SELECT upload_id FROM publisher_uploads")
+            .fetch_one(&migrated)
+            .await
+            .unwrap();
         assert_eq!(remaining, vec![current_release]);
         assert_eq!(old_table, 0);
+        assert_eq!(migrated_upload, upload_id);
+        assert!(!table_exists(&migrated, "transfer_imports").await.unwrap());
+        assert!(!table_exists(&migrated, "attempts").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn builder_journal_migrates_only_outbound_uploads() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("worker.db");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .unwrap()
+            .create_if_missing(true);
+        let database = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE transfer_exports(capability_id TEXT PRIMARY KEY, expires_at TEXT NOT NULL, directory TEXT NOT NULL, manifest_json TEXT NOT NULL, state TEXT NOT NULL)")
+            .execute(&database)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE publisher_release_jobs(release_id TEXT PRIMARY KEY, plan_sha256 TEXT NOT NULL, plan_json TEXT NOT NULL, state TEXT NOT NULL, manifest_sha256 TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&database)
+            .await
+            .unwrap();
+        let upload_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO transfer_exports(capability_id, expires_at, directory, manifest_json, state) VALUES (?, ?, '/jobs/transfers/fixture', '[]', 'pushed')")
+            .bind(&upload_id)
+            .bind(Utc::now())
+            .execute(&database)
+            .await
+            .unwrap();
+        database.close().await;
+
+        let migrated = connect(&database_url, RoleArg::Builder).await.unwrap();
+        let migrated_state: String =
+            sqlx::query_scalar("SELECT state FROM builder_uploads WHERE upload_id = ?")
+                .bind(&upload_id)
+                .fetch_one(&migrated)
+                .await
+                .unwrap();
+        assert_eq!(migrated_state, "pushed");
+        assert!(table_exists(&migrated, "attempts").await.unwrap());
+        assert!(!table_exists(&migrated, "transfer_exports").await.unwrap());
+        assert!(
+            !table_exists(&migrated, "publisher_release_jobs")
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2869,8 +3024,6 @@ mod transfer_tests {
             batch_id: uuid::Uuid::new_v4(),
             repository_name: "aursmith".into(),
             source_git_commit: "a".repeat(40),
-            revision_sha256s: vec!["b".repeat(64)],
-            audit_report_sha256s: vec!["c".repeat(64)],
             artifacts: vec![aursmith_protocol::ArtifactRecord {
                 path: "fixture-1-1-any.pkg.tar.zst".into(),
                 sha256: "d".repeat(64),
@@ -2879,20 +3032,12 @@ mod transfer_tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
-            evidence_files: vec![aursmith_protocol::ManifestEntry {
-                path: "evidence/attempt/build-records.tar.zst".into(),
-                sha256: "e".repeat(64),
-                size: 1,
-            }],
             removed_package_names: vec![],
             include_repository_keyring: true,
             issued_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::minutes(5),
         };
         assert!(validate_release_plan(&authorization).is_ok());
-        authorization.evidence_files[0].path = "../profile.tar.zst".into();
-        assert!(validate_release_plan(&authorization).is_err());
-        authorization.evidence_files[0].path = "evidence/attempt/build-records.tar.zst".into();
         authorization.artifacts[0].path = "nested/fixture-1-1-any.pkg.tar.zst".into();
         assert!(validate_release_plan(&authorization).is_err());
         authorization.artifacts.clear();
@@ -2974,20 +3119,12 @@ mod transfer_tests {
             package_version: Some("1-1".into()),
             architecture: Some("any".into()),
         };
-        let evidence = aursmith_protocol::ManifestEntry {
-            path: "evidence/build.log".into(),
-            sha256: "b".repeat(64),
-            size: 11,
-        };
         let authorization = ReleasePlan {
             release_id: uuid::Uuid::new_v4(),
             batch_id: uuid::Uuid::new_v4(),
             repository_name: "aursmith".into(),
             source_git_commit: "c".repeat(40),
-            revision_sha256s: vec![],
-            audit_report_sha256s: vec![],
             artifacts: vec![artifact.clone()],
-            evidence_files: vec![evidence.clone()],
             removed_package_names: vec![],
             include_repository_keyring: false,
             issued_at: Utc::now(),
@@ -2999,7 +3136,7 @@ mod transfer_tests {
             size: artifact.size,
         };
         assert!(transfer_manifest_is_consumed(
-            &[package.clone(), evidence],
+            std::slice::from_ref(&package),
             &authorization
         ));
         let mut unrelated = package;

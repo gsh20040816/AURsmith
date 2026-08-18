@@ -423,14 +423,13 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
     let fragment = url.fragment().unwrap_or_default().to_owned();
     let mut repository = url.clone();
     repository.set_fragment(None);
-    if let Some(commit) = fragment.strip_prefix("commit=") {
-        if commit.len() == 40
-            && commit
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        {
-            return Ok(Some(commit.to_owned()));
-        }
+    if let Some(commit) = fragment.strip_prefix("commit=")
+        && commit.len() == 40
+        && commit
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(Some(commit.to_owned()));
     }
     let reference = fragment
         .strip_prefix("branch=")

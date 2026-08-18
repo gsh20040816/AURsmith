@@ -85,7 +85,7 @@ describe("AURsmith 控制台", () => {
       const url = String(input);
       if (url.endsWith("/auth/me")) return ok({ id: "admin-id", username: "admin" });
       if (url.endsWith("/doctor")) return ok({ ready: true, checked_at: "", checks: [] });
-      if (url.endsWith("/client-bootstrap")) return ok({ repository_config: "[aursmith]", gpg_fingerprint: "ABCD1234", gpg_key_url: "https://repo.test/key", client_ca_url: null, commands: ["pacman -Syu"], warnings: ["请带外核对"] });
+      if (url.endsWith("/client-bootstrap")) return ok({ repository_config: "[aursmith]", gpg_fingerprint: "ABCD1234", gpg_key_url: "https://repo.test/key", keyring_generation: 3, keyring_published_at: "2026-08-01T00:00:00Z", keyring_next_due_at: "2026-09-01T00:00:00Z", client_ca_url: null, commands: ["pacman -Syu"], warnings: ["请带外核对"] });
       return ok({ items: [] });
     }));
     render(<App />);
@@ -99,8 +99,8 @@ describe("AURsmith 控制台", () => {
       const url = String(input);
       if (url.endsWith("/auth/me")) return ok({ id: "admin-id", username: "admin" });
       if (url.endsWith("/doctor")) return ok({ ready: true, checked_at: "", checks: [] });
-      if (url.endsWith("/jobs")) return ok({ items: [{ id: "11111111-1111-4111-8111-111111111111", kind: "build", required_role: "builder", status: "failed", priority: 40, failure_code: "GUEST_BUILD_FAILED", revision_sha256: "a".repeat(64), worker_name: "compute-local", attempt_count: 1, has_evidence: true, next_attempt_at: null, created_at: "2026-08-10T00:00:00Z", updated_at: "2026-08-10T00:01:00Z" }] });
-      if (url.includes("/jobs/11111111-1111-4111-8111-111111111111/evidence")) return ok({ job_id: "11111111-1111-4111-8111-111111111111", kind: "build", sha256: "b".repeat(64), created_at: "2026-08-10T00:01:00Z", document: { status: "failed", logs: [{ path: "output/build.log", content_utf8: "compiler error" }] } });
+      if (url.endsWith("/jobs")) return ok({ items: [{ id: "11111111-1111-4111-8111-111111111111", kind: "build", status: "failed", priority: 40, failure_code: "GUEST_BUILD_FAILED", revision_sha256: "a".repeat(64), attempt_count: 1, has_logs: true, next_attempt_at: null, created_at: "2026-08-10T00:00:00Z", updated_at: "2026-08-10T00:01:00Z" }] });
+      if (url.includes("/jobs/11111111-1111-4111-8111-111111111111/logs")) return ok({ job_id: "11111111-1111-4111-8111-111111111111", kind: "build", sha256: "b".repeat(64), created_at: "2026-08-10T00:01:00Z", document: { status: "failed", logs: [{ path: "output/build.log", content_utf8: "compiler error" }] } });
       return ok({ items: [] });
     }));
     render(<App />);

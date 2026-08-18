@@ -69,6 +69,10 @@ impl PublisherSigning {
         }
         process_release_path(&cli, input)
     }
+
+    pub fn keyring_refresh_days(&self) -> i64 {
+        self.cli.keyring_refresh_days
+    }
 }
 
 fn initialize_gpg(cli: &Cli) -> anyhow::Result<()> {
@@ -129,32 +133,42 @@ fn process_release_path(cli: &Cli, input: &Path) -> anyhow::Result<()> {
             find_reusable_package(cli, artifact)?;
         }
     }
-    let repository_keyring = if authorization.include_repository_keyring {
-        let (artifact, changed) =
-            if let Some(artifact) = reusable_repository_keyring(cli, &staging)? {
-                (artifact, false)
+    let (repository_keyring, keyring_generation, keyring_fingerprint, keyring_published_at) =
+        if authorization.include_repository_keyring {
+            let current = current_repository_keyring(cli, &authorization.repository_name)?;
+            let fingerprint = repository_fingerprint(cli)?;
+            let reusable = current.as_ref().is_some_and(|current| {
+                keyring_is_reusable(current, &fingerprint, Utc::now(), cli.keyring_refresh_days)
+            });
+            let (artifact, generation, published_at, changed) = if reusable {
+                let current = current.expect("已经检查当前 keyring");
+                reuse_repository_keyring(cli, &staging, &current)?;
+                (
+                    current.artifact,
+                    current.generation,
+                    current.published_at,
+                    false,
+                )
             } else {
-                let artifact = create_repository_keyring_package(cli, &authorization, &staging)?;
+                let generation = current
+                    .as_ref()
+                    .map_or(1, |current| current.generation.saturating_add(1));
+                let artifact = create_repository_keyring_package(cli, generation, &staging)?;
                 gpg_sign(cli, &staging.join(&artifact.path))?;
-                (artifact, true)
+                (artifact, generation, Utc::now(), true)
             };
-        if changed {
-            changed_package_paths.push(staging.join(&artifact.path));
-        }
-        Some(artifact)
-    } else {
-        None
-    };
-    let mut evidence_files = Vec::new();
-    for evidence in &authorization.evidence_files {
-        let source = input.join(&evidence.path);
-        let destination = staging.join(&evidence.path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, &destination)?;
-        evidence_files.push(file_entry_with_path(&destination, evidence.path.clone())?);
-    }
+            if changed {
+                changed_package_paths.push(staging.join(&artifact.path));
+            }
+            (
+                Some(artifact),
+                Some(generation),
+                Some(fingerprint),
+                Some(published_at),
+            )
+        } else {
+            (None, None, None, None)
+        };
     changed_package_paths.sort();
     let database = staging.join(format!("{}.db.tar.gz", authorization.repository_name));
     let files_database = staging.join(format!("{}.files.tar.gz", authorization.repository_name));
@@ -175,28 +189,19 @@ fn process_release_path(cli: &Cli, input: &Path) -> anyhow::Result<()> {
     )?;
     gpg_sign(cli, &database)?;
     gpg_sign(cli, &files_database)?;
-    let inspection_source = input.join("artifact-inspections.json");
-    let inspection_bytes = fs::read(&inspection_source)?;
-    if inspection_bytes.len() > 1024 {
-        bail!("Publisher Artifact 占位文件过大");
-    }
-    let inspection_destination = staging.join("artifact-inspections.json");
-    fs::write(&inspection_destination, inspection_bytes)?;
-    let plan_destination = staging.join("release-plan.json");
-    fs::copy(&plan_path, &plan_destination)?;
     let manifest = ReleaseManifest {
         release_id: authorization.release_id,
         batch_id: authorization.batch_id,
         source_git_commit: authorization.source_git_commit,
         repository_name: authorization.repository_name,
         artifacts: authorization.artifacts,
-        evidence_files,
         removed_package_names: authorization.removed_package_names,
         repository_keyring,
+        keyring_generation,
+        keyring_fingerprint,
+        keyring_published_at,
         repository_database: file_entry(&database)?,
         repository_files: file_entry(&files_database)?,
-        artifact_inspections: Some(file_entry(&inspection_destination)?),
-        release_plan: Some(file_entry(&plan_destination)?),
         committed_at: Utc::now(),
     };
     fs::write(
@@ -208,46 +213,80 @@ fn process_release_path(cli: &Cli, input: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reusable_repository_keyring(
+struct CurrentKeyring {
+    artifact: ArtifactRecord,
+    generation: u64,
+    fingerprint: String,
+    published_at: chrono::DateTime<Utc>,
+}
+
+fn keyring_is_reusable(
+    current: &CurrentKeyring,
+    fingerprint: &str,
+    now: chrono::DateTime<Utc>,
+    refresh_days: i64,
+) -> bool {
+    current.fingerprint == fingerprint
+        && current.published_at >= now - ChronoDuration::days(refresh_days)
+}
+
+fn current_repository_keyring(
+    cli: &Cli,
+    repository_name: &str,
+) -> anyhow::Result<Option<CurrentKeyring>> {
+    let database_link = cli
+        .repository
+        .join("x86_64")
+        .join(format!("{repository_name}.db"));
+    let Ok(target) = fs::read_link(&database_link) else {
+        return Ok(None);
+    };
+    let manifest_path = cli
+        .repository
+        .join("x86_64")
+        .join(target)
+        .parent()
+        .context("当前仓库数据库链接缺少父目录")?
+        .join("release-manifest.json");
+    let manifest: ReleaseManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    let Some(artifact) = manifest.repository_keyring else {
+        return Ok(None);
+    };
+    let (Some(generation), Some(fingerprint), Some(published_at)) = (
+        manifest.keyring_generation,
+        manifest.keyring_fingerprint,
+        manifest.keyring_published_at,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(CurrentKeyring {
+        artifact,
+        generation,
+        fingerprint,
+        published_at,
+    }))
+}
+
+fn reuse_repository_keyring(
     cli: &Cli,
     staging: &Path,
-) -> anyhow::Result<Option<ArtifactRecord>> {
-    let fingerprint = repository_fingerprint(cli)?;
-    let earliest_reusable = Utc::now() - ChronoDuration::days(cli.keyring_refresh_days);
-    let releases = cli.repository.join("x86_64/releases");
-    let mut candidates = fs::read_dir(releases)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let manifest: ReleaseManifest =
-                serde_json::from_slice(&fs::read(entry.path().join("release-manifest.json")).ok()?)
-                    .ok()?;
-            if manifest.committed_at < earliest_reusable {
-                return None;
-            }
-            manifest
-                .repository_keyring
-                .map(|artifact| (manifest.committed_at, artifact))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|(committed_at, _)| std::cmp::Reverse(*committed_at));
-    for (_, artifact) in candidates {
-        let package = cli.repository.join("x86_64").join(&artifact.path);
-        let signature = package.with_file_name(format!("{}.sig", artifact.path));
-        if !package.is_file()
-            || !signature.is_file()
-            || digest_file(&package)? != artifact.sha256
-            || !repository_keyring_matches(cli, &package, &fingerprint)?
-        {
-            continue;
-        }
-        fs::copy(&package, staging.join(&artifact.path))?;
-        fs::copy(&signature, staging.join(format!("{}.sig", artifact.path)))?;
-        return Ok(Some(artifact));
+    current: &CurrentKeyring,
+) -> anyhow::Result<()> {
+    let package = cli.repository.join("x86_64").join(&current.artifact.path);
+    let signature = package.with_file_name(format!("{}.sig", current.artifact.path));
+    if !package.is_file()
+        || !signature.is_file()
+        || digest_file(&package)? != current.artifact.sha256
+        || !repository_keyring_matches(cli, &package, &current.fingerprint)?
+    {
+        bail!("当前 keyring 与 Release Manifest 不一致");
     }
-    Ok(None)
+    fs::copy(&package, staging.join(&current.artifact.path))?;
+    fs::copy(
+        &signature,
+        staging.join(format!("{}.sig", current.artifact.path)),
+    )?;
+    Ok(())
 }
 
 fn repository_keyring_matches(
@@ -318,37 +357,14 @@ fn find_reusable_package(cli: &Cli, artifact: &ArtifactRecord) -> anyhow::Result
 
 fn create_repository_keyring_package(
     cli: &Cli,
-    authorization: &ReleasePlan,
+    generation: u64,
     staging: &Path,
 ) -> anyhow::Result<ArtifactRecord> {
     let fingerprint = repository_fingerprint(cli)?;
-    let source_commit = authorization
-        .source_git_commit
-        .chars()
-        .filter(|value| value.is_ascii_alphanumeric())
-        .take(8)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let source_commit = if source_commit.is_empty() {
-        "unknown".to_owned()
-    } else {
-        source_commit
-    };
-    let package_version = format!(
-        "{}.{}.{}-1",
-        authorization.issued_at.format("%Y%m%d.%H%M%S"),
-        source_commit,
-        authorization
-            .release_id
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>()
-    );
-    let pkgver = package_version
-        .strip_suffix("-1")
-        .context("keyring package version 无效")?;
+    if generation == 0 {
+        bail!("keyring generation 必须大于零");
+    }
+    let package_version = format!("1:{generation}-1");
     let directory = tempfile::Builder::new()
         .prefix("aursmith-keyring-")
         .tempdir_in("/tmp")?;
@@ -384,7 +400,7 @@ fn create_repository_keyring_package(
     fs::write(
         root.join("PKGBUILD"),
         format!(
-            "pkgname=aursmith-keyring\npkgver={pkgver}\npkgrel=1\npkgdesc='AURsmith repository signing keys'\narch=('any')\nurl='https://desktop.shgao.top:8443'\nlicense=('Apache-2.0')\ndepends=('pacman')\ninstall=aursmith-keyring.install\noptions=('!strip' '!debug')\nsource=('aursmith.gpg' 'aursmith-trusted' 'aursmith-revoked')\nsha256sums=('{}' '{}' '{}')\n\npackage() {{\n  install -Dm644 aursmith.gpg \"$pkgdir/usr/share/pacman/keyrings/aursmith.gpg\"\n  install -Dm644 aursmith-trusted \"$pkgdir/usr/share/pacman/keyrings/aursmith-trusted\"\n  install -Dm644 aursmith-revoked \"$pkgdir/usr/share/pacman/keyrings/aursmith-revoked\"\n}}\n",
+            "pkgname=aursmith-keyring\nepoch=1\npkgver={generation}\npkgrel=1\npkgdesc='AURsmith repository signing keys'\narch=('any')\nurl='https://desktop.shgao.top:8443'\nlicense=('Apache-2.0')\ndepends=('pacman')\ninstall=aursmith-keyring.install\noptions=('!strip' '!debug')\nsource=('aursmith.gpg' 'aursmith-trusted' 'aursmith-revoked')\nsha256sums=('{}' '{}' '{}')\n\npackage() {{\n  install -Dm644 aursmith.gpg \"$pkgdir/usr/share/pacman/keyrings/aursmith.gpg\"\n  install -Dm644 aursmith-trusted \"$pkgdir/usr/share/pacman/keyrings/aursmith-trusted\"\n  install -Dm644 aursmith-revoked \"$pkgdir/usr/share/pacman/keyrings/aursmith-revoked\"\n}}\n",
             checksums[0], checksums[1], checksums[2]
         ),
     )?;
@@ -499,24 +515,6 @@ fn validate_authorization(
     if authorization.include_repository_keyring && package_names.contains("aursmith-keyring") {
         bail!("aursmith-keyring 是 Publisher 生成的保留包名");
     }
-    if authorization.evidence_files.len() > 4096 {
-        bail!("Release 证据文件数量超过上限");
-    }
-    for evidence in &authorization.evidence_files {
-        aursmith_protocol::validate_relative_path(&evidence.path)?;
-        if !evidence.path.starts_with("evidence/") || !artifact_paths.insert(evidence.path.clone())
-        {
-            bail!("Release 证据文件路径无效：{}", evidence.path);
-        }
-        let path = root.join(&evidence.path);
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file()
-            || metadata.len() != evidence.size
-            || digest_file(&path)? != evidence.sha256
-        {
-            bail!("Release 证据文件 Manifest 不匹配：{}", evidence.path);
-        }
-    }
     let mut removed = std::collections::BTreeSet::new();
     for package_name in &authorization.removed_package_names {
         if package_name.is_empty()
@@ -568,11 +566,7 @@ fn expected_repository_packages(
     repository_keyring: Option<&ArtifactRecord>,
 ) -> anyhow::Result<BTreeMap<String, (String, String)>> {
     let mut expected = BTreeMap::new();
-    for artifact in authorization
-        .artifacts
-        .iter()
-        .chain(repository_keyring.into_iter())
-    {
+    for artifact in authorization.artifacts.iter().chain(repository_keyring) {
         let name = artifact
             .package_name
             .as_ref()
@@ -770,14 +764,6 @@ fn file_entry(path: &Path) -> anyhow::Result<ManifestEntry> {
     })
 }
 
-fn file_entry_with_path(path: &Path, manifest_path: String) -> anyhow::Result<ManifestEntry> {
-    Ok(ManifestEntry {
-        path: manifest_path,
-        sha256: digest_file(path)?,
-        size: fs::metadata(path)?.len(),
-    })
-}
-
 fn digest_file(path: &Path) -> anyhow::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -857,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn release_plan_accepts_package_without_transferred_evidence() {
+    fn release_plan_accepts_package() {
         let root = tempfile::tempdir().unwrap();
         let package_root = tempfile::tempdir().unwrap();
         fs::write(
@@ -880,8 +866,6 @@ mod tests {
             batch_id: Uuid::new_v4(),
             repository_name: "aursmith".into(),
             source_git_commit: "a".repeat(40),
-            revision_sha256s: vec!["b".repeat(64)],
-            audit_report_sha256s: vec!["c".repeat(64)],
             artifacts: vec![ArtifactRecord {
                 path: "fixture-1-1-any.pkg.tar.zst".into(),
                 sha256: digest_file(&package).unwrap(),
@@ -890,7 +874,6 @@ mod tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
-            evidence_files: vec![],
             removed_package_names: vec![],
             include_repository_keyring: true,
             issued_at: Utc::now(),
@@ -909,8 +892,6 @@ mod tests {
             batch_id: Uuid::new_v4(),
             repository_name: "aursmith".into(),
             source_git_commit: "a".repeat(40),
-            revision_sha256s: vec!["b".repeat(64)],
-            audit_report_sha256s: vec!["c".repeat(64)],
             artifacts: vec![ArtifactRecord {
                 path: "../evil.pkg.tar.zst".into(),
                 sha256: "d".repeat(64),
@@ -919,7 +900,6 @@ mod tests {
                 package_version: Some("1-1".into()),
                 architecture: Some("any".into()),
             }],
-            evidence_files: vec![],
             removed_package_names: vec![],
             include_repository_keyring: true,
             issued_at: Utc::now(),
@@ -1023,22 +1003,9 @@ mod tests {
             gpg_home,
             keyring_refresh_days: 30,
         };
-        let authorization = ReleasePlan {
-            release_id: Uuid::new_v4(),
-            batch_id: Uuid::new_v4(),
-            repository_name: "aursmith".into(),
-            source_git_commit: "abcdef1234567890".into(),
-            revision_sha256s: vec![],
-            audit_report_sha256s: vec![],
-            artifacts: vec![],
-            evidence_files: vec![],
-            removed_package_names: vec!["old-package".into()],
-            include_repository_keyring: true,
-            issued_at: Utc::now(),
-            expires_at: Utc::now() + Duration::minutes(5),
-        };
-        let artifact = create_repository_keyring_package(&cli, &authorization, &staging).unwrap();
+        let artifact = create_repository_keyring_package(&cli, 7, &staging).unwrap();
         assert_eq!(artifact.package_name.as_deref(), Some("aursmith-keyring"));
+        assert_eq!(artifact.package_version.as_deref(), Some("1:7-1"));
         assert_eq!(artifact.architecture.as_deref(), Some("any"));
         let package = staging.join(&artifact.path);
         validate_package_metadata(&package, &artifact).unwrap();
@@ -1081,27 +1048,35 @@ mod tests {
             source_git_commit: "a".repeat(40),
             repository_name: "aursmith".into(),
             artifacts: vec![],
-            evidence_files: vec![],
             removed_package_names: vec![],
             repository_keyring: Some(artifact.clone()),
+            keyring_generation: Some(7),
+            keyring_fingerprint: Some(fingerprint.clone()),
+            keyring_published_at: Some(Utc::now()),
             repository_database: placeholder.clone(),
             repository_files: placeholder,
-            artifact_inspections: None,
-            release_plan: None,
             committed_at: Utc::now(),
         };
         let manifest_path = release_root.join("release-manifest.json");
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert_eq!(
-            reusable_repository_keyring(&cli, &reuse_staging).unwrap(),
-            Some(artifact.clone())
-        );
+        std::os::unix::fs::symlink(
+            "releases/fixture/aursmith.db.tar.gz",
+            repository_root.join("aursmith.db"),
+        )
+        .unwrap();
+        let current = current_repository_keyring(&cli, "aursmith")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.generation, 7);
+        assert!(keyring_is_reusable(&current, &fingerprint, Utc::now(), 30));
+        reuse_repository_keyring(&cli, &reuse_staging, &current).unwrap();
+        assert!(reuse_staging.join(&artifact.path).is_file());
 
-        manifest.committed_at = Utc::now() - Duration::days(31);
+        manifest.keyring_published_at = Some(Utc::now() - Duration::days(31));
         fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert_eq!(
-            reusable_repository_keyring(&cli, &reuse_staging).unwrap(),
-            None
-        );
+        let expired = current_repository_keyring(&cli, "aursmith")
+            .unwrap()
+            .unwrap();
+        assert!(!keyring_is_reusable(&expired, &fingerprint, Utc::now(), 30));
     }
 }

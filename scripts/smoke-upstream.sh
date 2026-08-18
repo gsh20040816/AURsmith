@@ -20,24 +20,27 @@ cargo build --locked -p aursmith-worker -p aursmithctl
 install -d -m 0700 "${runtime_directory}/key-home" "${runtime_directory}/publisher-gpg"
 install -d "${runtime_directory}/landing" "${runtime_directory}/staging" \
   "${runtime_directory}/repository" \
-  "${runtime_directory}/jobs" "${runtime_directory}/archive"
+  "${runtime_directory}/jobs"
 gpg --homedir "${runtime_directory}/key-home" --batch --passphrase '' \
   --quick-generate-key 'AURsmith upstream smoke' ed25519 sign 1d >/dev/null 2>&1
 gpg --homedir "${runtime_directory}/key-home" --batch \
   --output "${runtime_directory}/repository-public-key.gpg" \
   --export 'AURsmith upstream smoke'
+gpg --homedir "${runtime_directory}/key-home" --batch \
+  --output "${runtime_directory}/repository-private-key.gpg" \
+  --export-secret-keys 'AURsmith upstream smoke'
 
 AURSMITH_WORKER_NAME=publisher-smoke \
 AURSMITH_WORKER_ROLE=publisher \
 AURSMITH_WORKER_SOCKET="${runtime_directory}/worker.sock" \
 AURSMITH_WORKER_DATABASE="sqlite://${runtime_directory}/worker.db" \
  AURSMITH_REPOSITORY_GPG_PUBLIC_KEY_FILE="${runtime_directory}/repository-public-key.gpg" \
+ AURSMITH_REPOSITORY_GPG_PRIVATE_KEY_FILE="${runtime_directory}/repository-private-key.gpg" \
  AURSMITH_PUBLISHER_GPG_HOME="${runtime_directory}/publisher-gpg" \
  AURSMITH_LANDING_DIR="${runtime_directory}/landing" \
  AURSMITH_PUBLISHER_STAGING_DIR="${runtime_directory}/staging" \
  AURSMITH_REPOSITORY_DIR="${runtime_directory}/repository" \
  AURSMITH_JOBS_DIR="${runtime_directory}/jobs" \
- AURSMITH_ARCHIVE_DIR="${runtime_directory}/archive" \
   "${repository_root}/target/debug/aursmith-worker" &
 worker_pid="$!"
 

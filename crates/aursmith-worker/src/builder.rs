@@ -8,23 +8,69 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, sync::Semaphore, time::timeout};
 
 const BUILD_IMAGE: &str = "aursmith-build:latest";
+const MIB: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+pub struct BuildLimits {
+    max_concurrent: usize,
+    cpu_count: u16,
+    memory_mib: u64,
+    timeout_seconds: u64,
+    max_output_bytes: u64,
+    max_log_bytes: u64,
+}
+
+impl BuildLimits {
+    pub fn new(
+        max_concurrent: u16,
+        cpu_count: u16,
+        memory_mib: u64,
+        timeout_seconds: u64,
+        max_output_mib: u64,
+        max_log_mib: u64,
+    ) -> anyhow::Result<Self> {
+        if !(1..=16).contains(&max_concurrent)
+            || !(1..=64).contains(&cpu_count)
+            || !(256..=262_144).contains(&memory_mib)
+            || !(60..=86_400).contains(&timeout_seconds)
+            || !(1..=1_048_576).contains(&max_output_mib)
+            || !(1..=64).contains(&max_log_mib)
+        {
+            bail!("Builder 全局构建配置超出允许范围");
+        }
+        Ok(Self {
+            max_concurrent: usize::from(max_concurrent),
+            cpu_count,
+            memory_mib,
+            timeout_seconds,
+            max_output_bytes: max_output_mib.checked_mul(MIB).context("输出上限溢出")?,
+            max_log_bytes: max_log_mib.checked_mul(MIB).context("日志上限溢出")?,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct BuilderRuntime {
     jobs_dir: PathBuf,
+    limits: BuildLimits,
 }
 
 impl BuilderRuntime {
-    pub fn new(jobs_dir: PathBuf) -> Self {
-        Self { jobs_dir }
+    pub fn new(jobs_dir: PathBuf, limits: BuildLimits) -> Self {
+        Self { jobs_dir, limits }
     }
 
     pub fn jobs_dir(&self) -> &Path {
         &self.jobs_dir
+    }
+
+    pub fn max_concurrent(&self) -> usize {
+        self.limits.max_concurrent
     }
 
     pub fn completed_result_json(&self, attempt_id: &str) -> anyhow::Result<String> {
@@ -36,11 +82,6 @@ impl BuilderRuntime {
                 .join("output/build-result.json"),
         )
         .context("COMPLETED_RESULT_MISSING")
-    }
-
-    pub fn completed_evidence_files(&self, attempt_id: &str) -> anyhow::Result<Vec<ManifestEntry>> {
-        validate_attempt_id(attempt_id)?;
-        Ok(Vec::new())
     }
 
     pub fn attempt_logs(
@@ -70,17 +111,17 @@ impl BuilderRuntime {
             ]
         };
         let mut logs = Vec::new();
-        for (source_path, evidence_path) in candidates {
+        for (source_path, log_path) in candidates {
             let file = root.join(source_path);
             let Ok(metadata) = fs::symlink_metadata(&file) else {
                 continue;
             };
             if !metadata.file_type().is_file() {
-                bail!("ATTEMPT_LOG_NOT_REGULAR:{evidence_path}");
+                bail!("ATTEMPT_LOG_NOT_REGULAR:{log_path}");
             }
             if metadata.len() > MAX_HASH_FILE_SIZE {
                 logs.push(serde_json::json!({
-                    "path": evidence_path,
+                    "path": log_path,
                     "size": metadata.len(),
                     "sha256": null,
                     "truncated": true,
@@ -92,7 +133,7 @@ impl BuilderRuntime {
             let content_length = bytes.len().min(MAX_CONTENT_PER_FILE as usize);
             let bounded_content = &bytes[..content_length];
             logs.push(serde_json::json!({
-                "path": evidence_path,
+                "path": log_path,
                 "size": metadata.len(),
                 "sha256": hex::encode(Sha256::digest(&bytes)),
                 "truncated": metadata.len() > MAX_CONTENT_PER_FILE,
@@ -193,29 +234,28 @@ pub fn spawn(database: SqlitePool, runtime: BuilderRuntime) {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let slots = Arc::new(Semaphore::new(runtime.limits.max_concurrent));
         loop {
             timer.tick().await;
-            if let Err(error) = execute_one(&database, &runtime).await {
-                tracing::warn!(%error, "Builder 执行任务失败");
+            while let Ok(slot) = slots.clone().try_acquire_owned() {
+                let database = database.clone();
+                let runtime = runtime.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = execute_one(&database, &runtime).await {
+                        tracing::warn!(%error, "Builder 执行任务失败");
+                    }
+                    drop(slot);
+                });
             }
         }
     });
 }
 
 async fn execute_one(database: &SqlitePool, runtime: &BuilderRuntime) -> anyhow::Result<()> {
-    let row = sqlx::query("SELECT attempt_id, spec_json FROM attempts WHERE status = 'queued' ORDER BY received_at LIMIT 1")
+    let row = sqlx::query("UPDATE attempts SET status = 'running' WHERE attempt_id = (SELECT attempt_id FROM attempts WHERE status = 'queued' ORDER BY received_at LIMIT 1) AND status = 'queued' RETURNING attempt_id, spec_json")
         .fetch_optional(database).await?;
     let Some(row) = row else { return Ok(()) };
     let attempt_id: String = row.get("attempt_id");
-    let claimed = sqlx::query(
-        "UPDATE attempts SET status = 'running' WHERE attempt_id = ? AND status = 'queued'",
-    )
-    .bind(&attempt_id)
-    .execute(database)
-    .await?;
-    if claimed.rows_affected() == 0 {
-        return Ok(());
-    }
     let result = execute_attempt(
         runtime,
         row.get::<String, _>("spec_json").as_str(),
@@ -284,8 +324,8 @@ async fn execute_attempt(
     let container_name = format!("aursmith-build-{attempt_id}");
     let stdout = File::create(work.join("docker.stdout.log"))?;
     let stderr = File::create(work.join("docker.stderr.log"))?;
-    let cpus = spec.limits.cpu_count.to_string();
-    let memory = format!("{}m", spec.limits.memory_mib);
+    let cpus = runtime.limits.cpu_count.to_string();
+    let memory = format!("{}m", runtime.limits.memory_mib);
     let input_mount = format!("{}:/mnt/aursmith-input:ro", staging.join("input").display());
     let output_mount = format!("{}:/mnt/aursmith-output:rw", work.join("output").display());
     let mut command = Command::new("/usr/bin/docker");
@@ -314,7 +354,7 @@ async fn execute_attempt(
         .kill_on_drop(true);
     let mut child = command.spawn().context("DOCKER_CLI_UNAVAILABLE")?;
     let execution = timeout(
-        std::time::Duration::from_secs(spec.limits.timeout_seconds),
+        std::time::Duration::from_secs(runtime.limits.timeout_seconds),
         child.wait(),
     )
     .await;
@@ -326,6 +366,7 @@ async fn execute_attempt(
             bail!("DOCKER_TIMEOUT");
         }
     };
+    validate_log_sizes(&work, runtime.limits.max_log_bytes)?;
     if !status.success() {
         if let Some(code) = guest_failure_code(&work.join("output")) {
             bail!("{code}");
@@ -334,10 +375,22 @@ async fn execute_attempt(
         bail!("{}:{diagnostic}", classify_docker_diagnostic(&diagnostic));
     }
     let result_path = work.join("output/build-result.json");
+    if fs::metadata(&result_path)
+        .context("GUEST_RESULT_MISSING")?
+        .len()
+        > MIB
+    {
+        bail!("GUEST_RESULT_TOO_LARGE");
+    }
     let result = fs::read(&result_path).context("GUEST_RESULT_MISSING")?;
     let guest_result: GuestResult =
         serde_json::from_slice(&result).context("GUEST_RESULT_INVALID")?;
-    validate_guest_result(&guest_result, &spec, &work.join("output"))?;
+    validate_guest_result(
+        &guest_result,
+        &spec,
+        &work.join("output"),
+        runtime.limits.max_output_bytes,
+    )?;
     let digest = hex::encode(Sha256::digest(&result));
     let completed = runtime.jobs_dir.join("completed").join(attempt_id);
     fs::create_dir_all(runtime.jobs_dir.join("completed"))?;
@@ -362,6 +415,7 @@ fn validate_guest_result(
     result: &GuestResult,
     spec: &JobSpec,
     output: &Path,
+    max_output_bytes: u64,
 ) -> anyhow::Result<()> {
     let GuestResult::Build(value) = result;
     if value.job_id != spec.job_id
@@ -379,7 +433,28 @@ fn validate_guest_result(
             size: artifact.size,
         })
         .collect::<Vec<_>>();
+    let output_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.size)
+            .context("GUEST_OUTPUT_TOO_LARGE")
+    })?;
+    if output_bytes > max_output_bytes {
+        bail!("GUEST_OUTPUT_TOO_LARGE");
+    }
     validate_output_entries(output, &entries)
+}
+
+fn validate_log_sizes(work: &Path, max_log_bytes: u64) -> anyhow::Result<()> {
+    for path in [
+        work.join("docker.stdout.log"),
+        work.join("docker.stderr.log"),
+        work.join("output/build.log"),
+    ] {
+        if path.exists() && fs::metadata(path)?.len() > max_log_bytes {
+            bail!("BUILD_LOG_TOO_LARGE");
+        }
+    }
+    Ok(())
 }
 
 fn validate_output_entries(output: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
@@ -484,6 +559,9 @@ fn classify_failure(error: &anyhow::Error) -> String {
         "GUEST_CHECK_FAILED",
         "GUEST_PACKAGE_FAILED",
         "GUEST_OUTPUT_MISMATCH",
+        "GUEST_OUTPUT_TOO_LARGE",
+        "GUEST_RESULT_TOO_LARGE",
+        "BUILD_LOG_TOO_LARGE",
         "GUEST_BUILD_FAILED",
         "BUILD_NETWORK_TRANSIENT",
     ] {
@@ -531,5 +609,28 @@ mod tests {
     #[test]
     fn build_container_uses_the_fixed_image() {
         assert_eq!(BUILD_IMAGE, "aursmith-build:latest");
+    }
+
+    #[test]
+    fn global_build_limits_reject_invalid_values() {
+        assert!(BuildLimits::new(0, 4, 8192, 3600, 8192, 64).is_err());
+        assert!(BuildLimits::new(1, 0, 8192, 3600, 8192, 64).is_err());
+        assert!(BuildLimits::new(1, 4, 128, 3600, 8192, 64).is_err());
+        assert!(BuildLimits::new(1, 4, 8192, 10, 8192, 64).is_err());
+        assert!(BuildLimits::new(1, 4, 8192, 3600, 0, 64).is_err());
+        assert!(BuildLimits::new(1, 4, 8192, 3600, 8192, 65).is_err());
+        assert!(BuildLimits::new(2, 4, 8192, 3600, 8192, 64).is_ok());
+    }
+
+    #[test]
+    fn oversized_build_logs_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("docker.stdout.log"), b"too large").unwrap();
+        assert!(
+            validate_log_sizes(root.path(), 4)
+                .unwrap_err()
+                .to_string()
+                .contains("BUILD_LOG_TOO_LARGE")
+        );
     }
 }

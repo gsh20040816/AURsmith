@@ -93,18 +93,18 @@ function ForgeRail() {
 function BuildsView() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [error, setError] = useState("");
-  const [evidence, setEvidence] = useState<{ job_id: string; kind: string; sha256: string; document: unknown } | null>(null);
+  const [selectedLogs, setSelectedLogs] = useState<{ job_id: string; kind: string; sha256: string; document: unknown } | null>(null);
   const refresh = useMemo(() => () => void api.jobs().then((response) => setJobs(response.items)).catch((reason) => setError(messageOf(reason))), []);
   usePolling(refresh);
-  const showEvidence = async (job: Job) => {
+  const showLogs = async (job: Job) => {
     setError("");
-    try { setEvidence(await api.jobEvidence(job.id)); } catch (reason) { setError(messageOf(reason)); }
+    try { setSelectedLogs(await api.jobLogs(job.id)); } catch (reason) { setError(messageOf(reason)); }
   };
   return <>
     <header className="page-header compact"><div><p className="eyebrow">固定 Builder</p><h1>构建任务</h1><p className="lede">只显示 Build、attempt、有限重试、最后错误和有界日志。</p></div></header>
     {error && <Notice kind="error">{error}</Notice>}
-    {evidence && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">有界构建日志</p><h2>{evidence.job_id.slice(0, 12)}</h2></div><button className="text-button" onClick={() => setEvidence(null)}>关闭</button></div><p className="panel-note">摘要 {evidence.sha256}</p><pre><code>{JSON.stringify(evidence.document, null, 2)}</code></pre></section>}
-    <section className="table-panel"><div className="section-heading"><h2>任务队列</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>{jobs.length === 0 ? <Empty title="没有构建任务" detail="加入软件包并批准审查后，Builder 会从这里领取任务。" /> : <div className="table-scroll"><table><thead><tr><th>任务</th><th>状态 / Attempt</th><th>Builder</th><th>Revision</th><th>更新时间</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td><code>{job.id.slice(0, 8)}</code></td><td><span className={`state ${job.status}`}>{job.failure_code ?? job.status}</span><small className="cell-note">{job.attempt_count} 次{job.next_attempt_at ? ` · ${new Date(job.next_attempt_at).toLocaleTimeString("zh-CN")} 重试` : ""}</small></td><td>{job.worker_name ?? "等待 Builder"}</td><td><code>{job.revision_sha256?.slice(0, 12) ?? "—"}</code></td><td>{new Date(job.updated_at).toLocaleString("zh-CN")}{job.has_evidence && <small className="cell-note"><button className="text-button" onClick={() => void showEvidence(job)}>查看日志</button></small>}</td></tr>)}</tbody></table></div>}</section>
+    {selectedLogs && <section className="work-panel"><div className="section-heading"><div><p className="eyebrow">有界构建日志</p><h2>{selectedLogs.job_id.slice(0, 12)}</h2></div><button className="text-button" onClick={() => setSelectedLogs(null)}>关闭</button></div><p className="panel-note">摘要 {selectedLogs.sha256}</p><pre><code>{JSON.stringify(selectedLogs.document, null, 2)}</code></pre></section>}
+    <section className="table-panel"><div className="section-heading"><h2>任务队列</h2><button className="secondary-button" onClick={refresh}>刷新</button></div>{jobs.length === 0 ? <Empty title="没有构建任务" detail="加入软件包并批准审查后，Builder 会从这里领取任务。" /> : <div className="table-scroll"><table><thead><tr><th>任务</th><th>状态 / Attempt</th><th>Builder</th><th>Revision</th><th>更新时间</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td><code>{job.id.slice(0, 8)}</code></td><td><span className={`state ${job.status}`}>{job.failure_code ?? job.status}</span><small className="cell-note">{job.attempt_count} 次{job.next_attempt_at ? ` · ${new Date(job.next_attempt_at).toLocaleTimeString("zh-CN")} 重试` : ""}</small></td><td>固定 Builder</td><td><code>{job.revision_sha256?.slice(0, 12) ?? "—"}</code></td><td>{new Date(job.updated_at).toLocaleString("zh-CN")}{job.has_logs && <small className="cell-note"><button className="text-button" onClick={() => void showLogs(job)}>查看日志</button></small>}</td></tr>)}</tbody></table></div>}</section>
   </>;
 }
 
@@ -166,14 +166,21 @@ function PackageDetailPanel({ detail, busy, close, operate, selectProvider, setC
 function AuditsView() {
   const [audits, setAudits] = useState<Audit[]>([]);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
   const [rationale, setRationale] = useState<Record<string, string>>({});
   const refresh = useMemo(() => () => void api.audits().then((response) => setAudits(response.items)).catch((reason) => setError(messageOf(reason))), []);
   usePolling(refresh);
   const decide = async (audit: Audit, approve: boolean) => {
     setError("");
-    try { await api.decideAudit(audit.sha256, approve, rationale[audit.sha256] ?? ""); refresh(); } catch (reason) { setError(messageOf(reason)); }
+    setBusy(audit.sha256);
+    try { await api.decideAudit(audit.sha256, approve, rationale[audit.sha256] ?? ""); refresh(); } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
   };
-  return <><header className="page-header compact"><div><p className="eyebrow">diff-first 3+1</p><h1>审查</h1><p className="lede">报告只覆盖固定 AUR wrapper；上游下载内容未被审查时必须明确说明。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{audits.length === 0 ? <Empty title="没有审查任务" detail="新 AUR commit 固定后会自动生成审查输入。" /> : audits.map((audit) => <article className="audit-card" key={audit.sha256}><div className="audit-title"><div><p className="eyebrow">{audit.policy_version} · {audit.aur_commit.slice(0, 12)}</p><h2>{audit.package_base}</h2></div><span className={`state ${audit.state}`}>{audit.state}</span></div><p className="coverage-note">{audit.coverage.upstream_source?.statement}</p><div className="finding-list">{audit.findings.length === 0 ? <p>确定性扫描未发现阻断或可疑项。</p> : audit.findings.map((finding, index) => <div key={`${finding.rule_id}-${index}`}><code>{finding.rule_id}</code><span>{finding.path}</span><strong>{finding.summary}</strong></div>)}</div>{audit.state === "manual_review" && <div className="manual-decision"><label>人工判断理由<input value={rationale[audit.sha256] ?? ""} onChange={(event) => setRationale((current) => ({ ...current, [audit.sha256]: event.target.value }))} placeholder="至少 8 个字符，只对当前 commit 有效" /></label><div><button className="secondary-button" onClick={() => void decide(audit, true)}>批准当前 commit</button><button className="secondary-button danger" onClick={() => void decide(audit, false)}>拒绝当前 commit</button></div></div>}</article>)}</section></>;
+  const retry = async (audit: Audit) => {
+    setError("");
+    setBusy(audit.sha256);
+    try { await api.retryAudit(audit.sha256); refresh(); } catch (reason) { setError(messageOf(reason)); } finally { setBusy(""); }
+  };
+  return <><header className="page-header compact"><div><p className="eyebrow">diff-first 3+1</p><h1>审查</h1><p className="lede">报告只覆盖固定 AUR wrapper；上游下载内容未被审查时必须明确说明。</p></div></header>{error && <Notice kind="error">{error}</Notice>}<section className="audit-list">{audits.length === 0 ? <Empty title="没有审查任务" detail="新 AUR commit 固定后会自动生成审查输入。" /> : audits.map((audit) => <article className="audit-card" key={audit.sha256}><div className="audit-title"><div><p className="eyebrow">{audit.policy_version} · {audit.aur_commit.slice(0, 12)}</p><h2>{audit.package_base}</h2></div><span className={`state ${audit.state}`}>{audit.state}</span></div><p className="coverage-note">{audit.coverage.upstream_source?.statement}</p><h3>实际 Agent 运行</h3><div className="finding-list">{audit.runs.map((run) => <div key={`${run.tier}-${run.slot}-${run.attempt}`}><code>{run.tier} {run.slot} · attempt {run.attempt}</code><strong>{run.provider} / {run.model} · {run.verdict ?? run.status}</strong><span>{run.adapter} {run.adapter_version}{run.report?.summary ? ` · ${run.report.summary}` : ""}</span></div>)}</div><h3>确定性检查</h3><div className="finding-list">{audit.findings.length === 0 ? <p>确定性扫描未发现阻断或可疑项。</p> : audit.findings.map((finding, index) => <div key={`${finding.rule_id}-${index}`}><code>{finding.rule_id}</code><span>{finding.path}</span><strong>{finding.summary}</strong></div>)}</div>{audit.state === "manual_review" && <div className="manual-decision"><label>人工判断理由<input value={rationale[audit.sha256] ?? ""} onChange={(event) => setRationale((current) => ({ ...current, [audit.sha256]: event.target.value }))} placeholder="至少 8 个字符，只对当前 commit 有效" /></label><div><button className="secondary-button" disabled={busy === audit.sha256} onClick={() => void retry(audit)}>修复配置后重跑 3 个 low</button><button className="secondary-button" disabled={busy === audit.sha256} onClick={() => void decide(audit, true)}>批准当前 commit</button><button className="secondary-button danger" disabled={busy === audit.sha256} onClick={() => void decide(audit, false)}>拒绝当前 commit</button></div></div>}</article>)}</section></>;
 }
 
 function ReleasesView() {
@@ -199,7 +206,7 @@ function ClientView() {
   const [bootstrap, setBootstrap] = useState<ClientBootstrap | null>(null);
   const [error, setError] = useState("");
   useEffect(() => { void api.clientBootstrap().then(setBootstrap).catch((reason) => setError(messageOf(reason))); }, []);
-  return <><header className="page-header compact"><div><p className="eyebrow">首次接入</p><h1>客户端</h1><p className="lede">先带外核对完整 GPG 指纹，再安装 keyring 和仓库配置。</p></div></header>{error && <Notice kind="error">{error}</Notice>}{bootstrap && <><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">完整指纹</p><h2><code>{bootstrap.gpg_fingerprint}</code></h2></div></div>{bootstrap.warnings.map((warning) => <p key={warning}>{warning}</p>)}</section><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pacman.conf</p><h2>仓库配置</h2></div></div><pre><code>{bootstrap.repository_config}</code></pre><div className="finding-list">{bootstrap.commands.map((command) => <div key={command}><code>{command}</code></div>)}</div></section></>}</>;
+  return <><header className="page-header compact"><div><p className="eyebrow">首次接入</p><h1>客户端</h1><p className="lede">先带外核对完整 GPG 指纹，再安装 keyring 和仓库配置。</p></div></header>{error && <Notice kind="error">{error}</Notice>}{bootstrap && <><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">完整指纹</p><h2><code>{bootstrap.gpg_fingerprint}</code></h2></div></div><p>keyring generation：{bootstrap.keyring_generation ?? "等待首次发布"}</p>{bootstrap.keyring_published_at && <p>上次发布：{new Date(bootstrap.keyring_published_at).toLocaleString("zh-CN")}</p>}{bootstrap.keyring_next_due_at && <p>下次到期：{new Date(bootstrap.keyring_next_due_at).toLocaleString("zh-CN")}</p>}{bootstrap.warnings.map((warning) => <p key={warning}>{warning}</p>)}</section><section className="work-panel"><div className="section-heading"><div><p className="eyebrow">pacman.conf</p><h2>仓库配置</h2></div></div><pre><code>{bootstrap.repository_config}</code></pre><div className="finding-list">{bootstrap.commands.map((command) => <div key={command}><code>{command}</code></div>)}</div></section></>}</>;
 }
 
 function LoginScreen({ initialError, onLogin }: { initialError: string; onLogin: () => Promise<void> }) {

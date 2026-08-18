@@ -49,7 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/doctor", get(doctor_status))
         .route("/api/v1/builder/poll", post(builder_poll))
         .route("/api/v1/jobs", get(list_jobs))
-        .route("/api/v1/jobs/{id}/evidence", get(job_evidence))
+        .route("/api/v1/jobs/{id}/logs", get(job_logs))
         .route("/api/v1/audits", get(crate::audits::list))
         .route("/api/v1/audits/{bundle}/retry", post(crate::audits::retry))
         .route(
@@ -137,6 +137,14 @@ async fn client_bootstrap(
         )
     })?;
     let fingerprint: String = serde_json::from_str(&value).map_err(ApiError::internal)?;
+    let keyring: Value = sqlx::query_scalar::<_, String>(
+        "SELECT value_json FROM system_settings WHERE key = 'keyring_state'",
+    )
+    .fetch_optional(&state.database)
+    .await
+    .map_err(ApiError::internal)?
+    .and_then(|value| serde_json::from_str(&value).ok())
+    .unwrap_or(Value::Null);
     let base = state.config.repository_base_url.trim_end_matches('/');
     let repository_config =
         format!("[aursmith]\nSigLevel = Required DatabaseRequired\nServer = {base}/$arch");
@@ -149,6 +157,9 @@ async fn client_bootstrap(
         "repository_config": repository_config,
         "gpg_fingerprint": fingerprint,
         "gpg_key_url": format!("{base}/x86_64/aursmith-repository-key.asc"),
+        "keyring_generation": keyring["generation"],
+        "keyring_published_at": keyring["published_at"],
+        "keyring_next_due_at": keyring["next_due_at"],
         "client_ca_url": null,
         "commands": [
             format!("curl --fail --output /tmp/aursmith-repository-key.asc '{base}/x86_64/aursmith-repository-key.asc'"),
@@ -221,17 +232,14 @@ async fn doctor_status(
             .await,
         );
     }
-    match crate::transport::publisher_doctor(&state.config, &state.config.publisher_endpoint).await
-    {
+    match crate::transport::publisher_doctor(&state.config).await {
         Ok(reply) if reply.ok => {
-            for name in ["aur"] {
-                let check = &reply.data["checks"][name];
-                checks.push(json!({
-                    "id": format!("publisher-{name}"),
-                    "ok": check["ok"].as_bool().unwrap_or(false),
-                    "message": check["message"].as_str().unwrap_or("Publisher Doctor 返回字段无效")
-                }));
-            }
+            let check = &reply.data["checks"]["aur"];
+            checks.push(json!({
+                "id": "publisher-aur",
+                "ok": check["ok"].as_bool().unwrap_or(false),
+                "message": check["message"].as_str().unwrap_or("Publisher Doctor 返回字段无效")
+            }));
         }
         Ok(reply) => {
             checks.push(json!({"id": "publisher-upstream", "ok": false, "message": reply.message}))
@@ -386,10 +394,10 @@ async fn builder_poll(
             acknowledged_attempts.push(report.job_id);
         }
     }
-    for capability_id in poll.completed_transfers {
+    for upload_id in poll.completed_uploads {
         sqlx::query("UPDATE uploads SET state = 'verified', last_error = NULL, export_cleaned_at = COALESCE(export_cleaned_at, ?), updated_at = ? WHERE id = ? AND state IN ('export_ready', 'verified')")
             .bind(Utc::now())
-            .bind(Utc::now()).bind(capability_id.to_string())
+            .bind(Utc::now()).bind(upload_id.to_string())
             .execute(&state.database).await.map_err(ApiError::internal)?;
     }
     let status = &poll.status;
@@ -410,12 +418,12 @@ async fn builder_poll(
     .map_err(ApiError::internal)?;
     let releasable_attempts = releasable_reverse_attempts(&state.database).await?;
     let job = crate::scheduler::lease_reverse_job(&state).await?;
-    let transfer = crate::scheduler::lease_reverse_transfer(&state).await?;
+    let upload = crate::scheduler::lease_reverse_upload(&state).await?;
     Ok(Json(BuilderLease {
         acknowledged_attempts,
         releasable_attempts,
         job,
-        transfer,
+        upload,
         issued_at: Utc::now(),
         next_poll_seconds: 15,
     }))
@@ -439,7 +447,7 @@ async fn list_jobs(
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT jobs.id, jobs.kind, jobs.required_role, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count, EXISTS(SELECT 1 FROM job_evidence WHERE job_evidence.job_id = jobs.id) AS has_evidence FROM jobs ORDER BY jobs.created_at DESC LIMIT 200",
+        "SELECT jobs.id, jobs.kind, jobs.status, jobs.priority, jobs.failure_code, jobs.revision_sha256, jobs.next_attempt_at, jobs.created_at, jobs.updated_at, (SELECT COUNT(*) FROM attempts WHERE attempts.job_id = jobs.id) AS attempt_count, EXISTS(SELECT 1 FROM job_logs WHERE job_logs.job_id = jobs.id) AS has_logs FROM jobs ORDER BY jobs.created_at DESC LIMIT 200",
     )
     .fetch_all(&state.database)
     .await
@@ -450,14 +458,12 @@ async fn list_jobs(
             json!({
                 "id": row.get::<String, _>("id"),
                 "kind": row.get::<String, _>("kind"),
-                "required_role": row.get::<String, _>("required_role"),
                 "status": row.get::<String, _>("status"),
                 "priority": row.get::<i64, _>("priority"),
                 "failure_code": row.get::<Option<String>, _>("failure_code"),
                 "revision_sha256": row.get::<Option<String>, _>("revision_sha256"),
-                "worker_name": "builder",
                 "attempt_count": row.get::<i64, _>("attempt_count"),
-                "has_evidence": row.get::<bool, _>("has_evidence"),
+                "has_logs": row.get::<bool, _>("has_logs"),
                 "next_attempt_at": row.get::<Option<String>, _>("next_attempt_at"),
                 "created_at": row.get::<String, _>("created_at"),
                 "updated_at": row.get::<String, _>("updated_at"),
@@ -467,7 +473,7 @@ async fn list_jobs(
     Ok(Json(json!({"items": items})))
 }
 
-async fn job_evidence(
+async fn job_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -475,7 +481,7 @@ async fn job_evidence(
     auth::require_administrator(&state, &headers).await?;
     Uuid::parse_str(&id).map_err(|_| ApiError::bad_request("INVALID_JOB_ID", "Job ID 无效"))?;
     let row = sqlx::query(
-        "SELECT kind, document_json, sha256, created_at FROM job_evidence WHERE job_id = ?",
+        "SELECT kind, document_json, sha256, created_at FROM job_logs WHERE job_id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.database)
@@ -511,9 +517,6 @@ mod tests {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             public_origin: "https://aursmith.test".into(),
-            ssh_identity_source_file: "/不存在".into(),
-            ssh_identity_file: "/不存在".into(),
-            ssh_known_hosts_file: "/不存在".into(),
             session_idle_minutes: 30,
             session_absolute_hours: 1,
             low_agent_endpoints: vec![],
@@ -522,7 +525,9 @@ mod tests {
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
             builder_token_sha256: auth::sha256("test-builder-token"),
-            publisher_endpoint: "ssh://publisher.test:22".into(),
+            builder_max_concurrent: 1,
+            update_interval_minutes: 30,
+            publisher_socket: "/run/aursmith-publisher/worker.sock".into(),
         }
     }
 
@@ -789,7 +794,7 @@ mod tests {
         let poll = BuilderPoll {
             status: json!({"role": "builder"}),
             attempts: Vec::new(),
-            completed_transfers: Vec::new(),
+            completed_uploads: Vec::new(),
             sent_at: Utc::now(),
         };
         let response = app
@@ -814,9 +819,6 @@ mod tests {
             bind_address: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             public_origin: "https://aursmith.test".into(),
-            ssh_identity_source_file: "/不存在".into(),
-            ssh_identity_file: "/不存在".into(),
-            ssh_known_hosts_file: "/不存在".into(),
             session_idle_minutes: 30,
             session_absolute_hours: 1,
             low_agent_endpoints: vec![],
@@ -825,18 +827,11 @@ mod tests {
             source_git_commit: "test".into(),
             repository_base_url: "https://repo.test".into(),
             builder_token_sha256: auth::sha256("test-builder-token"),
-            publisher_endpoint: "ssh://publisher.test:22".into(),
+            builder_max_concurrent: 1,
+            update_interval_minutes: 30,
+            publisher_socket: "/run/aursmith-publisher/worker.sock".into(),
         };
-        let worker_id = Uuid::new_v4();
         let now = Utc::now();
-        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, identity_signing_key_hex, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'degraded', '', '', 1, '[]', ?, 'reverse', ?, ?)")
-            .bind(worker_id.to_string())
-            .bind("00".repeat(32))
-            .bind(now)
-            .bind(now)
-            .execute(&database)
-            .await
-            .unwrap();
         let app = router(AppState::new(database, config));
         let poll = BuilderPoll {
             status: json!({"role": "builder"}),
@@ -844,7 +839,7 @@ mod tests {
                 job_id: Uuid::new_v4(),
                 response: json!({"ok": true}),
             }],
-            completed_transfers: Vec::new(),
+            completed_uploads: Vec::new(),
             sent_at: now,
         };
         let response = app
@@ -868,10 +863,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_worker_releases_only_terminal_batch_workspaces() {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
-        let worker_id = Uuid::new_v4();
         let now = Utc::now();
-        sqlx::query("INSERT INTO workers(id, name, role, state, endpoint, ssh_host_key_sha256, protocol_version, labels_json, connection_mode, created_at, updated_at) VALUES (?, 'builder', 'builder', 'online', '', '', 1, '[]', 'reverse', ?, ?)")
-            .bind(worker_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
         let active_batch = Uuid::new_v4();
         let published_batch = Uuid::new_v4();
         for (id, state) in [(active_batch, "building"), (published_batch, "published")] {
@@ -892,8 +884,8 @@ mod tests {
             (Some(active_batch), "failed", "build", failed_attempt),
         ] {
             let job_id = Uuid::new_v4();
-            sqlx::query("INSERT INTO jobs(id, batch_id, required_role, worker_id, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', ?, ?, 1, ?, '[]', '[]', '[]', ?, ?)")
-                .bind(job_id.to_string()).bind(batch.map(|value| value.to_string())).bind(worker_id.to_string())
+            sqlx::query("INSERT INTO jobs(id, batch_id, status, priority, kind, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, ?, ?, 1, ?, '[]', '[]', ?, ?)")
+                .bind(job_id.to_string()).bind(batch.map(|value| value.to_string()))
                 .bind(job_status).bind(kind).bind(now).bind(now).execute(&database).await.unwrap();
             sqlx::query("INSERT INTO attempts(id, job_id, generation, token_sha256, status, finished_at) VALUES (?, ?, 0, ?, ?, ?)")
                 .bind(attempt.to_string()).bind(job_id.to_string()).bind(hex::encode(Sha256::digest(attempt.as_bytes())))

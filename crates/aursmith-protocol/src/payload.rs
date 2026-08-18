@@ -26,14 +26,6 @@ pub struct DependencyInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceLimits {
-    pub cpu_count: u16,
-    pub memory_mib: u64,
-    pub disk_mib: u64,
-    pub timeout_seconds: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
     pub sha256: String,
@@ -66,7 +58,6 @@ pub struct JobSpec {
     pub expected_outputs: Vec<String>,
     #[serde(default = "default_allow_check")]
     pub allow_check: bool,
-    pub limits: ResourceLimits,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -121,14 +112,15 @@ pub struct BuilderPoll {
     pub status: serde_json::Value,
     #[serde(default)]
     pub attempts: Vec<ReverseAttemptReport>,
-    #[serde(default)]
-    pub completed_transfers: Vec<Uuid>,
+    #[serde(default, alias = "completed_transfers")]
+    pub completed_uploads: Vec<Uuid>,
     pub sent_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderUpload {
-    pub id: Uuid,
+    #[serde(alias = "id")]
+    pub upload_id: Uuid,
     pub attempt: AttemptRef,
     pub files: Vec<ManifestEntry>,
     pub expires_at: DateTime<Utc>,
@@ -142,8 +134,8 @@ pub struct BuilderLease {
     pub releasable_attempts: Vec<Uuid>,
     #[serde(default)]
     pub job: Option<JobSpec>,
-    #[serde(default)]
-    pub transfer: Option<BuilderUpload>,
+    #[serde(default, alias = "transfer")]
+    pub upload: Option<BuilderUpload>,
     pub issued_at: DateTime<Utc>,
     pub next_poll_seconds: u16,
 }
@@ -154,11 +146,7 @@ pub struct ReleasePlan {
     pub batch_id: Uuid,
     pub repository_name: String,
     pub source_git_commit: String,
-    pub revision_sha256s: Vec<String>,
-    pub audit_report_sha256s: Vec<String>,
     pub artifacts: Vec<ArtifactRecord>,
-    #[serde(default)]
-    pub evidence_files: Vec<ManifestEntry>,
     #[serde(default)]
     pub removed_package_names: Vec<String>,
     #[serde(default)]
@@ -175,17 +163,17 @@ pub struct ReleaseManifest {
     pub repository_name: String,
     pub artifacts: Vec<ArtifactRecord>,
     #[serde(default)]
-    pub evidence_files: Vec<ManifestEntry>,
-    #[serde(default)]
     pub removed_package_names: Vec<String>,
     #[serde(default)]
     pub repository_keyring: Option<ArtifactRecord>,
+    #[serde(default)]
+    pub keyring_generation: Option<u64>,
+    #[serde(default)]
+    pub keyring_fingerprint: Option<String>,
+    #[serde(default)]
+    pub keyring_published_at: Option<DateTime<Utc>>,
     pub repository_database: ManifestEntry,
     pub repository_files: ManifestEntry,
-    #[serde(default)]
-    pub artifact_inspections: Option<ManifestEntry>,
-    #[serde(default)]
-    pub release_plan: Option<ManifestEntry>,
     pub committed_at: DateTime<Utc>,
 }
 
@@ -222,12 +210,6 @@ mod tests {
             inline_inputs: Vec::new(),
             expected_outputs: vec!["demo".into()],
             allow_check: true,
-            limits: ResourceLimits {
-                cpu_count: 1,
-                memory_mib: 1024,
-                disk_mib: 4096,
-                timeout_seconds: 600,
-            },
             issued_at: now,
             expires_at: now + Duration::minutes(5),
         };
@@ -246,14 +228,14 @@ mod tests {
         let poll = BuilderPoll {
             status: serde_json::json!({"role": "builder"}),
             attempts: Vec::new(),
-            completed_transfers: Vec::new(),
+            completed_uploads: Vec::new(),
             sent_at: Utc::now(),
         };
         let lease = BuilderLease {
             acknowledged_attempts: Vec::new(),
             releasable_attempts: Vec::new(),
             job: None,
-            transfer: None,
+            upload: None,
             issued_at: Utc::now(),
             next_poll_seconds: 15,
         };
@@ -264,5 +246,41 @@ mod tests {
             serde_json::to_value(poll).unwrap()["status"]["role"],
             "builder"
         );
+    }
+
+    #[test]
+    fn builder_messages_accept_legacy_transfer_field_names() {
+        let upload_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = Utc::now();
+        let poll: BuilderPoll = serde_json::from_value(serde_json::json!({
+            "status": {"role": "builder"},
+            "attempts": [],
+            "completed_transfers": [upload_id],
+            "sent_at": now,
+        }))
+        .unwrap();
+        assert_eq!(poll.completed_uploads, vec![upload_id]);
+
+        let lease: BuilderLease = serde_json::from_value(serde_json::json!({
+            "acknowledged_attempts": [],
+            "releasable_attempts": [],
+            "job": null,
+            "transfer": {
+                "id": upload_id,
+                "attempt": {
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "generation": 0
+                },
+                "files": [],
+                "expires_at": now,
+            },
+            "issued_at": now,
+            "next_poll_seconds": 15,
+        }))
+        .unwrap();
+        assert_eq!(lease.upload.unwrap().upload_id, upload_id);
     }
 }

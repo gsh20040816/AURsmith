@@ -45,6 +45,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(obsolete_vcs_review_table, 0);
+        for table in ["workers", "job_evidence", "job_evidence_files"] {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "旧表仍存在：{table}");
+        }
+        let obsolete_job_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name IN ('preferred_worker_id', 'worker_id', 'required_role', 'required_labels_json', 'profile_sha256', 'limits_json')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(obsolete_job_columns, 0);
+        let job_logs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'job_logs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(job_logs, 1);
         let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
             .fetch_one(&pool)
             .await

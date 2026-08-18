@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use std::{env, fs, fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{env, path::Path};
 
 const MAXIMUM_SESSION_IDLE_MINUTES: i64 = 7 * 24 * 60;
 const MAXIMUM_SESSION_ABSOLUTE_HOURS: i64 = 365 * 24;
@@ -9,9 +9,6 @@ pub struct Config {
     pub bind_address: String,
     pub database_url: String,
     pub public_origin: String,
-    pub ssh_identity_source_file: String,
-    pub ssh_identity_file: String,
-    pub ssh_known_hosts_file: String,
     pub session_idle_minutes: i64,
     pub session_absolute_hours: i64,
     pub low_agent_endpoints: Vec<String>,
@@ -20,7 +17,9 @@ pub struct Config {
     pub source_git_commit: String,
     pub repository_base_url: String,
     pub builder_token_sha256: String,
-    pub publisher_endpoint: String,
+    pub builder_max_concurrent: u16,
+    pub update_interval_minutes: u32,
+    pub publisher_socket: String,
 }
 
 impl Config {
@@ -50,17 +49,21 @@ impl Config {
         {
             bail!("AURSMITH_BUILDER_TOKEN_SHA256 必须是 64 位十六进制 SHA-256");
         }
+        let builder_max_concurrent = u16::try_from(parse_bounded_positive(
+            "AURSMITH_BUILDER_MAX_CONCURRENT",
+            1,
+            16,
+        )?)?;
+        let update_interval_minutes = u32::try_from(parse_bounded_positive(
+            "AURSMITH_UPDATE_INTERVAL_MINUTES",
+            30,
+            10_080,
+        )?)?;
         Ok(Self {
             bind_address: env::var("AURSMITH_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             database_url: env::var("AURSMITH_DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://runtime/controller.db".into()),
             public_origin,
-            ssh_identity_source_file: env::var("AURSMITH_SSH_IDENTITY_SOURCE_FILE")
-                .unwrap_or_else(|_| "/run/secrets/worker_ssh_key".into()),
-            ssh_identity_file: env::var("AURSMITH_SSH_IDENTITY_FILE")
-                .unwrap_or_else(|_| "/run/aursmith-private/worker_ssh_key".into()),
-            ssh_known_hosts_file: env::var("AURSMITH_SSH_KNOWN_HOSTS_FILE")
-                .unwrap_or_else(|_| "/run/secrets/worker_known_hosts".into()),
             session_idle_minutes,
             session_absolute_hours,
             low_agent_endpoints: env::var("AURSMITH_LOW_AGENT_ENDPOINTS")
@@ -78,33 +81,22 @@ impl Config {
             repository_base_url: env::var("AURSMITH_REPOSITORY_BASE_URL")
                 .unwrap_or_else(|_| "https://repo.aursmith.lan".into()),
             builder_token_sha256: builder_token_sha256.to_ascii_lowercase(),
-            publisher_endpoint: env::var("AURSMITH_PUBLISHER_ENDPOINT")
-                .context("必须设置固定 Publisher SSH 端点：AURSMITH_PUBLISHER_ENDPOINT")?,
+            builder_max_concurrent,
+            update_interval_minutes,
+            publisher_socket: validate_publisher_socket(
+                &env::var("AURSMITH_PUBLISHER_SOCKET")
+                    .unwrap_or_else(|_| "/run/aursmith-publisher/worker.sock".into()),
+            )?,
         })
     }
+}
 
-    pub fn materialize_ssh_identity(&self) -> anyhow::Result<()> {
-        let source = Path::new(&self.ssh_identity_source_file);
-        let target = Path::new(&self.ssh_identity_file);
-        let metadata = fs::symlink_metadata(source)
-            .with_context(|| format!("无法检查 Worker SSH 私钥 {}", source.display()))?;
-        if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 64 * 1024 {
-            bail!("Worker SSH 私钥类型或大小不合法");
-        }
-        let bytes = fs::read(source)
-            .with_context(|| format!("无法读取 Worker SSH 私钥 {}", source.display()))?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(target)
-            .with_context(|| format!("无法创建私有 SSH 密钥 {}", target.display()))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("无法写入私有 SSH 密钥 {}", target.display()))?;
-        file.sync_all()
-            .with_context(|| format!("无法同步私有 SSH 密钥 {}", target.display()))?;
-        Ok(())
+fn validate_publisher_socket(value: &str) -> anyhow::Result<String> {
+    let path = Path::new(value);
+    if !path.is_absolute() || value.as_bytes().contains(&0) {
+        bail!("AURSMITH_PUBLISHER_SOCKET 必须是绝对路径");
     }
+    Ok(value.to_owned())
 }
 
 fn parse_bounded_positive(name: &str, default: i64, maximum: i64) -> anyhow::Result<i64> {

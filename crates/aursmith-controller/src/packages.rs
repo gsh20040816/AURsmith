@@ -111,8 +111,7 @@ pub async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let endpoint = state.config.publisher_endpoint.clone();
-    let reply = transport::aur_search(&state.config, &endpoint, &query.q).await?;
+    let reply = transport::aur_search(&state.config, &query.q).await?;
     let packages: Vec<UpstreamPackage> =
         serde_json::from_value(reply.data.get("items").cloned().unwrap_or(Value::Null))
             .map_err(ApiError::internal)?;
@@ -128,13 +127,9 @@ pub async fn subscribe(
 ) -> Result<impl IntoResponse, ApiError> {
     let administrator_id = auth::require_administrator(&state, &headers).await?;
     validate_name(&request.package_name)?;
-    let endpoint = state.config.publisher_endpoint.clone();
-    let official = transport::official_info(
-        &state.config,
-        &endpoint,
-        std::slice::from_ref(&request.package_name),
-    )
-    .await?;
+    let official =
+        transport::official_info(&state.config, std::slice::from_ref(&request.package_name))
+            .await?;
     if official
         .data
         .get(&request.package_name)
@@ -146,12 +141,8 @@ pub async fn subscribe(
             "同名软件包已经进入 Arch 官方仓库，请优先使用官方包",
         ));
     }
-    let info_reply = transport::aur_info(
-        &state.config,
-        &endpoint,
-        std::slice::from_ref(&request.package_name),
-    )
-    .await?;
+    let info_reply =
+        transport::aur_info(&state.config, std::slice::from_ref(&request.package_name)).await?;
     let packages: Vec<UpstreamPackage> =
         serde_json::from_value(info_reply.data.get("items").cloned().unwrap_or(Value::Null))
             .map_err(ApiError::internal)?;
@@ -159,12 +150,11 @@ pub async fn subscribe(
         .into_iter()
         .find(|package| package.name == request.package_name)
         .ok_or_else(|| ApiError::not_found("AUR 中不存在该软件包"))?;
-    let snapshot_reply =
-        transport::aur_snapshot(&state.config, &endpoint, &package.package_base).await?;
+    let snapshot_reply = transport::aur_snapshot(&state.config, &package.package_base).await?;
     let snapshot: UpstreamSnapshot =
         serde_json::from_value(snapshot_reply.data).map_err(ApiError::internal)?;
     let dependency_closure =
-        collect_dependency_snapshots(&state, &endpoint, &snapshot, &BTreeMap::new()).await?;
+        collect_dependency_snapshots(&state, &snapshot, &BTreeMap::new()).await?;
     let result = apply_snapshot(
         &state.database,
         &administrator_id,
@@ -179,7 +169,6 @@ pub async fn subscribe(
 
 async fn collect_dependency_snapshots(
     state: &AppState,
-    endpoint: &str,
     root: &UpstreamSnapshot,
     selected_providers: &BTreeMap<String, String>,
 ) -> Result<DependencyClosure, ApiError> {
@@ -202,7 +191,7 @@ async fn collect_dependency_snapshots(
         if names.is_empty() {
             continue;
         }
-        let official_names = collect_official_dependency_names(state, endpoint, &names).await?;
+        let official_names = collect_official_dependency_names(state, &names).await?;
         let names: Vec<String> = names
             .into_iter()
             .filter(|name| !official_names.contains(name))
@@ -210,7 +199,7 @@ async fn collect_dependency_snapshots(
         if names.is_empty() {
             continue;
         }
-        let reply = transport::aur_info(&state.config, endpoint, &names).await?;
+        let reply = transport::aur_info(&state.config, &names).await?;
         let found: Vec<UpstreamPackage> =
             serde_json::from_value(reply.data.get("items").cloned().unwrap_or(Value::Null))
                 .map_err(ApiError::internal)?;
@@ -233,7 +222,7 @@ async fn collect_dependency_snapshots(
             if chunk.is_empty() {
                 continue;
             }
-            let reply = transport::aur_providers(&state.config, endpoint, chunk).await?;
+            let reply = transport::aur_providers(&state.config, chunk).await?;
             let values = reply
                 .data
                 .as_object()
@@ -279,8 +268,7 @@ async fn collect_dependency_snapshots(
                     "AUR 依赖闭包超过第一版 64 个 pkgbase 的安全上限",
                 ));
             }
-            let reply =
-                transport::aur_snapshot(&state.config, endpoint, &package.package_base).await?;
+            let reply = transport::aur_snapshot(&state.config, &package.package_base).await?;
             let snapshot: UpstreamSnapshot =
                 serde_json::from_value(reply.data).map_err(ApiError::internal)?;
             if snapshot.package_base != package.package_base {
@@ -311,12 +299,11 @@ async fn collect_dependency_snapshots(
 
 async fn collect_official_dependency_names(
     state: &AppState,
-    endpoint: &str,
     names: &[String],
 ) -> Result<BTreeSet<String>, ApiError> {
     let mut official_names = BTreeSet::new();
     for chunk in names.chunks(50) {
-        let reply = transport::official_info(&state.config, endpoint, chunk).await?;
+        let reply = transport::official_info(&state.config, chunk).await?;
         official_names.extend(official_dependency_names_from_data(chunk, &reply.data)?);
     }
     Ok(official_names)
@@ -648,7 +635,7 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
         .await
         .map_err(ApiError::internal)?;
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, required_role, status, priority, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, required_labels_json, limits_json, created_at, updated_at) VALUES (?, ?, ?, 'builder', 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, batch_id, revision_id, status, priority, revision_sha256, kind, source_manifest_sha256, dependency_snapshot_sha256, inputs_json, inline_inputs_json, expected_outputs_json, allow_check, created_at, updated_at) VALUES (?, ?, ?, 'queued', 40, ?, 'build', ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(Uuid::new_v4().to_string()).bind(&batch_id).bind(&revision_id)
             .bind(next.get::<String,_>("input_sha256")).bind(source_manifest_sha256)
             .bind(dependency_snapshot_sha256)
@@ -656,7 +643,6 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
             .bind(serde_json::to_string(&inline_inputs).map_err(ApiError::internal)?)
             .bind(serde_json::to_string(&snapshot.outputs).map_err(ApiError::internal)?)
             .bind(allow_check)
-            .bind(r#"{"cpu_count":4,"memory_mib":8192,"disk_mib":32768,"timeout_seconds":3600}"#)
             .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("UPDATE revisions SET state = 'build_pending' WHERE id = ?")
             .bind(&revision_id)
@@ -1035,12 +1021,7 @@ pub async fn rollback_release(
         issued_at: now,
         expires_at: now + Duration::minutes(5),
     };
-    let reply = transport::authorize_rollback(
-        &state.config,
-        &state.config.publisher_endpoint,
-        &authorization,
-    )
-    .await?;
+    let reply = transport::authorize_rollback(&state.config, &authorization).await?;
     if reply.data["release_id"].as_str() != Some(release_id.as_str())
         || reply.data["manifest_sha256"].as_str()
             != Some(row.get::<String, _>("manifest_sha256").as_str())
@@ -1118,6 +1099,18 @@ pub async fn select_provider(
 }
 
 pub async fn refresh_due(state: &AppState) -> Result<(), ApiError> {
+    let unscheduled: Vec<String> = sqlx::query_scalar(
+        "SELECT subscriptions.package_base FROM subscriptions LEFT JOIN package_sync_state ON package_sync_state.package_base = subscriptions.package_base WHERE subscriptions.kind = 'direct' AND package_sync_state.next_check_at IS NULL ORDER BY subscriptions.package_base",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(ApiError::internal)?;
+    let now = Utc::now();
+    for package_base in unscheduled {
+        let next = next_scheduled_check(&package_base, now, state.config.update_interval_minutes)?;
+        sqlx::query("INSERT INTO package_sync_state(package_base, next_check_at) VALUES (?, ?) ON CONFLICT(package_base) DO UPDATE SET next_check_at = excluded.next_check_at WHERE package_sync_state.next_check_at IS NULL")
+            .bind(package_base).bind(next).execute(&state.database).await.map_err(ApiError::internal)?;
+    }
     let rows = sqlx::query(
         "SELECT subscriptions.package_base FROM subscriptions LEFT JOIN package_sync_state ON package_sync_state.package_base = subscriptions.package_base WHERE subscriptions.kind = 'direct' AND (package_sync_state.next_check_at IS NULL OR package_sync_state.next_check_at <= ?) ORDER BY subscriptions.package_base LIMIT 10",
     )
@@ -1136,7 +1129,7 @@ pub async fn refresh_due(state: &AppState) -> Result<(), ApiError> {
 }
 
 async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Result<Value, ApiError> {
-    let row = sqlx::query("SELECT package_bases.outputs_json, package_bases.vcs_kind, subscriptions.followed_outputs_json, subscriptions.selected_providers_json, package_sync_state.last_official_checked_at FROM package_bases JOIN subscriptions ON subscriptions.package_base = package_bases.name AND subscriptions.kind = 'direct' LEFT JOIN package_sync_state ON package_sync_state.package_base = package_bases.name WHERE package_bases.name = ?")
+    let row = sqlx::query("SELECT package_bases.outputs_json, subscriptions.followed_outputs_json, subscriptions.selected_providers_json, package_sync_state.last_official_checked_at FROM package_bases JOIN subscriptions ON subscriptions.package_base = package_bases.name AND subscriptions.kind = 'direct' LEFT JOIN package_sync_state ON package_sync_state.package_base = package_bases.name WHERE package_bases.name = ?")
         .bind(package_base)
         .fetch_optional(&state.database)
         .await
@@ -1146,14 +1139,13 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
     let followed_outputs: Vec<String> = parse_json(row.get("followed_outputs_json"))?;
     let selected_providers: BTreeMap<String, String> =
         parse_json(row.get("selected_providers_json"))?;
-    let endpoint = state.config.publisher_endpoint.clone();
     let last_official_check: Option<chrono::DateTime<Utc>> = row
         .get::<Option<String>, _>("last_official_checked_at")
         .and_then(|value| value.parse().ok());
     let official_check_due = last_official_check
         .is_none_or(|checked| checked <= Utc::now() - chrono::Duration::hours(6));
     if official_check_due {
-        let official = transport::official_info(&state.config, &endpoint, &outputs).await?;
+        let official = transport::official_info(&state.config, &outputs).await?;
         let now = Utc::now();
         sqlx::query("INSERT INTO package_sync_state(package_base, last_official_checked_at) VALUES (?, ?) ON CONFLICT(package_base) DO UPDATE SET last_official_checked_at = excluded.last_official_checked_at")
             .bind(package_base).bind(now).execute(&state.database).await.map_err(ApiError::internal)?;
@@ -1169,7 +1161,7 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
             );
         }
     }
-    let reply = transport::aur_info(&state.config, &endpoint, &outputs).await?;
+    let reply = transport::aur_info(&state.config, &outputs).await?;
     let packages: Vec<UpstreamPackage> =
         serde_json::from_value(reply.data.get("items").cloned().unwrap_or(Value::Null))
             .map_err(ApiError::internal)?;
@@ -1182,11 +1174,10 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
             "AUR 软件包可能已删除、重命名或合并",
         ));
     };
-    let snapshot_reply = transport::aur_snapshot(&state.config, &endpoint, package_base).await?;
+    let snapshot_reply = transport::aur_snapshot(&state.config, package_base).await?;
     let snapshot: UpstreamSnapshot =
         serde_json::from_value(snapshot_reply.data).map_err(ApiError::internal)?;
-    let closure =
-        collect_dependency_snapshots(state, &endpoint, &snapshot, &selected_providers).await?;
+    let closure = collect_dependency_snapshots(state, &snapshot, &selected_providers).await?;
     let result = apply_snapshot(
         &state.database,
         actor,
@@ -1196,20 +1187,34 @@ async fn refresh_one(state: &AppState, package_base: &str, actor: &str) -> Resul
         &closure,
     )
     .await?;
-    let interval_hours = if row.get::<Option<String>, _>("vcs_kind").as_deref() == Some("git") {
-        24
-    } else {
-        0
-    };
-    let next = if interval_hours == 0 {
-        Utc::now() + chrono::Duration::minutes(30)
-    } else {
-        Utc::now() + chrono::Duration::hours(interval_hours)
-    };
+    let next = next_scheduled_check(
+        package_base,
+        Utc::now(),
+        state.config.update_interval_minutes,
+    )?;
     sqlx::query("INSERT INTO package_sync_state(package_base, consecutive_failures, last_checked_at, last_success_at, last_error, next_check_at) VALUES (?, 0, ?, ?, NULL, ?) ON CONFLICT(package_base) DO UPDATE SET consecutive_failures = 0, last_checked_at = excluded.last_checked_at, last_success_at = excluded.last_success_at, last_error = NULL, next_check_at = excluded.next_check_at")
         .bind(package_base).bind(Utc::now()).bind(Utc::now()).bind(next)
         .execute(&state.database).await.map_err(ApiError::internal)?;
     Ok(result)
+}
+
+fn next_scheduled_check(
+    package_base: &str,
+    after: chrono::DateTime<Utc>,
+    interval_minutes: u32,
+) -> Result<chrono::DateTime<Utc>, ApiError> {
+    let period = i64::from(interval_minutes)
+        .checked_mul(60)
+        .ok_or_else(|| ApiError::internal("检查周期换算溢出"))?;
+    let digest = Sha256::digest(package_base.as_bytes());
+    let offset = i64::try_from(
+        u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 前缀长度固定"))
+            % u64::try_from(period).map_err(ApiError::internal)?,
+    )
+    .map_err(ApiError::internal)?;
+    let cycle = (after.timestamp() - offset).div_euclid(period) + 1;
+    chrono::DateTime::from_timestamp(cycle * period + offset, 0)
+        .ok_or_else(|| ApiError::internal("检查时间超出范围"))
 }
 
 async fn record_sync_failure(
@@ -1821,7 +1826,7 @@ mod tests {
         .await
         .unwrap();
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, revision_id, required_role, status, priority, kind, failure_code, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', 'failed', 1, 'build', 'GUEST_CHECKSUM_FAILED', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, revision_id, status, priority, kind, failure_code, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, ?, 'failed', 1, 'build', 'GUEST_CHECKSUM_FAILED', '[]', '[]', ?, ?)")
             .bind(Uuid::new_v4().to_string())
             .bind(created["revision_id"].as_str().unwrap())
             .bind(now)
@@ -1854,7 +1859,7 @@ mod tests {
         assert_eq!(after, before);
 
         let later = now + Duration::seconds(1);
-        sqlx::query("INSERT INTO jobs(id, revision_id, required_role, status, priority, kind, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', 'succeeded', 1, 'build', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, revision_id, status, priority, kind, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, ?, 'succeeded', 1, 'build', '[]', '[]', ?, ?)")
             .bind(Uuid::new_v4().to_string())
             .bind(created["revision_id"].as_str().unwrap())
             .bind(later)
@@ -1889,7 +1894,7 @@ mod tests {
         .await
         .unwrap();
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, revision_id, required_role, status, priority, kind, failure_code, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', 'failed', 1, 'build', 'GUEST_BUILD_FAILED', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, revision_id, status, priority, kind, failure_code, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, ?, 'failed', 1, 'build', 'GUEST_BUILD_FAILED', '[]', '[]', ?, ?)")
             .bind(Uuid::new_v4().to_string())
             .bind(first["revision_id"].as_str().unwrap())
             .bind(now)
@@ -1937,7 +1942,7 @@ mod tests {
         .await
         .unwrap();
         let now = Utc::now();
-        sqlx::query("INSERT INTO jobs(id, revision_id, required_role, status, priority, kind, failure_code, inputs_json, inline_inputs_json, required_labels_json, created_at, updated_at) VALUES (?, ?, 'builder', 'failed', 1, 'build', 'GUEST_BUILD_FAILED', '[]', '[]', '[]', ?, ?)")
+        sqlx::query("INSERT INTO jobs(id, revision_id, status, priority, kind, failure_code, inputs_json, inline_inputs_json, created_at, updated_at) VALUES (?, ?, 'failed', 1, 'build', 'GUEST_BUILD_FAILED', '[]', '[]', ?, ?)")
             .bind(Uuid::new_v4().to_string())
             .bind(created["revision_id"].as_str().unwrap())
             .bind(now)
@@ -2501,19 +2506,27 @@ mod tests {
 
         schedule_ready_builds(&database).await.unwrap();
 
-        let row = sqlx::query("SELECT expected_outputs_json, allow_check, limits_json, inputs_json, inline_inputs_json FROM jobs WHERE batch_id = ? AND kind = 'build'")
+        let row = sqlx::query("SELECT expected_outputs_json, allow_check, inputs_json, inline_inputs_json FROM jobs WHERE batch_id = ? AND kind = 'build'")
             .bind(batch_id).fetch_one(&database).await.unwrap();
         let outputs: Vec<String> = serde_json::from_str(row.get("expected_outputs_json")).unwrap();
-        let limits: aursmith_protocol::ResourceLimits =
-            serde_json::from_str(row.get("limits_json")).unwrap();
         assert_eq!(outputs, ["demo-cli", "demo-lib"]);
         assert_eq!(row.get::<i64, _>("allow_check"), 0);
-        assert_eq!(limits.cpu_count, 4);
-        assert_eq!(limits.memory_mib, 8192);
         let inputs: Vec<aursmith_protocol::ManifestEntry> =
             serde_json::from_str(row.get("inputs_json")).unwrap();
         let inline: Vec<aursmith_protocol::InlineInput> =
             serde_json::from_str(row.get("inline_inputs_json")).unwrap();
         assert_eq!(inputs.len(), inline.len());
+    }
+
+    #[test]
+    fn package_checks_use_stable_stagger_within_the_global_interval() {
+        let after = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let first = next_scheduled_check("package-a", after, 30).unwrap();
+        let repeated = next_scheduled_check("package-a", after, 30).unwrap();
+        let second = next_scheduled_check("package-b", after, 30).unwrap();
+        assert_eq!(first, repeated);
+        assert!(first > after && first <= after + Duration::minutes(30));
+        assert!(second > after && second <= after + Duration::minutes(30));
+        assert_ne!(first, second);
     }
 }
