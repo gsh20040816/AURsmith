@@ -4,7 +4,7 @@
 
 ## 2026-08-18：本地验证
 
-- `./scripts/test-all.sh` 通过；Rust 共 128 项：Agent Gateway 2、Agent Runner 11、Controller 55、Domain 13、Guest Agent 6、Protocol 5、Repository 6、Worker 24、CLI 6；
+- `./scripts/test-all.sh` 通过；Rust 共 131 项：Agent Gateway 2、Agent Runner 11、Controller 56、Domain 13、Guest Agent 6、Protocol 5、Repository 6、Worker 26、CLI 6；
 - 前端类型检查、6 个 Vitest 用例和 Vite 生产构建通过；
 - `cargo clippy --workspace --all-targets -- -D warnings` 通过；
 - Compose 安全检查通过；Repository 测试实际调用 Arch `repo-add`/`repo-remove`、`makepkg` 和 GPG 生成 keyring 包；
@@ -46,6 +46,14 @@
 - `webkit2gtk-imgpaste 2.50.6-1` 的 PKGBUILD 只声明无版本 `cmake`，pacman 因而正确选择官方 4.4.2；其 WebKit 2.50.6 源码在 `WebKitMacros.cmake:311` 不兼容 CMake 4.4。提交 `96eca75` 收紧失败分类，避免把无关的 signature 文本与 CMake `Failed` 拼成 PGP 错误；生产复验 Job `a97a9a9c-d109-4d20-8cd5-34751ad8e32b` 准确返回 `GUEST_BUILD_FAILED`。旧误分类只更正 Job/Batch failure code，并写入 `manual_actions`，原始日志和审查证据未改。
 - 两个隐式依赖新 Revision 均有 3/3 独立低成本 Agent 批准；重建 Revision 的摘要复用链已追溯到各自 3/3 原始批准。生产 Doctor 最终 `ready: true`，Controller 数据库完整性为 `ok` 且无外键错误。
 - 本轮备份目录为 `/opt/aursmith/runtime/deployment-backups/20260818T071546Z-dependency-resolution/`；初始 Controller、Publisher Worker 和误分类修正前 Controller 备份 SHA-256 分别为 `59c037b36ff6feca194009aad45d19a706bd6ed1230cb7e70c47ad8a66368fd1`、`9e90d95fff02c131bbdeae1404720b1409015bf07ade26ed4a1731708d136ad1`、`6cdf08ca531c41d2697c4183e13813d8f4414720a699916a1c5a2bc05001563f`。
+
+## 2026-08-18：无 `-git` 后缀的动态包
+
+- 提交 `f6c323f` 删除按 pkgbase 后缀启用 Git 跟踪的门槛，改为解析 `.SRCINFO` 中的 `git+https://` source；普通 archive source 的回归用例确认不会误判。Controller 的 `vcs_kind` 也改由已经成功固定的 VCS commit 得出，不再猜测包名。
+- 本地完整测试、Web 生产构建、Compose 安全检查和全 workspace Clippy 通过；真实上游 smoke 成功为 `wallpaper-engine-kde-plugin-new-fork` 解析 40 位 Git commit。
+- 生产 Controller 与 Publisher 镜像均部署 revision `f6c323f` 且健康。该包原有显式订阅的旧 Revision 因后缀误判留下 `vcs_commit = NULL`；正式 refresh 后，新 Revision `92cecdfe-e3a9-43f4-a2be-1db425ffea71` 在同一 AUR commit `b1456d2352febe65ee5bcf5961826926e2068a22` 下固定上游 commit `5c9328efe89b529eaf8a77cfab323c1bb46bd2de`，旧 Revision 已 supersede。
+- 新 Revision 复用相同 AUR 包装层的既有批准并进入真实 Builder 调度；记录时 Job `8ffe4957-6ad1-40fc-9833-8ed153be2cd8` 为 `dispatched`，尚未声称构建成功。生产 Doctor `ready: true`，Controller 数据库完整性为 `ok` 且无外键错误。
+- 部署前在线备份位于 `/opt/aursmith/runtime/deployment-backups/20260818T080732Z-suffixless-vcs/`；Controller 与 Publisher Worker SHA-256 分别为 `44b35420c02e6059071f87139eed38d4861d3681fb2b33d92637a5caaf0b0472`、`9e90d95fff02c131bbdeae1404720b1409015bf07ade26ed4a1731708d136ad1`。
 
 ## 外部代理缓存说明
 
