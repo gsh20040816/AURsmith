@@ -204,7 +204,7 @@ services:
       - /run/private:uid=0,gid=0,mode=0755,size=2m
     ports:
       - ${AURSMITH_SSH_BIND:-127.0.0.1:2223}:2222
-    networks: [publisher-control]
+    networks: [publisher-control, edge]
     depends_on:
       publisher:
         condition: service_healthy

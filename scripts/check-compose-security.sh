@@ -107,6 +107,10 @@ if [[ "$(jq '[.services["publisher-ssh"].volumes[]? | select(.target == "/landin
   echo "Publisher SSH 必须只通过 Publisher landing 卷接收受限 Builder 推送" >&2
   exit 1
 fi
+if [[ "$(jq '(.services["publisher-ssh"].networks | has("publisher-control")) and (.services["publisher-ssh"].networks | has("edge"))' <<<"${publisher_json}")" != "true" ]]; then
+  echo "Publisher SSH 必须同时连接内部控制网络和可发布宿主端口的 edge 网络" >&2
+  exit 1
+fi
 if jq -e '.services | has("pacoloco")' <<<"${publisher_json}" >/dev/null; then
   echo "Publisher 不得部署 pacoloco" >&2
   exit 1
