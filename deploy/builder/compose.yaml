@@ -10,6 +10,7 @@ services:
       args:
         AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
         AURSMITH_ARCH_MIRROR: ${AURSMITH_ARCH_MIRROR:-https://mirrors.ustc.edu.cn/archlinux}
+        AURSMITH_ARCHLINUXCN_MIRROR: ${AURSMITH_ARCHLINUXCN_MIRROR:-https://mirrors.ustc.edu.cn/archlinuxcn}
 
   worker:
     build:

@@ -33,6 +33,8 @@ docker compose --env-file runtime/deployment/builder.env \
 
 Builder 的轮询 URL 必须精确指向 `/api/v1/builder/poll`；旧 `/api/v1/reverse-workers/poll` 不兼容且应从部署环境删除。Builder secret 文件至少包括 Controller Bearer token、Publisher write-only SSH key 和 known_hosts。Bearer token 与 SSH 私钥必须属于 `AURSMITH_SECRET_GID` 对应的宿主组且权限为 `0440`；known_hosts 可以是 `0444`。仅设为创建者 `0600` 会使以 UID 10001 运行的 Worker 无法读取。AURsmith 容器不开放入站端口。Builder jobs 路径必须是宿主绝对路径，Docker Socket 只挂载给 Builder daemon，不进入临时 Build 容器。
 
+Build image 默认依次启用 Arch 官方 `core/extra/multilib` 与 `archlinuxcn`，后者使用 `AURSMITH_ARCHLINUXCN_MIRROR` 配置的 HTTPS 镜像，并通过 `archlinuxcn-keyring` 校验软件包签名。官方仓库排列在前，普通同名依赖仍优先使用官方包；当版本约束排除官方包时，pacman 才会选择后续仓库中满足约束的 Provider，例如用 `cmake3` 满足 `cmake<4.4`。
+
 ## 恢复顺序
 
 1. 停止公网单一 Compose 栈和家庭 Builder 的写入；

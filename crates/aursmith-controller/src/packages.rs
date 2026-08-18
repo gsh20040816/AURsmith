@@ -203,56 +203,40 @@ async fn collect_dependency_snapshots(
         let found: Vec<UpstreamPackage> =
             serde_json::from_value(reply.data.get("items").cloned().unwrap_or(Value::Null))
                 .map_err(ApiError::internal)?;
-        let found_names: BTreeSet<String> =
-            found.iter().map(|package| package.name.clone()).collect();
+        let provider_reply = transport::aur_providers(&state.config, &names).await?;
+        let provider_values = provider_reply
+            .data
+            .as_object()
+            .ok_or_else(|| ApiError::internal("Provider 响应不是对象"))?;
         let mut discovered = Vec::new();
-        for package in found {
-            if !names.contains(&package.name) || package.package_base == root.package_base {
-                continue;
-            }
-            resolutions.insert(package.name.clone(), package.package_base.clone());
-            discovered.push(package);
-        }
-        let unresolved: Vec<String> = names
-            .iter()
-            .filter(|name| !found_names.contains(*name))
-            .cloned()
-            .collect();
-        for chunk in unresolved.chunks(50) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let reply = transport::aur_providers(&state.config, chunk).await?;
-            let values = reply
-                .data
-                .as_object()
-                .ok_or_else(|| ApiError::internal("Provider 响应不是对象"))?;
-            for name in chunk {
-                let candidates: Vec<UpstreamPackage> =
-                    serde_json::from_value(values.get(name).cloned().unwrap_or_else(|| json!([])))
-                        .map_err(ApiError::internal)?;
-                let bases: BTreeSet<String> = candidates
-                    .iter()
-                    .map(|candidate| candidate.package_base.clone())
-                    .filter(|base| base != &root.package_base)
-                    .collect();
-                let selected = selected_providers
+        for name in &names {
+            let providers: Vec<UpstreamPackage> = serde_json::from_value(
+                provider_values
                     .get(name)
-                    .filter(|selected| bases.contains(*selected))
-                    .cloned();
-                if bases.len() == 1 || selected.is_some() {
-                    let package_base = selected
-                        .unwrap_or_else(|| bases.iter().next().expect("长度已经检查").clone());
-                    resolutions.insert(name.clone(), package_base.clone());
-                    if let Some(candidate) = candidates
-                        .into_iter()
-                        .find(|candidate| candidate.package_base == package_base)
-                    {
-                        discovered.push(candidate);
-                    }
-                } else if bases.len() > 1 {
-                    provider_candidates.insert(name.clone(), bases.into_iter().collect());
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+            .map_err(ApiError::internal)?;
+            let candidates = merge_aur_dependency_candidates(
+                name,
+                &root.package_base,
+                found.iter().filter(|package| package.name == *name),
+                providers.iter(),
+            );
+            let bases: BTreeSet<String> = candidates.keys().cloned().collect();
+            let selected = selected_providers
+                .get(name)
+                .filter(|selected| bases.contains(*selected))
+                .cloned();
+            if bases.len() == 1 || selected.is_some() {
+                let package_base =
+                    selected.unwrap_or_else(|| bases.iter().next().expect("长度已经检查").clone());
+                resolutions.insert(name.clone(), package_base.clone());
+                if let Some(candidate) = candidates.get(&package_base) {
+                    discovered.push(candidate.clone());
                 }
+            } else if bases.len() > 1 {
+                provider_candidates.insert(name.clone(), bases.into_iter().collect());
             }
         }
         for package in discovered {
@@ -295,6 +279,30 @@ async fn collect_dependency_snapshots(
         resolutions,
         provider_candidates,
     })
+}
+
+fn merge_aur_dependency_candidates<'a>(
+    dependency_name: &str,
+    root_package_base: &str,
+    exact: impl Iterator<Item = &'a UpstreamPackage>,
+    providers: impl Iterator<Item = &'a UpstreamPackage>,
+) -> BTreeMap<String, UpstreamPackage> {
+    exact
+        .chain(providers)
+        .filter(|candidate| candidate.package_base != root_package_base)
+        .filter(|candidate| {
+            candidate.name == dependency_name
+                || candidate
+                    .provides
+                    .iter()
+                    .any(|provided| dependency_name_from_spec(provided) == dependency_name)
+        })
+        .map(|candidate| (candidate.package_base.clone(), candidate.clone()))
+        .collect()
+}
+
+fn dependency_name_from_spec(value: &str) -> &str {
+    value.split(['<', '>', '=']).next().unwrap_or(value).trim()
 }
 
 async fn collect_official_dependency_names(
@@ -490,22 +498,55 @@ async fn apply_snapshot(
             .map_err(ApiError::internal)?;
         }
     }
+    let mut changed = if idempotent_revision {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([snapshot.package_base.clone()])
+    };
     for node in &dependency_closure.nodes {
-        upsert_implicit_node(
+        if upsert_implicit_node(
             &mut transaction,
             node,
             dependency_map,
             &dependency_closure.provider_candidates,
             now,
         )
-        .await?;
+        .await?
+        {
+            changed.insert(node.snapshot.package_base.clone());
+        }
     }
     recalculate_reference_counts(&mut transaction).await?;
 
     let graph = load_dependency_graph(&mut transaction).await?;
-    let changed = BTreeSet::from([snapshot.package_base.clone()]);
+    if changed.is_empty() {
+        let root_closure = graph
+            .affected_release_closure(&BTreeSet::from([snapshot.package_base.clone()]))
+            .map_err(ApiError::internal)?;
+        let active_orphans = sqlx::query(
+            "SELECT revisions.package_base FROM revisions \
+             WHERE revisions.package_base IN (SELECT package_base FROM subscriptions) \
+               AND revisions.state IN ('discovered', 'audit_pending', 'audit_approved', 'build_pending') \
+               AND NOT EXISTS (SELECT 1 FROM revisions AS newer WHERE newer.package_base = revisions.package_base AND newer.state != 'superseded' AND newer.created_at > revisions.created_at) \
+               AND NOT EXISTS (SELECT 1 FROM release_batch_revisions WHERE release_batch_revisions.revision_id = revisions.id)",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(ApiError::internal)?;
+        changed.extend(
+            active_orphans
+                .into_iter()
+                .map(|row| row.get::<String, _>("package_base"))
+                .filter(|package_base| root_closure.contains(package_base)),
+        );
+    }
+    let batch_seed = if changed.is_empty() {
+        BTreeSet::from([snapshot.package_base.clone()])
+    } else {
+        changed.clone()
+    };
     let batch_packages = graph
-        .affected_release_closure(&changed)
+        .affected_release_closure(&batch_seed)
         .map_err(ApiError::internal)?;
     let batch_graph = graph
         .induced_subgraph(&batch_packages)
@@ -515,7 +556,7 @@ async fn apply_snapshot(
     let batch_has_blocker = blocked_rows
         .iter()
         .any(|row| batch_packages.contains(&row.get::<String, _>("package_base")));
-    let (batch_id, batch_state) = if idempotent_revision {
+    let (batch_id, batch_state) = if changed.is_empty() {
         (None, "unchanged")
     } else {
         let batch_id = Uuid::new_v4().to_string();
@@ -1509,7 +1550,7 @@ async fn upsert_implicit_node(
     dependency_map: &BTreeMap<String, String>,
     provider_candidates: &BTreeMap<String, Vec<String>>,
     now: chrono::DateTime<Utc>,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let snapshot = &node.snapshot;
     let package = &node.package;
     let metadata = serde_json::to_value(snapshot).map_err(ApiError::internal)?;
@@ -1552,7 +1593,7 @@ async fn upsert_implicit_node(
         .await
         .map_err(ApiError::internal)?;
     supersede_other_revisions(transaction, snapshot, &provider_selection_sha256).await?;
-    let revision_id: String = sqlx::query_scalar(
+    let existing_revision: Option<String> = sqlx::query_scalar(
         "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ? ORDER BY rebuild_generation DESC LIMIT 1",
     )
     .bind(&snapshot.package_base)
@@ -1561,8 +1602,9 @@ async fn upsert_implicit_node(
     .bind(&provider_selection_sha256)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(ApiError::internal)?
-    .unwrap_or_else(|| Uuid::new_v4().to_string());
+    .map_err(ApiError::internal)?;
+    let created = existing_revision.is_none();
+    let revision_id = existing_revision.unwrap_or_else(|| Uuid::new_v4().to_string());
     sqlx::query(
         "INSERT OR IGNORE INTO revisions(id, package_base, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, state, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, 'v1', ?, 'discovered', ?, ?)",
     )
@@ -1627,7 +1669,7 @@ async fn upsert_implicit_node(
                 .map_err(ApiError::internal)?;
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 async fn load_dependency_graph(
@@ -1782,6 +1824,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aur_dependency_candidates_include_exact_names_and_provides() {
+        let exact = UpstreamPackage {
+            name: "tool".into(),
+            package_base: "tool".into(),
+            version: "4.0-1".into(),
+            description: None,
+            maintainer: Some("tester".into()),
+            out_of_date: None,
+            last_modified: 1,
+            depends: vec![],
+            make_depends: vec![],
+            check_depends: vec![],
+            opt_depends: vec![],
+            provides: vec![],
+        };
+        let provider = UpstreamPackage {
+            name: "tool3".into(),
+            package_base: "tool3".into(),
+            version: "3.2-1".into(),
+            provides: vec!["tool=3.2".into()],
+            ..exact.clone()
+        };
+        let unrelated = UpstreamPackage {
+            name: "tool-docs".into(),
+            package_base: "tool-docs".into(),
+            provides: vec!["other-tool".into()],
+            ..exact.clone()
+        };
+
+        let candidates = merge_aur_dependency_candidates(
+            "tool",
+            "root",
+            [&exact].into_iter(),
+            [&provider, &unrelated].into_iter(),
+        );
+
+        assert_eq!(
+            candidates.keys().cloned().collect::<Vec<_>>(),
+            vec!["tool".to_owned(), "tool3".to_owned()]
+        );
+    }
+
     fn snapshot() -> UpstreamSnapshot {
         UpstreamSnapshot {
             package_base: "demo".into(),
@@ -1803,6 +1888,47 @@ mod tests {
         DependencyClosure {
             nodes: vec![],
             resolutions: BTreeMap::new(),
+            provider_candidates: BTreeMap::new(),
+        }
+    }
+
+    fn dependency_node(version: &str, commit: char) -> SnapshotNode {
+        SnapshotNode {
+            package: UpstreamPackage {
+                name: "aur-dep".into(),
+                package_base: "aur-dep".into(),
+                version: version.into(),
+                description: None,
+                maintainer: Some("tester".into()),
+                out_of_date: None,
+                last_modified: 2,
+                depends: vec![],
+                make_depends: vec![],
+                check_depends: vec![],
+                opt_depends: vec![],
+                provides: vec![],
+            },
+            snapshot: UpstreamSnapshot {
+                package_base: "aur-dep".into(),
+                aur_commit: commit.to_string().repeat(40),
+                vcs_commit: None,
+                version: version.into(),
+                outputs: vec!["aur-dep".into()],
+                dependencies: vec![],
+                optional_dependencies: vec![],
+                provides: vec![],
+                architectures: vec!["x86_64".into()],
+                sources: vec![],
+                srcinfo: "pkgbase = aur-dep".into(),
+                files: vec![],
+            },
+        }
+    }
+
+    fn dependency_closure(node: SnapshotNode) -> DependencyClosure {
+        DependencyClosure {
+            nodes: vec![node],
+            resolutions: BTreeMap::from([("aur-dep".into(), "aur-dep".into())]),
             provider_candidates: BTreeMap::new(),
         }
     }
@@ -1846,6 +1972,87 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(direct, 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_root_creates_a_batch_when_an_implicit_dependency_changes() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let mut root = snapshot();
+        root.dependencies.push(SnapshotDependency {
+            name: "aur-dep".into(),
+            kind: "build".into(),
+        });
+        apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &root,
+            &[],
+            &dependency_closure(dependency_node("1.0-1", 'b')),
+        )
+        .await
+        .unwrap();
+
+        let updated = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &root,
+            &[],
+            &dependency_closure(dependency_node("2.0-1", 'c')),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated["idempotent"], true);
+        assert!(updated["batch_id"].is_string());
+        let batch_id = updated["batch_id"].as_str().unwrap();
+        let members: Vec<(String, String)> = sqlx::query_as(
+            "SELECT revisions.package_base, revisions.upstream_version FROM release_batch_revisions JOIN revisions ON revisions.id = release_batch_revisions.revision_id WHERE release_batch_revisions.batch_id = ? ORDER BY release_batch_revisions.build_order",
+        )
+        .bind(batch_id)
+        .fetch_all(&database)
+        .await
+        .unwrap();
+        assert_eq!(
+            members,
+            vec![
+                ("aur-dep".into(), "2.0-1".into()),
+                ("demo".into(), "1.0-1".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_sync_repairs_an_active_dependency_revision_without_a_batch() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let mut root = snapshot();
+        root.dependencies.push(SnapshotDependency {
+            name: "aur-dep".into(),
+            kind: "build".into(),
+        });
+        let closure = dependency_closure(dependency_node("1.0-1", 'b'));
+        apply_snapshot(&database, "tester", &package(), &root, &[], &closure)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM release_batch_revisions WHERE revision_id IN (SELECT id FROM revisions WHERE package_base = 'aur-dep')")
+            .execute(&database)
+            .await
+            .unwrap();
+
+        let repaired = apply_snapshot(&database, "tester", &package(), &root, &[], &closure)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired["idempotent"], true);
+        assert!(repaired["batch_id"].is_string());
+        let repaired_members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM release_batch_revisions WHERE batch_id = ?")
+                .bind(repaired["batch_id"].as_str().unwrap())
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        assert_eq!(repaired_members, 2);
     }
 
     #[tokio::test]

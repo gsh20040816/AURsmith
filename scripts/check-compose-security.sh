@@ -73,6 +73,15 @@ if [[ "$(jq -r '.services["build-image"].image // ""' <<<"${build_image_json}")"
   echo "Build image 必须只负责构建固定 tag，禁止挂载 Socket、目录或 secret" >&2
   exit 1
 fi
+if [[ "$(jq -r '.services["build-image"].build.args.AURSMITH_ARCHLINUXCN_MIRROR // ""' <<<"${build_image_json}")" != https://* ]]; then
+  echo "Build image 的 archlinuxcn 镜像必须使用 HTTPS" >&2
+  exit 1
+fi
+if ! rg -q 'pacman-key --init' deploy/images/build.Dockerfile \
+  || ! rg -q 'pacman-key --populate archlinux archlinuxcn' deploy/images/build.Dockerfile; then
+  echo "Build image 必须初始化并载入 Arch Linux 与 archlinuxcn 的包签名信任库" >&2
+  exit 1
+fi
 if jq -e '.services | has("ssh")' <<<"${builder_json}" >/dev/null \
   || jq -e '.services.worker.ports[]?' <<<"${builder_json}" >/dev/null; then
   echo "反向 Builder 禁止 SSH sidecar 和公网入站端口" >&2
