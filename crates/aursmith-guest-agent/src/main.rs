@@ -299,8 +299,16 @@ fn classify_makepkg_failure_text(text: &str) -> &'static str {
         "BUILD_NETWORK_TRANSIENT"
     } else if text.contains("did not pass the validity check") || text.contains("checksum") {
         "GUEST_CHECKSUM_FAILED"
-    } else if text.contains("unknown public key")
-        || text.contains("signature") && text.contains("failed")
+    } else if [
+        "unknown public key",
+        "pgp signatures could not be verified",
+        "signature verification failed",
+        "bad signature",
+        "signature is unknown trust",
+        "invalid or corrupted package (pgp signature)",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
     {
         "GUEST_PGP_FAILED"
     } else if text.contains("a failure occurred in check()") {
@@ -535,6 +543,22 @@ mod tests {
                 "curl: (22) the requested url returned error: 404\n==> error: failure while downloading"
             ),
             "GUEST_BUILD_FAILED"
+        );
+    }
+
+    #[test]
+    fn unrelated_signature_and_failed_lines_are_not_a_pgp_failure() {
+        assert_eq!(
+            classify_makepkg_failure_text(
+                "gpg: public key ABC is newer than the signature\n-- Performing Test FEATURE - Failed\nCMake Error at CMakeLists.txt:1"
+            ),
+            "GUEST_BUILD_FAILED"
+        );
+        assert_eq!(
+            classify_makepkg_failure_text(
+                "==> error: one or more pgp signatures could not be verified!"
+            ),
+            "GUEST_PGP_FAILED"
         );
     }
 
