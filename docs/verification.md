@@ -52,7 +52,7 @@
 - 提交 `f6c323f` 删除按 pkgbase 后缀启用 Git 跟踪的门槛，改为解析 `.SRCINFO` 中的 `git+https://` source；普通 archive source 的回归用例确认不会误判。Controller 的 `vcs_kind` 也改由已经成功固定的 VCS commit 得出，不再猜测包名。
 - 本地完整测试、Web 生产构建、Compose 安全检查和全 workspace Clippy 通过；真实上游 smoke 成功为 `wallpaper-engine-kde-plugin-new-fork` 解析 40 位 Git commit。
 - 生产 Controller 与 Publisher 镜像均部署 revision `f6c323f` 且健康。该包原有显式订阅的旧 Revision 因后缀误判留下 `vcs_commit = NULL`；正式 refresh 后，新 Revision `92cecdfe-e3a9-43f4-a2be-1db425ffea71` 在同一 AUR commit `b1456d2352febe65ee5bcf5961826926e2068a22` 下固定上游 commit `5c9328efe89b529eaf8a77cfab323c1bb46bd2de`，旧 Revision 已 supersede。
-- 新 Revision 复用相同 AUR 包装层的既有批准并进入真实 Builder 调度；记录时 Job `8ffe4957-6ad1-40fc-9833-8ed153be2cd8` 为 `dispatched`，尚未声称构建成功。生产 Doctor `ready: true`，Controller 数据库完整性为 `ok` 且无外键错误。
+- 新 Revision 复用相同 AUR 包装层的既有批准并进入真实 Builder；`pkgver()` 正确生成动态版本 `1.4.r10.g5c9328e-1`。Job `8ffe4957-6ad1-40fc-9833-8ed153be2cd8` 随后准确返回 `GUEST_BUILD_FAILED`：上游源码要求 `Qt6WebEngineCore`，但当前 PKGBUILD 未声明 `qt6-webengine`，构建环境中不存在相应 CMake config。这是 AUR 配方缺失依赖，AURsmith 没有越过审计输入自动补包。生产 Doctor `ready: true`，Controller 数据库完整性为 `ok` 且无外键错误。
 - 部署前在线备份位于 `/opt/aursmith/runtime/deployment-backups/20260818T080732Z-suffixless-vcs/`；Controller 与 Publisher Worker SHA-256 分别为 `44b35420c02e6059071f87139eed38d4861d3681fb2b33d92637a5caaf0b0472`、`9e90d95fff02c131bbdeae1404720b1409015bf07ade26ed4a1731708d136ad1`。
 
 ## 外部代理缓存说明
