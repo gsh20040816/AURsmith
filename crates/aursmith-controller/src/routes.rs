@@ -94,6 +94,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/releases/{id}/rollback",
             post(crate::packages::rollback_release),
         )
+        .route(
+            "/api/v1/releases/{id}/retry",
+            post(crate::packages::retry_release),
+        )
         .route("/api/{*path}", any(api_not_found))
         .fallback_service(
             ServeDir::new("/srv").not_found_service(ServeFile::new("/srv/index.html")),

@@ -231,17 +231,23 @@ secrets:
 volumes:
   controller-data:
     name: aursmith-controller_controller-data
+    external: true
   controller-run:
   publisher-run:
     name: aursmith-publisher_worker-run
+    external: true
   publisher-state:
     name: aursmith-publisher_publisher-state
+    external: true
   publisher-landing:
     name: aursmith-publisher_publisher-landing
+    external: true
   publisher-staging:
     name: aursmith-publisher_publisher-staging
+    external: true
   publisher-hot:
     name: aursmith-publisher_publisher-hot
+    external: true
 
 networks:
   agent-low-1-control:

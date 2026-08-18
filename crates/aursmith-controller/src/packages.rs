@@ -1,6 +1,6 @@
 use crate::{auth, error::ApiError, routes::AppState, transport};
 use aursmith_domain::{AuditFile, DependencyGraph, FindingSeverity, scan_aur_wrapper};
-use aursmith_protocol::ReleaseRollbackRequest;
+use aursmith_protocol::{ReleasePlan, ReleaseRollbackRequest};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -984,18 +984,97 @@ pub async fn list_releases(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     auth::require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("WITH current AS (SELECT json_extract(value_json, '$') AS id FROM system_settings WHERE key = 'current_release_id') SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.committed_at, releases.created_at, release_jobs.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count FROM releases LEFT JOIN release_jobs ON release_jobs.release_id = releases.id WHERE releases.state = 'committed' ORDER BY CASE WHEN releases.id = (SELECT id FROM current) THEN 0 ELSE 1 END, releases.committed_at DESC LIMIT 2")
+    let rows = sqlx::query("WITH current AS (SELECT json_extract(value_json, '$') AS id FROM system_settings WHERE key = 'current_release_id'), previous AS (SELECT id FROM releases WHERE state = 'committed' AND id != COALESCE((SELECT id FROM current), '') ORDER BY committed_at DESC LIMIT 1) SELECT releases.id, releases.batch_id, releases.state, releases.manifest_sha256, releases.committed_at, releases.created_at, release_jobs.last_error, (SELECT COUNT(*) FROM release_artifacts WHERE release_artifacts.release_id = releases.id) AS artifact_count, CASE WHEN releases.id = (SELECT id FROM current) THEN 'current' WHEN releases.id = (SELECT id FROM previous) THEN 'previous' ELSE 'failed' END AS position FROM releases LEFT JOIN release_jobs ON release_jobs.release_id = releases.id WHERE releases.id = (SELECT id FROM current) OR releases.id = (SELECT id FROM previous) OR releases.state = 'failed' ORDER BY CASE WHEN releases.id = (SELECT id FROM current) THEN 0 WHEN releases.id = (SELECT id FROM previous) THEN 1 ELSE 2 END, releases.created_at DESC LIMIT 12")
         .fetch_all(&state.database).await.map_err(ApiError::internal)?;
     Ok(Json(json!({"items": rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>("id"),
         "batch_id": row.get::<String,_>("batch_id"),
         "state": row.get::<String,_>("state"),
+        "position": row.get::<String,_>("position"),
         "manifest_sha256": row.get::<String,_>("manifest_sha256"),
         "artifact_count": row.get::<i64,_>("artifact_count"),
         "last_error": row.get::<Option<String>,_>("last_error"),
         "committed_at": row.get::<Option<String>,_>("committed_at"),
         "created_at": row.get::<String,_>("created_at"),
     })).collect::<Vec<_>>() })))
+}
+
+pub async fn retry_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(release_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_administrator(&state, &headers).await?;
+    let new_release_id = retry_failed_release(&state.database, &release_id, Utc::now()).await?;
+    Ok(Json(json!({
+        "failed_release_id": release_id,
+        "release_id": new_release_id,
+        "state": "issued",
+    })))
+}
+
+async fn retry_failed_release(
+    database: &SqlitePool,
+    failed_release_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<String, ApiError> {
+    Uuid::parse_str(failed_release_id)
+        .map_err(|_| ApiError::bad_request("INVALID_RELEASE", "Release ID 无效"))?;
+    let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+    let row = sqlx::query(
+        "SELECT releases.batch_id, releases.source_git_commit, release_jobs.plan_json \
+         FROM releases JOIN release_jobs ON release_jobs.release_id = releases.id \
+         JOIN release_batches ON release_batches.id = releases.batch_id \
+         WHERE releases.id = ? AND releases.state = 'failed' \
+           AND release_jobs.state = 'failed' AND release_batches.state = 'publish_failed'",
+    )
+    .bind(failed_release_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| {
+        ApiError::conflict(
+            "RELEASE_NOT_RETRYABLE",
+            "Release 不存在、未失败或所属批次已恢复",
+        )
+    })?;
+    let batch_id: String = row.get("batch_id");
+    let source_git_commit: String = row.get("source_git_commit");
+    let mut plan: ReleasePlan =
+        serde_json::from_str(row.get("plan_json")).map_err(ApiError::internal)?;
+    let new_release_id = Uuid::new_v4();
+    plan.release_id = new_release_id;
+    plan.issued_at = now;
+    plan.expires_at = now + Duration::hours(1);
+    let claimed = sqlx::query(
+        "UPDATE release_batches SET state = 'publishing', failure_reason = NULL, updated_at = ? \
+         WHERE id = ? AND state = 'publish_failed'",
+    )
+    .bind(now)
+    .bind(&batch_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::internal)?;
+    if claimed.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "RELEASE_NOT_RETRYABLE",
+            "Release 批次已被其他重试占用",
+        ));
+    }
+    sqlx::query("INSERT INTO releases(id, batch_id, state, manifest_sha256, source_git_commit, created_at) VALUES (?, ?, 'authorizing', ?, ?, ?)")
+        .bind(new_release_id.to_string()).bind(&batch_id)
+        .bind(format!("pending:{new_release_id}")).bind(source_git_commit).bind(now)
+        .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO release_jobs(release_id, state, plan_json, expires_at, created_at, updated_at) VALUES (?, 'issued', ?, ?, ?, ?)")
+        .bind(new_release_id.to_string())
+        .bind(serde_json::to_string(&plan).map_err(ApiError::internal)?)
+        .bind(plan.expires_at).bind(now).bind(now)
+        .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO release_artifacts(release_id, artifact_sha256) SELECT ?, artifact_sha256 FROM release_artifacts WHERE release_id = ?")
+        .bind(new_release_id.to_string()).bind(failed_release_id)
+        .execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(new_release_id.to_string())
 }
 
 pub async fn rollback_release(
@@ -2528,5 +2607,68 @@ mod tests {
         assert!(first > after && first <= after + Duration::minutes(30));
         assert!(second > after && second <= after + Duration::minutes(30));
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn failed_release_retry_reuses_plan_with_a_new_identity() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let batch_id = Uuid::new_v4();
+        let failed_release_id = Uuid::new_v4();
+        let now = Utc::now();
+        let plan = ReleasePlan {
+            release_id: failed_release_id,
+            batch_id,
+            repository_name: "aursmith".into(),
+            source_git_commit: "test".into(),
+            artifacts: vec![aursmith_protocol::ArtifactRecord {
+                path: "demo-1-1-x86_64.pkg.tar.zst".into(),
+                sha256: "a".repeat(64),
+                size: 1,
+                package_name: Some("demo".into()),
+                package_version: Some("1-1".into()),
+                architecture: Some("x86_64".into()),
+            }],
+            removed_package_names: vec![],
+            include_repository_keyring: true,
+            issued_at: now - Duration::hours(2),
+            expires_at: now - Duration::hours(1),
+        };
+        sqlx::query("INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, 'publish_failed', '{\"keyring_only\":true}', 'fakeroot missing', ?, ?)")
+            .bind(batch_id.to_string()).bind(now).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO releases(id, batch_id, state, manifest_sha256, source_git_commit, created_at) VALUES (?, ?, 'failed', ?, 'test', ?)")
+            .bind(failed_release_id.to_string()).bind(batch_id.to_string())
+            .bind(format!("pending:{failed_release_id}")).bind(now).execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO release_jobs(release_id, state, plan_json, last_error, expires_at, created_at, updated_at) VALUES (?, 'failed', ?, 'fakeroot missing', ?, ?, ?)")
+            .bind(failed_release_id.to_string()).bind(serde_json::to_string(&plan).unwrap())
+            .bind(plan.expires_at).bind(now).bind(now).execute(&database).await.unwrap();
+
+        let retried = retry_failed_release(&database, &failed_release_id.to_string(), now)
+            .await
+            .unwrap();
+
+        assert_ne!(retried, failed_release_id.to_string());
+        let retried_plan: String =
+            sqlx::query_scalar("SELECT plan_json FROM release_jobs WHERE release_id = ?")
+                .bind(&retried)
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        let retried_plan: ReleasePlan = serde_json::from_str(&retried_plan).unwrap();
+        assert_eq!(retried_plan.release_id.to_string(), retried);
+        assert_eq!(retried_plan.batch_id, batch_id);
+        assert_eq!(retried_plan.artifacts, plan.artifacts);
+        assert!(retried_plan.expires_at > now);
+        let batch_state: String =
+            sqlx::query_scalar("SELECT state FROM release_batches WHERE id = ?")
+                .bind(batch_id.to_string())
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        assert_eq!(batch_state, "publishing");
+        assert!(
+            retry_failed_release(&database, &failed_release_id.to_string(), now)
+                .await
+                .is_err()
+        );
     }
 }

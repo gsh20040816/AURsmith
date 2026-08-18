@@ -116,6 +116,7 @@ export type Release = {
   id: string;
   batch_id: string;
   state: string;
+  position: "current" | "previous" | "failed";
   manifest_sha256: string;
   artifact_count: number;
   last_error: string | null;
@@ -158,6 +159,11 @@ export const api = {
     server_rolled_back: boolean;
     client_auto_downgrade: false;
   }>(`/api/v1/releases/${encodeURIComponent(id)}/rollback`, { method: "POST" }),
+  retryRelease: (id: string) => request<{
+    failed_release_id: string;
+    release_id: string;
+    state: "issued";
+  }>(`/api/v1/releases/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   clientBootstrap: () => request<ClientBootstrap>("/api/v1/client-bootstrap"),
   doctor: () => request<Doctor>("/api/v1/doctor"),
   decideAudit: (bundle: string, approve: boolean, rationale: string) =>

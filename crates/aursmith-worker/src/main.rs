@@ -1041,7 +1041,9 @@ async fn authorize_release(worker: &Worker, authorization: ReleasePlan) -> Worke
         return WorkerResponse::error("WRONG_ROLE", "只有 Publisher 可以提交 Release");
     }
     if authorization.expires_at < Utc::now()
-        || (authorization.artifacts.is_empty() && authorization.removed_package_names.is_empty())
+        || (authorization.artifacts.is_empty()
+            && authorization.removed_package_names.is_empty()
+            && !authorization.include_repository_keyring)
     {
         return WorkerResponse::error("INVALID_RELEASE", "ReleasePlan 已过期或为空");
     }
@@ -1083,8 +1085,11 @@ async fn authorize_release(worker: &Worker, authorization: ReleasePlan) -> Worke
 }
 
 fn validate_release_plan(authorization: &ReleasePlan) -> anyhow::Result<()> {
-    if authorization.artifacts.is_empty() && authorization.removed_package_names.is_empty() {
-        bail!("Release 没有软件包或清除目标");
+    if authorization.artifacts.is_empty()
+        && authorization.removed_package_names.is_empty()
+        && !authorization.include_repository_keyring
+    {
+        bail!("Release 没有软件包、清除目标或 keyring");
     }
     let mut paths = std::collections::BTreeSet::new();
     let mut package_names = std::collections::BTreeSet::new();
@@ -3041,6 +3046,10 @@ mod transfer_tests {
         authorization.artifacts[0].path = "nested/fixture-1-1-any.pkg.tar.zst".into();
         assert!(validate_release_plan(&authorization).is_err());
         authorization.artifacts.clear();
+        assert!(
+            validate_release_plan(&authorization).is_ok(),
+            "空仓库必须允许 keyring-only Release"
+        );
         authorization.removed_package_names = vec!["fixture".into()];
         assert!(validate_release_plan(&authorization).is_ok());
         authorization.removed_package_names = vec!["../fixture".into()];
