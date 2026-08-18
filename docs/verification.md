@@ -22,7 +22,7 @@
 
 ## 2026-08-18：真实部署与端到端验证
 
-- 公网设备已合并为单个 `deploy/controller/compose.yaml` 项目；服务器主线和部署配置位于 `938cb29`。Controller、Publisher、Publisher SSH 与家庭 Builder 的运行镜像代码为 `b22a004`；Agent 镜像为 `889f36e`，后续两个提交没有修改 Agent Runner；
+- 公网设备已合并为单个 `deploy/controller/compose.yaml` 项目；服务器主线、Controller、Publisher、Publisher SSH 与家庭 Builder 均部署 `930a552`。Agent 镜像为 `889f36e`，后续提交没有修改 Agent Runner；
 - 生产 Doctor 返回 `ready: true`：Builder 最近轮询、仓库 GPG、TLS、三个低成本 Agent、高成本 Agent 和 Publisher AUR RPC 全部正常；
 - keyring 失败恢复已真实验证：失败 Release `b81c0d0d-d6ed-465e-916f-3ff2a487ab3d` 通过显式 retry 创建新身份 `e567208f-0c61-4237-b539-92c6949744e3`，复用原已验证计划并成功提交，没有重新构建包；
 - Publisher 已生成真实 `aursmith-keyring 1:1-1`。generation 为 1，固定指纹为 `BE59BEA40D9F50E7DA64BCBAFE313D9CC82D812D`，发布时间为 `2026-08-18T05:51:55.985818795Z`，下次到期时间为 `2026-09-17T05:51:55.985818795Z`；
@@ -35,6 +35,7 @@
 - 删除临时订阅后，清理 Release `fe5a20df-82b2-45bc-a9cc-5bd052c0a90e` 成功提交，Manifest SHA-256 为 `67acd9429bbe34636afd998d2b9f71d63469a31687ecb03ec841504111997ca2`，当前仓库数据库不再包含测试包；
 - 真实回滚到 `7e267811-8ae0-4548-84f0-e02b98ae0d07` 后，公网数据库重新包含测试包；随后恢复 `fe5a20df-82b2-45bc-a9cc-5bd052c0a90e`，公网数据库再次移除测试包；
 - Publisher 最终只保留上述 current/previous 两个 Release 目录，Controller current 指针为 `fe5a20df-82b2-45bc-a9cc-5bd052c0a90e`，临时订阅数量为 0；Controller 和 Publisher 数据库完整性检查通过。
+- 严格协议版本部署后，家庭 Builder 健康检查为 healthy，生产 Doctor 再次返回 `ready: true` 且 Builder 最近轮询正常；current/previous API 与上述两个 Release 及 Manifest 摘要一致。
 
 ## 外部代理缓存说明
 
