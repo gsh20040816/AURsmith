@@ -4,7 +4,7 @@
 
 ## 2026-08-18：本地验证
 
-- `./scripts/test-all.sh` 通过；Rust 共 123 项：Agent Gateway 2、Agent Runner 11、Controller 52、Domain 13、Guest Agent 5、Protocol 5、Repository 6、Worker 23、CLI 6；
+- `./scripts/test-all.sh` 通过；Rust 共 128 项：Agent Gateway 2、Agent Runner 11、Controller 55、Domain 13、Guest Agent 6、Protocol 5、Repository 6、Worker 24、CLI 6；
 - 前端类型检查、6 个 Vitest 用例和 Vite 生产构建通过；
 - `cargo clippy --workspace --all-targets -- -D warnings` 通过；
 - Compose 安全检查通过；Repository 测试实际调用 Arch `repo-add`/`repo-remove`、`makepkg` 和 GPG 生成 keyring 包；
@@ -36,6 +36,16 @@
 - 真实回滚到 `7e267811-8ae0-4548-84f0-e02b98ae0d07` 后，公网数据库重新包含测试包；随后恢复 `fe5a20df-82b2-45bc-a9cc-5bd052c0a90e`，公网数据库再次移除测试包；
 - Publisher 最终只保留上述 current/previous 两个 Release 目录，Controller current 指针为 `fe5a20df-82b2-45bc-a9cc-5bd052c0a90e`，临时订阅数量为 0；Controller 和 Publisher 数据库完整性检查通过。
 - 严格协议版本部署后，家庭 Builder 健康检查为 healthy，生产 Doctor 再次返回 `ready: true` 且 Builder 最近轮询正常；current/previous API 与上述两个 Release 及 Manifest 摘要一致。
+
+## 2026-08-18：依赖 Provider 与失败批次修复
+
+- 提交 `c71ca8b` 修复了根 Revision 未变化时遗漏新版隐式依赖 Revision 的批次创建，并在重复同步时恢复既有未入批次的活动 Revision；生产修复批次 `beda37e4-03bb-45ce-9eae-a1e41dd6ac43` 按 `vulkan-memory-allocator → waywallen-display → waywallen → open-wallpaper-engine` 排序创建 Job，前三项真实构建成功。
+- Build image 增加位于官方仓库之后的 `archlinuxcn`、独立 HTTPS 镜像配置和完整 pacman keyring 初始化。一次性容器和生产 Job 都成功验签安装 `archlinuxcn/cmake3 3.31.6-13` 来满足配方声明的 `cmake<4.4`；Build image revision 为 `96eca75`。
+- `open-wallpaper-engine 0.2.3-1` 随后被源码自身拒绝：源码要求 CMake `>=4.3.1`，PKGBUILD 却只声明 `<4.4`；当前 Arch 为 4.4.2，archlinuxcn/AUR 的 `cmake3` 为 3.31.6，均不满足真实区间，因此该原子批次以 `GUEST_BUILD_FAILED` 结束，没有伪装发布前三个产物。
+- 提交 `ed220ce` 将 AUR `search?by=provides` 的简略候选再次通过 `info` 批量补全。生产 Publisher Unix Socket 的 `aur-providers cmake` 实测返回 `cmake-git` 与 `cmake3`，并分别带有 `Provides=[cmake]` 与 `Provides=[cmake=3.31.6]`。
+- `webkit2gtk-imgpaste 2.50.6-1` 的 PKGBUILD 只声明无版本 `cmake`，pacman 因而正确选择官方 4.4.2；其 WebKit 2.50.6 源码在 `WebKitMacros.cmake:311` 不兼容 CMake 4.4。提交 `96eca75` 收紧失败分类，避免把无关的 signature 文本与 CMake `Failed` 拼成 PGP 错误；生产复验 Job `a97a9a9c-d109-4d20-8cd5-34751ad8e32b` 准确返回 `GUEST_BUILD_FAILED`。旧误分类只更正 Job/Batch failure code，并写入 `manual_actions`，原始日志和审查证据未改。
+- 两个隐式依赖新 Revision 均有 3/3 独立低成本 Agent 批准；重建 Revision 的摘要复用链已追溯到各自 3/3 原始批准。生产 Doctor 最终 `ready: true`，Controller 数据库完整性为 `ok` 且无外键错误。
+- 本轮备份目录为 `/opt/aursmith/runtime/deployment-backups/20260818T071546Z-dependency-resolution/`；初始 Controller、Publisher Worker 和误分类修正前 Controller 备份 SHA-256 分别为 `59c037b36ff6feca194009aad45d19a706bd6ed1230cb7e70c47ad8a66368fd1`、`9e90d95fff02c131bbdeae1404720b1409015bf07ade26ed4a1731708d136ad1`、`6cdf08ca531c41d2697c4183e13813d8f4414720a699916a1c5a2bc05001563f`。
 
 ## 外部代理缓存说明
 
