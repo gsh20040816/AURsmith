@@ -130,7 +130,12 @@ impl AurClient {
     }
 
     pub async fn providers(&self, dependency: &str) -> anyhow::Result<Vec<AurPackage>> {
-        self.search_by(dependency, "provides").await
+        let matches = self.search_by(dependency, "provides").await?;
+        let names = provider_info_names(&matches);
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.info(&names).await
     }
 
     async fn search_by(&self, query: &str, field: &str) -> anyhow::Result<Vec<AurPackage>> {
@@ -253,6 +258,15 @@ impl AurClient {
         }
         unreachable!("固定次数的上游请求循环必须返回结果")
     }
+}
+
+fn provider_info_names(matches: &[AurPackage]) -> Vec<String> {
+    matches
+        .iter()
+        .map(|package| package.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn official_package_matches(package: &OfficialPackage, name: &str) -> bool {
@@ -754,6 +768,33 @@ mod tests {
         assert!(validate_package_base("../evil").is_err());
         assert!(validate_package_base("demo;touch").is_err());
         assert!(validate_package_base("valid-bin").is_ok());
+    }
+
+    #[test]
+    fn provider_search_results_are_hydrated_by_unique_package_name() {
+        let package = |name: &str| AurPackage {
+            name: name.into(),
+            package_base: name.into(),
+            version: "1-1".into(),
+            description: None,
+            maintainer: None,
+            out_of_date: None,
+            last_modified: 1,
+            depends: vec![],
+            make_depends: vec![],
+            check_depends: vec![],
+            opt_depends: vec![],
+            provides: vec![],
+        };
+
+        assert_eq!(
+            provider_info_names(&[
+                package("virtual-z"),
+                package("virtual-a"),
+                package("virtual-z")
+            ]),
+            ["virtual-a", "virtual-z"]
+        );
     }
 
     #[test]
