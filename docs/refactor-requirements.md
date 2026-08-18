@@ -107,7 +107,7 @@ AUR 依赖解析只服务当前订阅闭包：
 
 系统使用一个全局可配置检查周期，并按 `pkgbase` 做确定性错峰，避免同一时刻并发查询全部包。管理员可以手工刷新单个包。
 
-普通包在 AUR commit 变化时进入新一轮审查。Git VCS 包还应跟踪 `.SRCINFO` 中声明的 Git 上游精确 commit；只有上游 commit 变化而 AUR 包装 tree 不变时，复用该包装 tree 的既有批准，记录新的精确 VCS commit 并直接创建 Build，不重复调用 3+1，也不把复用描述成审计了新上游源码。AUR 包装 tree 同时变化时仍按正常 full/diff 规则重新审查。非 fast-forward 历史重写视为普通 VCS commit 变化，不保留祖先关系门禁或专用人工审批。
+普通包在 AUR commit 变化时进入新一轮审查。Git VCS 包必须按 `.SRCINFO` 中解析后的 `git+https://` source 识别，不依赖包名是否带 `-git` 后缀，并跟踪该上游的精确 commit；只有上游 commit 变化而 AUR 包装 tree 不变时，复用该包装 tree 的既有批准，记录新的精确 VCS commit 并直接创建 Build，不重复调用 3+1，也不把复用描述成审计了新上游源码。AUR 包装 tree 同时变化时仍按正常 full/diff 规则重新审查。非 fast-forward 历史重写视为普通 VCS commit 变化，不保留祖先关系门禁或专用人工审批。
 
 Arch 官方依赖版本变化不触发检测、提示或自动重建。管理员可以手工重建当前已批准 commit；手工重建仍使用上游原版本和原 `pkgrel`，不派生本地版本。系统必须在 UI 中明确说明该制品不会通过常规版本比较自动升级客户端，并显示同名制品替换风险。
 

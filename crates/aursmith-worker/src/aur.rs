@@ -238,9 +238,7 @@ impl AurClient {
         let srcinfo = run_git_output(temporary.path(), &["show", "HEAD:.SRCINFO"]).await?;
         let mut snapshot = parse_srcinfo(package_base, commit, srcinfo)?;
         snapshot.files = collect_snapshot_files(temporary.path()).await?;
-        if package_base.ends_with("-git") {
-            snapshot.vcs_commit = resolve_git_vcs_commit(&snapshot.sources).await?;
-        }
+        snapshot.vcs_commit = resolve_git_vcs_commit(&snapshot.sources).await?;
         Ok(snapshot)
     }
 
@@ -413,13 +411,7 @@ async fn run_git_output(directory: &Path, arguments: &[&str]) -> anyhow::Result<
 }
 
 async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<String>> {
-    let Some(source) = sources.iter().find(|source| {
-        source
-            .split_once("::")
-            .map(|(_, value)| value)
-            .unwrap_or(source)
-            .starts_with("git+https://")
-    }) else {
+    let Some(source) = git_vcs_source(sources) else {
         return Ok(None);
     };
     let source = source
@@ -503,6 +495,16 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
         .map(|(commit, _)| commit.clone())
         .ok_or_else(|| anyhow::anyhow!("Git VCS 上游没有返回目标 ref"))?;
     Ok(Some(commit))
+}
+
+fn git_vcs_source(sources: &[String]) -> Option<&str> {
+    sources.iter().find_map(|source| {
+        let value = source
+            .split_once("::")
+            .map(|(_, value)| value)
+            .unwrap_or(source);
+        value.starts_with("git+https://").then_some(value)
+    })
 }
 
 fn parse_git_advertisement(body: &[u8]) -> Vec<(String, String)> {
@@ -827,5 +829,25 @@ mod tests {
             "0123456789012345678901234567890123456789".into(),
             "refs/heads/main".into()
         )));
+    }
+
+    #[test]
+    fn git_vcs_source_is_detected_without_a_git_package_suffix() {
+        let sources = vec!["wallpaper-engine::git+https://example.org/wallpaper-engine.git".into()];
+
+        assert_eq!(
+            git_vcs_source(&sources),
+            Some("git+https://example.org/wallpaper-engine.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_sources_are_not_misclassified_as_git_vcs() {
+        let resolved =
+            resolve_git_vcs_commit(&["https://example.org/wallpaper-engine-1.0.tar.gz".into()])
+                .await
+                .unwrap();
+
+        assert_eq!(resolved, None);
     }
 }

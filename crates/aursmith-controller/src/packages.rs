@@ -378,7 +378,7 @@ async fn apply_snapshot(
     .bind(&package.maintainer)
     .bind(package.out_of_date)
     .bind(i64::from(package.maintainer.is_none()))
-    .bind(vcs_kind(&snapshot.package_base))
+    .bind(vcs_kind(snapshot))
     .bind(json_string(&snapshot.outputs)?)
     .bind(json_string(&snapshot.dependencies)?)
     .bind(json_string(&snapshot.optional_dependencies)?)
@@ -1565,7 +1565,7 @@ async fn upsert_implicit_node(
     .bind(&package.maintainer)
     .bind(package.out_of_date)
     .bind(i64::from(package.maintainer.is_none()))
-    .bind(vcs_kind(&snapshot.package_base))
+    .bind(vcs_kind(snapshot))
     .bind(json_string(&snapshot.outputs)?)
     .bind(json_string(&snapshot.dependencies)?)
     .bind(json_string(&snapshot.optional_dependencies)?)
@@ -1720,10 +1720,8 @@ fn package_json(package: UpstreamPackage) -> Value {
     })
 }
 
-fn vcs_kind(package_base: &str) -> Option<&'static str> {
-    ["git", "svn", "hg", "bzr", "cvs", "darcs"]
-        .into_iter()
-        .find(|kind| package_base.ends_with(&format!("-{kind}")))
+fn vcs_kind(snapshot: &UpstreamSnapshot) -> Option<&'static str> {
+    snapshot.vcs_commit.as_ref().map(|_| "git")
 }
 
 fn validate_name(value: &str) -> Result<(), ApiError> {
@@ -1822,6 +1820,15 @@ mod tests {
             official_dependency_names_from_data(&names, &data).unwrap(),
             BTreeSet::from(["glibc".into()])
         );
+    }
+
+    #[test]
+    fn vcs_kind_comes_from_the_resolved_source_not_the_package_name() {
+        let mut snapshot = snapshot();
+        snapshot.package_base = "dynamic-package-without-suffix".into();
+        snapshot.vcs_commit = Some("a".repeat(40));
+
+        assert_eq!(vcs_kind(&snapshot), Some("git"));
     }
 
     #[test]

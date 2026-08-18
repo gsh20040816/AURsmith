@@ -66,6 +66,10 @@ vcs_result="$("${repository_root}/target/debug/aursmithctl" worker \
   --socket "${runtime_directory}/worker.sock" aur-snapshot paru-git)"
 jq -e '.ok == true and (.data.vcs_commit | test("^[0-9a-f]{40}$"))' \
   <<<"${vcs_result}" >/dev/null
+suffixless_vcs_result="$("${repository_root}/target/debug/aursmithctl" worker \
+  --socket "${runtime_directory}/worker.sock" aur-snapshot wallpaper-engine-kde-plugin-new-fork)"
+jq -e '.ok == true and (.data.vcs_commit | test("^[0-9a-f]{40}$"))' \
+  <<<"${suffixless_vcs_result}" >/dev/null
 official_result="$("${repository_root}/target/debug/aursmithctl" worker \
   --socket "${runtime_directory}/worker.sock" official-info pacman)"
 jq -e '.ok == true and (.data.pacman | length) >= 1' <<<"${official_result}" >/dev/null
