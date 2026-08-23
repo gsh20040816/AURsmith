@@ -1,3 +1,5 @@
+import type { Audit, AurPackage, ClientBootstrap, Doctor, Job, LogDocument, PackageDetail, Release, Session, Subscription } from "./types";
+
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
@@ -33,112 +35,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export type Session = { id: string; username: string };
-export type Job = {
-  id: string;
-  kind: "build";
-  status: string;
-  priority: number;
-  failure_code: string | null;
-  revision_sha256: string | null;
-  attempt_count: number;
-  has_logs: boolean;
-  next_attempt_at: string | null;
-  created_at: string;
-  updated_at: string;
-};
-export type AurPackage = {
-  name: string;
-  package_base: string;
-  version: string;
-  description: string | null;
-  maintainer: string | null;
-  out_of_date: number | null;
-  last_modified: number;
-  depends: string[];
-  make_depends: string[];
-  check_depends: string[];
-  opt_depends: string[];
-  provides: string[];
-};
-export type Subscription = {
-  id: string;
-  package_base: string;
-  kind: "direct" | "implicit";
-  reference_count: number;
-  followed_outputs: string[];
-  version: string | null;
-  description: string | null;
-  outputs: string[];
-  maintainer: string | null;
-  out_of_date: number | null;
-};
-export type PackageDetail = {
-  package_base: string;
-  version: string;
-  description: string | null;
-  maintainer: string | null;
-  outputs: string[];
-  build_policy: { allow_check: boolean };
-  revisions: Array<{ id: string; aur_commit: string; vcs_commit: string | null; upstream_version: string; published_version: string | null; state: string; release_state: string | null; created_at: string }>;
-  dependency_resolution: Array<{ name: string; kind: string; target_package_base: string | null; state: string; candidates: string[] }>;
-  events: Array<{ type: string; payload: unknown; actor: string; created_at: string }>;
-};
-export type Audit = {
-  sha256: string;
-  revision_id: string;
-  state: string;
-  policy_version: string;
-  package_base: string;
-  aur_commit: string;
-  findings: Array<{ rule_id: string; severity: string; path: string; summary: string }>;
-  coverage: {
-    aur_wrapper?: { mode: string; files: string[] };
-    upstream_source?: { mode: string; statement: string };
-  };
-  runs: Array<{
-    tier: "low" | "high";
-    slot: number;
-    attempt: number;
-    adapter: string;
-    provider: string;
-    model: string;
-    adapter_version: string;
-    status: string;
-    verdict: string | null;
-    report: { summary?: string; findings?: unknown[]; files_read?: string[] } | null;
-    started_at: string | null;
-    finished_at: string | null;
-  }>;
-  created_at: string;
-};
-export type Release = {
-  id: string;
-  batch_id: string;
-  state: string;
-  position: "current" | "previous" | "failed";
-  manifest_sha256: string;
-  artifact_count: number;
-  last_error: string | null;
-  committed_at: string | null;
-  created_at: string;
-};
-export type ClientBootstrap = {
-  repository_config: string;
-  gpg_fingerprint: string;
-  gpg_key_url: string;
-  keyring_generation: number | null;
-  keyring_published_at: string | null;
-  keyring_next_due_at: string | null;
-  client_ca_url: string | null;
-  commands: string[];
-  warnings: string[];
-};
-export type Doctor = {
-  ready: boolean;
-  checked_at: string;
-  checks: Array<{ id: string; ok: boolean; message: string }>;
-};
 export const api = {
   login: (input: { username: string; password: string }) =>
     request<{ username: string }>("/api/v1/auth/login", {
@@ -148,7 +44,8 @@ export const api = {
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   me: () => request<Session>("/api/v1/auth/me"),
   jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
-  jobLogs: (id: string) => request<{ job_id: string; kind: string; sha256: string; document: unknown; created_at: string }>(`/api/v1/jobs/${encodeURIComponent(id)}/logs`),
+  jobLogs: (id: string) =>
+    request<LogDocument>(`/api/v1/jobs/${encodeURIComponent(id)}/logs`),
   searchAur: (query: string) =>
     request<{ items: AurPackage[] }>(`/api/v1/aur/search?q=${encodeURIComponent(query)}`),
   subscriptions: () => request<{ items: Subscription[] }>("/api/v1/subscriptions"),

@@ -8,6 +8,7 @@ function ok(body: unknown) {
 
 describe("AURsmith 控制台", () => {
   beforeEach(() => {
+    window.history.replaceState({}, "", "/");
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/auth/me")) return ok({ id: "admin-id", username: "admin" });
@@ -20,10 +21,10 @@ describe("AURsmith 控制台", () => {
     render(<App />);
     expect(await screen.findByText("审查后再构建，签名后再发布")).toBeInTheDocument();
     expect(screen.getByLabelText("软件包锻造流程")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "客户端" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Worker/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /告警/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /设置/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "客户端" })).toHaveAttribute("href", "/client");
+    expect(screen.queryByRole("link", { name: /Worker/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /告警/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /设置/ })).not.toBeInTheDocument();
     expect(screen.queryByText("归档")).not.toBeInTheDocument();
   });
 
@@ -38,7 +39,7 @@ describe("AURsmith 控制台", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "退出登录" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("退出请求失败");
-    expect(screen.getByText("admin")).toBeInTheDocument();
+    expect(screen.getByTitle("admin")).toBeInTheDocument();
   });
 
   it("退出返回 401 时清除本地会话", async () => {
@@ -72,9 +73,9 @@ describe("AURsmith 控制台", () => {
       return ok({ items: [] });
     }));
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "软件包" }));
+    fireEvent.click(await screen.findByRole("link", { name: "软件包" }));
     fireEvent.click(await screen.findByRole("button", { name: "详情" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("客户端不会按版本比较自动升级");
+    expect(await screen.findByText(/客户端不会按版本比较自动升级/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "禁用 check()" }));
     expect(await screen.findByText("已显式禁用")).toBeInTheDocument();
     expect(csrfHeader).toBe("1");
@@ -89,7 +90,7 @@ describe("AURsmith 控制台", () => {
       return ok({ items: [] });
     }));
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "客户端" }));
+    fireEvent.click(await screen.findByRole("link", { name: "客户端" }));
     expect(await screen.findByText("ABCD1234")).toBeInTheDocument();
     expect(screen.getByText("[aursmith]")).toBeInTheDocument();
   });
@@ -100,12 +101,31 @@ describe("AURsmith 控制台", () => {
       if (url.endsWith("/auth/me")) return ok({ id: "admin-id", username: "admin" });
       if (url.endsWith("/doctor")) return ok({ ready: true, checked_at: "", checks: [] });
       if (url.endsWith("/jobs")) return ok({ items: [{ id: "11111111-1111-4111-8111-111111111111", kind: "build", status: "failed", priority: 40, failure_code: "GUEST_BUILD_FAILED", revision_sha256: "a".repeat(64), attempt_count: 1, has_logs: true, next_attempt_at: null, created_at: "2026-08-10T00:00:00Z", updated_at: "2026-08-10T00:01:00Z" }] });
-      if (url.includes("/jobs/11111111-1111-4111-8111-111111111111/logs")) return ok({ job_id: "11111111-1111-4111-8111-111111111111", kind: "build", sha256: "b".repeat(64), created_at: "2026-08-10T00:01:00Z", document: { status: "failed", logs: [{ path: "output/build.log", content_utf8: "compiler error" }] } });
+      if (url.includes("/jobs/11111111-1111-4111-8111-111111111111/logs")) return ok({
+        job_id: "11111111-1111-4111-8111-111111111111",
+        kind: "build",
+        sha256: "b".repeat(64),
+        created_at: "2026-08-10T00:01:00Z",
+        document: {
+          schema_version: 1,
+          status: "failed",
+          failure_code: "GUEST_BUILD_FAILED",
+          guest_result: null,
+          logs: [{
+            path: "output/build.log",
+            size: 14,
+            sha256: "c".repeat(64),
+            truncated: false,
+            content_utf8: "compiler error",
+            content_base64: "Y29tcGlsZXIgZXJyb3I="
+          }]
+        }
+      });
       return ok({ items: [] });
     }));
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "构建" }));
-    fireEvent.click(await screen.findByRole("button", { name: "查看日志" }));
+    fireEvent.click(await screen.findByRole("link", { name: "构建" }));
+    fireEvent.click(await screen.findByRole("button", { name: "日志" }));
     expect(await screen.findByText(/compiler error/)).toBeInTheDocument();
   });
 });

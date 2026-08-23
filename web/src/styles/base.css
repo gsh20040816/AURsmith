@@ -1,0 +1,175 @@
+/* ============================================================================
+   Base — reset, elemental styles, shared primitives
+   ========================================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+h2 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--ink);
+}
+
+h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+a {
+  color: var(--info);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+::selection {
+  background: rgba(79, 70, 229, 0.16);
+}
+
+/* ---- Scrollbars --------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: content-box;
+}
+
+/* ---- Code --------------------------------------------------------------- */
+code,
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+}
+
+code.inline {
+  background: var(--code-bg);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 0.8em;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+code.hash {
+  color: var(--hash);
+}
+
+/* ---- Focus -------------------------------------------------------------- */
+:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+/* ---- Utility ------------------------------------------------------------ */
+.u-mono {
+  font-family: var(--font-mono);
+}
+.u-muted {
+  color: var(--text-muted);
+}
+.u-secondary {
+  color: var(--text-secondary);
+}
+.u-nowrap {
+  white-space: nowrap;
+}
+
+/* ---- Skeleton shimmer --------------------------------------------------- */
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: 200px 0;
+  }
+}
+.skeleton {
+  display: inline-block;
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #e9edf1 25%, #f4f6f8 37%, #e9edf1 63%);
+  background-size: 400px 100%;
+  animation: skeleton-shimmer 1.4s ease infinite;
+}
+
+/* ---- Reduced motion ----------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

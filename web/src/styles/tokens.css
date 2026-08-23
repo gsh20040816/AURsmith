@@ -1,0 +1,99 @@
+/* ============================================================================
+   AURsmith console — design tokens
+   A light, precise "engineering console" system: cool neutral surfaces, one
+   warm ember accent used sparingly, and a strict color-coded state language.
+   ========================================================================== */
+
+:root {
+  /* ---- Type ------------------------------------------------------------- */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Menlo", "Consolas", "Liberation Mono",
+    "Noto Sans Mono", ui-monospace, monospace;
+
+  /* ---- Ink / text ------------------------------------------------------- */
+  --ink: #12141a;
+  --text: #191c22;
+  --text-secondary: #59606b;
+  --text-muted: #858d98;
+  --text-faint: #a8b0bb;
+
+  /* ---- Surfaces --------------------------------------------------------- */
+  --bg: #f5f6f8;            /* app canvas */
+  --bg-tint: #eef0f4;
+  --surface: #ffffff;
+  --surface-muted: #f9fafb;
+  --surface-2: #f1f3f6;
+  --surface-overlay: #ffffff;
+
+  /* ---- Lines ------------------------------------------------------------ */
+  --border: #e6e8ec;
+  --border-strong: #d5d9e0;
+  --border-focus: #98a0ad;
+
+  /* ---- Accent (single indigo) — used for actions + key highlights --------- */
+  --accent: #4f46e5;
+  --accent-strong: #4238c8;
+  --accent-soft: #eef0fe;
+  --accent-border: #c9ccf8;
+
+  /* ---- Primary interactive (same accent) --------------------------------- */
+  --primary: #4f46e5;
+  --primary-hover: #4238c8;
+  --primary-soft: #eef0fe;
+
+  /* ---- Status language --------------------------------------------------- */
+  --success: #177a53;
+  --success-soft: #e2f5ec;
+  --success-border: #b2e0c8;
+  --warning: #a8640a;
+  --warning-soft: #fdf2df;
+  --warning-border: #efd6a3;
+  --danger: #bb3430;
+  --danger-soft: #fbe8e7;
+  --danger-border: #eec0bc;
+  --info: #2a63a8;
+  --info-soft: #e7f1fa;
+  --info-border: #bcd7ee;
+  --neutral-soft: #eef1f4;
+  --neutral-border: #dce1e6;
+
+  /* ---- Code accents ------------------------------------------------------ */
+  --code-bg: #f2f4f7;
+  --hash: #55607a;
+
+  /* ---- Radius ------------------------------------------------------------ */
+  --radius-xs: 5px;
+  --radius-sm: 8px;
+  --radius-md: 11px;
+  --radius-lg: 15px;
+  --radius-xl: 20px;
+  --radius-full: 999px;
+
+  /* ---- Elevation --------------------------------------------------------- */
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.05);
+  --shadow-2: 0 2px 6px rgba(16, 24, 40, 0.06), 0 8px 22px rgba(16, 24, 40, 0.07);
+  --shadow-3: 0 10px 30px rgba(16, 24, 40, 0.12), 0 30px 70px rgba(16, 24, 40, 0.12);
+
+  /* ---- Spacing ----------------------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ---- Layout ------------------------------------------------------------ */
+  --sidebar-w: 248px;
+  --topbar-h: 62px;
+
+  /* ---- Motion ------------------------------------------------------------ */
+  --speed-fast: 120ms;
+  --speed: 200ms;
+  --speed-slow: 260ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
