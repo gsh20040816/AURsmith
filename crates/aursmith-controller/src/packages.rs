@@ -403,13 +403,6 @@ async fn apply_snapshot(
     .await
     .map_err(ApiError::internal)?;
 
-    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND aur_commit != ? AND state IN ('discovered', 'audit_pending', 'build_pending')")
-        .bind(&snapshot.package_base)
-        .bind(&snapshot.aur_commit)
-        .execute(&mut *transaction)
-        .await
-        .map_err(ApiError::internal)?;
-    supersede_other_revisions(&mut transaction, snapshot, &provider_selection_sha256).await?;
     let existing_revision: Option<String> = sqlx::query_scalar(
         "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ? ORDER BY rebuild_generation DESC LIMIT 1",
     )
@@ -516,6 +509,13 @@ async fn apply_snapshot(
             changed.insert(node.snapshot.package_base.clone());
         }
     }
+    let observed_packages = dependency_closure
+        .nodes
+        .iter()
+        .map(|node| node.snapshot.package_base.clone())
+        .chain(std::iter::once(snapshot.package_base.clone()))
+        .collect::<BTreeSet<_>>();
+    supersede_stale_pipelines(&mut transaction, &observed_packages, "SUPERSEDED_REVISION").await?;
     recalculate_reference_counts(&mut transaction).await?;
 
     let graph = load_dependency_graph(&mut transaction).await?;
@@ -615,6 +615,11 @@ pub(crate) async fn schedule_ready_builds(database: &SqlitePool) -> Result<(), A
     .map_err(ApiError::internal)?;
     for batch_id in batch_ids {
         let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+        if batch_contains_stale_revision(&mut transaction, &batch_id).await? {
+            supersede_batch(&mut transaction, &batch_id, "STALE_RELEASE_BATCH").await?;
+            transaction.commit().await.map_err(ApiError::internal)?;
+            continue;
+        }
         let unapproved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_batch_revisions AS member WHERE member.batch_id = ? AND NOT EXISTS (SELECT 1 FROM audit_bundles WHERE audit_bundles.revision_id = member.revision_id AND audit_bundles.state = 'approved')")
             .bind(&batch_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
         if unapproved > 0 {
@@ -755,20 +760,6 @@ pub(crate) async fn schedule_rebuild_batch(
     sqlx::query("INSERT INTO release_batches(id, state, graph_json, failure_reason, created_at, updated_at) VALUES (?, 'awaiting_audit', ?, NULL, ?, ?)")
         .bind(&batch_id).bind(serde_json::to_string(&batch_graph).map_err(ApiError::internal)?)
         .bind(now).bind(now).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    let mut superseded_batches = BTreeSet::new();
-    for package_base in &packages {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT release_batches.id FROM release_batches JOIN release_batch_revisions ON release_batch_revisions.batch_id = release_batches.id JOIN revisions ON revisions.id = release_batch_revisions.revision_id WHERE release_batches.id != ? AND revisions.package_base = ? AND release_batches.state IN ('awaiting_audit', 'building', 'build_failed', 'ready_to_publish', 'artifacts_ready')")
-            .bind(&batch_id).bind(package_base).fetch_all(&mut *transaction).await.map_err(ApiError::internal)?;
-        superseded_batches.extend(ids);
-    }
-    for old_batch_id in superseded_batches {
-        sqlx::query("UPDATE release_batches SET state = 'superseded', failure_reason = 'SUPERSEDED_REBUILD', updated_at = ? WHERE id = ?")
-            .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'SUPERSEDED_REBUILD', updated_at = ? WHERE batch_id = ? AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
-            .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE batch_id = ?) AND status NOT IN ('succeeded', 'failed', 'cancelled')")
-            .bind(now).bind(&old_batch_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-    }
     for (index, package_base) in order.into_iter().enumerate() {
         let previous = sqlx::query("SELECT id, aur_commit, vcs_commit, upstream_version, input_sha256, audit_policy_version, provider_selection_sha256, metadata_json FROM revisions WHERE package_base = ? AND rebuild_generation = 0 ORDER BY created_at DESC LIMIT 1")
             .bind(&package_base).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
@@ -803,15 +794,12 @@ pub(crate) async fn schedule_rebuild_batch(
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
         sqlx::query("INSERT INTO revision_dependencies(revision_id, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json) SELECT ?, dependency_name, dependency_kind, target_package_base, provider_state, candidates_json FROM revision_dependencies WHERE revision_id = ?")
             .bind(&revision_id).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = 'SUPERSEDED_REBUILD', updated_at = ? WHERE revision_id = ? AND kind = 'build' AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
-            .bind(now).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
-        sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE revision_id = ? AND failure_code = 'SUPERSEDED_REBUILD') AND status NOT IN ('succeeded', 'failed', 'cancelled')")
-            .bind(now).bind(&previous_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
         create_audit_bundle(&mut transaction, &revision_id, &snapshot).await?;
         sqlx::query("INSERT INTO release_batch_revisions(batch_id, revision_id, build_order) VALUES (?, ?, ?)")
             .bind(&batch_id).bind(&revision_id).bind(i64::try_from(index).map_err(ApiError::internal)?)
             .execute(&mut *transaction).await.map_err(ApiError::internal)?;
     }
+    supersede_stale_pipelines(&mut transaction, &packages, "SUPERSEDED_REBUILD").await?;
     transaction.commit().await.map_err(ApiError::internal)?;
     schedule_ready_builds(database).await?;
     Ok(Some(batch_id))
@@ -1375,20 +1363,123 @@ async fn recalculate_reference_counts(
     Ok(())
 }
 
-async fn supersede_other_revisions(
+async fn supersede_stale_pipelines(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    snapshot: &UpstreamSnapshot,
-    provider_selection_sha256: &str,
+    package_bases: &BTreeSet<String>,
+    reason: &str,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND state IN ('discovered', 'audit_pending', 'build_pending') AND (aur_commit != ? OR COALESCE(vcs_commit, '') != COALESCE(?, '') OR provider_selection_sha256 != ?)")
-        .bind(&snapshot.package_base)
-        .bind(&snapshot.aur_commit)
-        .bind(&snapshot.vcs_commit)
-        .bind(provider_selection_sha256)
+    let now = Utc::now();
+    for package_base in package_bases {
+        let Some(latest_revision_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM revisions WHERE package_base = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(package_base)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?
+        else {
+            continue;
+        };
+        sqlx::query("UPDATE agent_runs SET status = 'failed', verdict = 'error', raw_output_json = ?, finished_at = ? WHERE audit_bundle_sha256 IN (SELECT audit_bundles.sha256 FROM audit_bundles JOIN revisions ON revisions.id = audit_bundles.revision_id WHERE revisions.package_base = ? AND revisions.id != ?) AND status IN ('pending', 'running')")
+            .bind(json!({"error": reason}).to_string())
+            .bind(now)
+            .bind(package_base)
+            .bind(&latest_revision_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        sqlx::query("UPDATE audit_bundles SET state = 'rejected' WHERE revision_id IN (SELECT id FROM revisions WHERE package_base = ? AND id != ?) AND state IN ('agent_pending', 'agent_running', 'manual_review')")
+            .bind(package_base)
+            .bind(&latest_revision_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        sqlx::query("UPDATE manual_actions SET state = 'rejected', completed_at = COALESCE(completed_at, ?) WHERE aggregate_type = 'revision' AND aggregate_id IN (SELECT id FROM revisions WHERE package_base = ? AND id != ?) AND state = 'pending'")
+            .bind(now)
+            .bind(package_base)
+            .bind(&latest_revision_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND id != ? AND state IN ('discovered', 'audit_pending', 'audit_approved', 'build_pending', 'built')")
+            .bind(package_base)
+            .bind(&latest_revision_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        let batch_ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT release_batches.id FROM release_batches JOIN release_batch_revisions ON release_batch_revisions.batch_id = release_batches.id JOIN revisions ON revisions.id = release_batch_revisions.revision_id WHERE revisions.package_base = ? AND revisions.id != ? AND release_batches.state IN ('awaiting_audit', 'building', 'build_failed', 'ready_to_publish', 'artifacts_ready')")
+            .bind(package_base)
+            .bind(&latest_revision_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(ApiError::internal)?;
+        for batch_id in batch_ids {
+            supersede_batch(transaction, &batch_id, reason).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn batch_contains_stale_revision(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    batch_id: &str,
+) -> Result<bool, ApiError> {
+    let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_batch_revisions AS member JOIN revisions AS current ON current.id = member.revision_id WHERE member.batch_id = ? AND (current.state = 'superseded' OR EXISTS (SELECT 1 FROM revisions AS newer WHERE newer.package_base = current.package_base AND (newer.created_at > current.created_at OR (newer.created_at = current.created_at AND newer.rowid > current.rowid))))")
+        .bind(batch_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(stale != 0)
+}
+
+async fn supersede_batch(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    batch_id: &str,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    sqlx::query("UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE job_id IN (SELECT id FROM jobs WHERE batch_id = ?) AND status NOT IN ('succeeded', 'failed', 'cancelled')")
+        .bind(now)
+        .bind(batch_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE jobs SET status = 'cancelled', failure_code = ?, updated_at = ? WHERE batch_id = ? AND status IN ('queued', 'no_eligible_worker', 'dispatched', 'running', 'uncertain')")
+        .bind(reason)
+        .bind(now)
+        .bind(batch_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE uploads SET state = 'expired', last_error = ?, updated_at = ? WHERE batch_id = ? AND state IN ('issued', 'export_ready', 'verified')")
+        .bind(reason)
+        .bind(now)
+        .bind(batch_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE release_batches SET state = 'superseded', failure_reason = ?, updated_at = ? WHERE id = ? AND state IN ('awaiting_audit', 'building', 'build_failed', 'ready_to_publish', 'artifacts_ready')")
+        .bind(reason)
+        .bind(now)
+        .bind(batch_id)
         .execute(&mut **transaction)
         .await
         .map_err(ApiError::internal)?;
     Ok(())
+}
+
+pub(crate) async fn supersede_batch_if_stale(
+    database: &SqlitePool,
+    batch_id: &str,
+) -> Result<bool, ApiError> {
+    let mut transaction = database.begin().await.map_err(ApiError::internal)?;
+    if !batch_contains_stale_revision(&mut transaction, batch_id).await? {
+        transaction.commit().await.map_err(ApiError::internal)?;
+        return Ok(false);
+    }
+    supersede_batch(&mut transaction, batch_id, "STALE_RELEASE_BATCH").await?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    Ok(true)
 }
 
 async fn create_audit_bundle(
@@ -1586,13 +1677,6 @@ async fn upsert_implicit_node(
     .execute(&mut **transaction)
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE package_base = ? AND aur_commit != ? AND state IN ('discovered', 'audit_pending', 'build_pending')")
-        .bind(&snapshot.package_base)
-        .bind(&snapshot.aur_commit)
-        .execute(&mut **transaction)
-        .await
-        .map_err(ApiError::internal)?;
-    supersede_other_revisions(transaction, snapshot, &provider_selection_sha256).await?;
     let existing_revision: Option<String> = sqlx::query_scalar(
         "SELECT id FROM revisions WHERE package_base = ? AND aur_commit = ? AND COALESCE(vcs_commit, '') = COALESCE(?, '') AND audit_policy_version = 'v1' AND provider_selection_sha256 = ? ORDER BY rebuild_generation DESC LIMIT 1",
     )
@@ -2103,6 +2187,64 @@ mod tests {
         assert_eq!(payload["baseline"]["status"], "present");
         assert_eq!(payload["baseline"]["aur_commit"], "a".repeat(40));
         assert_eq!(payload["baseline"]["files"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn new_revision_supersedes_the_old_audit_and_release_batch() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let first = apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &snapshot(),
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+        let first_revision = first["revision_id"].as_str().unwrap();
+        let first_batch = first["batch_id"].as_str().unwrap();
+
+        let mut updated = snapshot();
+        updated.aur_commit = "b".repeat(40);
+        updated.version = "2.0-1".into();
+        apply_snapshot(
+            &database,
+            "tester",
+            &package(),
+            &updated,
+            &[],
+            &empty_closure(),
+        )
+        .await
+        .unwrap();
+
+        let revision_state: String = sqlx::query_scalar("SELECT state FROM revisions WHERE id = ?")
+            .bind(first_revision)
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        let audit_state: String =
+            sqlx::query_scalar("SELECT state FROM audit_bundles WHERE revision_id = ?")
+                .bind(first_revision)
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        let batch_state: String =
+            sqlx::query_scalar("SELECT state FROM release_batches WHERE id = ?")
+                .bind(first_batch)
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        let active_agent_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE audit_bundle_sha256 IN (SELECT sha256 FROM audit_bundles WHERE revision_id = ?) AND status IN ('pending', 'running')")
+            .bind(first_revision)
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(revision_state, "superseded");
+        assert_eq!(audit_state, "rejected");
+        assert_eq!(batch_state, "superseded");
+        assert_eq!(active_agent_runs, 0);
     }
 
     #[tokio::test]

@@ -146,6 +146,9 @@ async fn dispatch_release_one(state: &AppState) -> Result<(), ApiError> {
         return Ok(());
     };
     let batch_id: String = batch.get("id");
+    if crate::packages::supersede_batch_if_stale(&state.database, &batch_id).await? {
+        return Ok(());
+    }
     let batch_state: String = batch.get("state");
     let removed_package_names = if batch_state == "queued_removal" {
         let graph: serde_json::Value =
@@ -1190,6 +1193,56 @@ mod release_tests {
             authorization.removed_package_names,
             ["demo-cli", "demo-lib"]
         );
+    }
+
+    #[tokio::test]
+    async fn stale_artifact_batch_never_creates_a_release_plan() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        let state = state(database.clone());
+        let old_revision = Uuid::new_v4().to_string();
+        let new_revision = Uuid::new_v4().to_string();
+        let batch = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, upstream_version, input_sha256, audit_policy_version, state, metadata_json, created_at) VALUES (?, 'demo', ?, '1-1', ?, 'v1', 'built', '{}', ?), (?, 'demo', ?, '2-1', ?, 'v1', 'published', '{}', ?)")
+            .bind(&old_revision)
+            .bind("a".repeat(40))
+            .bind("b".repeat(64))
+            .bind(now - Duration::seconds(1))
+            .bind(&new_revision)
+            .bind("c".repeat(40))
+            .bind("d".repeat(64))
+            .bind(now)
+            .execute(&database)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release_batches(id, state, graph_json, created_at, updated_at) VALUES (?, 'artifacts_ready', '{}', ?, ?)")
+            .bind(&batch)
+            .bind(now)
+            .bind(now)
+            .execute(&database)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release_batch_revisions(batch_id, revision_id, build_order) VALUES (?, ?, 0)")
+            .bind(&batch)
+            .bind(&old_revision)
+            .execute(&database)
+            .await
+            .unwrap();
+
+        dispatch_release_one(&state).await.unwrap();
+
+        let batch_state: String =
+            sqlx::query_scalar("SELECT state FROM release_batches WHERE id = ?")
+                .bind(&batch)
+                .fetch_one(&database)
+                .await
+                .unwrap();
+        let releases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM releases")
+            .fetch_one(&database)
+            .await
+            .unwrap();
+        assert_eq!(batch_state, "superseded");
+        assert_eq!(releases, 0);
     }
 
     #[test]

@@ -260,9 +260,10 @@ fn next_attempt_generation(maximum: Option<i64>) -> i64 {
 }
 
 async fn finalize(state: &AppState, bundle: &str, decision: AuditDecision) -> Result<(), ApiError> {
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     let bundle_row = sqlx::query("SELECT revision_id, state FROM audit_bundles WHERE sha256 = ?")
         .bind(bundle)
-        .fetch_one(&state.database)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(ApiError::internal)?;
     let revision_id: String = bundle_row.get("revision_id");
@@ -270,10 +271,16 @@ async fn finalize(state: &AppState, bundle: &str, decision: AuditDecision) -> Re
         bundle_row.get::<String, _>("state").as_str(),
         "agent_pending" | "agent_running"
     ) {
+        transaction.commit().await.map_err(ApiError::internal)?;
+        return Ok(());
+    }
+    if !revision_is_current(&mut transaction, &revision_id).await? {
+        retire_stale_audit(&mut transaction, bundle, &revision_id).await?;
+        transaction.commit().await.map_err(ApiError::internal)?;
         return Ok(());
     }
     let report_hashes: Vec<String> = sqlx::query_scalar("SELECT report_sha256 FROM agent_runs WHERE audit_bundle_sha256 = ? AND report_sha256 IS NOT NULL ORDER BY tier, slot, attempt")
-        .bind(bundle).fetch_all(&state.database).await.map_err(ApiError::internal)?;
+        .bind(bundle).fetch_all(&mut *transaction).await.map_err(ApiError::internal)?;
     let report_sha = hex::encode(Sha256::digest(report_hashes.join("").as_bytes()));
     let (decision_name, bundle_state, revision_state) = match decision {
         AuditDecision::ApprovedByLowCost => ("approved_by_low_cost", "approved", "audit_approved"),
@@ -282,7 +289,6 @@ async fn finalize(state: &AppState, bundle: &str, decision: AuditDecision) -> Re
         }
         _ => ("manual_review", "manual_review", "audit_pending"),
     };
-    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     let updated = sqlx::query("UPDATE audit_bundles SET state = ? WHERE sha256 = ? AND state IN ('agent_pending', 'agent_running')")
         .bind(bundle_state)
         .bind(bundle)
@@ -384,11 +390,12 @@ pub async fn manual_decision(
             "人工审计理由至少 8 个字符",
         ));
     }
+    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     let row = sqlx::query(
         "SELECT revision_id, policy_version, state FROM audit_bundles WHERE sha256 = ?",
     )
     .bind(&bundle)
-    .fetch_optional(&state.database)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::not_found("AuditBundle 不存在"))?;
@@ -399,6 +406,12 @@ pub async fn manual_decision(
         ));
     }
     let revision_id: String = row.get("revision_id");
+    if !revision_is_current(&mut transaction, &revision_id).await? {
+        return Err(ApiError::conflict(
+            "REVISION_SUPERSEDED",
+            "该审计所属 Revision 已被更新版本取代",
+        ));
+    }
     let decision = if request.approve {
         "manually_approved"
     } else {
@@ -412,7 +425,6 @@ pub async fn manual_decision(
     let report_sha = hex::encode(Sha256::digest(
         format!("{bundle}:{}:{}", request.approve, request.rationale).as_bytes(),
     ));
-    let mut transaction = state.database.begin().await.map_err(ApiError::internal)?;
     sqlx::query("UPDATE audit_bundles SET state = ? WHERE sha256 = ?")
         .bind(if request.approve {
             "approved"
@@ -473,6 +485,12 @@ pub async fn retry(
         ));
     }
     let revision_id: String = row.get("revision_id");
+    if !revision_is_current(&mut transaction, &revision_id).await? {
+        return Err(ApiError::conflict(
+            "REVISION_SUPERSEDED",
+            "该审计所属 Revision 已被更新版本取代，不能重新运行",
+        ));
+    }
     let mut attempts = Vec::with_capacity(3);
     for slot in 1_i64..=3 {
         let maximum: Option<i64> = sqlx::query_scalar(
@@ -516,6 +534,45 @@ pub async fn retry(
         "state": "agent_pending",
         "attempts": attempts
     })))
+}
+
+async fn revision_is_current(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    revision_id: &str,
+) -> Result<bool, ApiError> {
+    let row = sqlx::query("SELECT current.state, NOT EXISTS (SELECT 1 FROM revisions AS newer WHERE newer.package_base = current.package_base AND (newer.created_at > current.created_at OR (newer.created_at = current.created_at AND newer.rowid > current.rowid))) AS is_latest FROM revisions AS current WHERE current.id = ?")
+        .bind(revision_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(row.is_some_and(|row| {
+        row.get::<String, _>("state") != "superseded" && row.get::<i64, _>("is_latest") != 0
+    }))
+}
+
+async fn retire_stale_audit(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    bundle: &str,
+    revision_id: &str,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    sqlx::query("UPDATE audit_bundles SET state = 'rejected' WHERE sha256 = ? AND state IN ('agent_pending', 'agent_running', 'manual_review')")
+        .bind(bundle)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE revisions SET state = 'superseded' WHERE id = ? AND state IN ('discovered', 'audit_pending', 'audit_approved', 'build_pending', 'built')")
+        .bind(revision_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE manual_actions SET state = 'rejected', completed_at = COALESCE(completed_at, ?) WHERE aggregate_type = 'revision' AND aggregate_id = ? AND state = 'pending'")
+        .bind(now)
+        .bind(revision_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, ApiError> {
@@ -663,5 +720,37 @@ mod tests {
             .unwrap();
         assert_eq!(decisions, 1);
         assert_eq!(actions, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_agent_results_cannot_reactivate_an_old_revision() {
+        let state = fixture(["approve", "approve", "approve"]).await;
+        let now = Utc::now() + chrono::Duration::seconds(1);
+        sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, upstream_version, input_sha256, audit_policy_version, state, metadata_json, created_at) VALUES ('new-revision', 'demo', ?, '2-1', ?, 'v1', 'published', '{}', ?)")
+            .bind("d".repeat(40))
+            .bind("e".repeat(64))
+            .bind(now)
+            .execute(&state.database)
+            .await
+            .unwrap();
+
+        evaluate(&state, &"c".repeat(64), "low").await.unwrap();
+
+        let revision_state: String =
+            sqlx::query_scalar("SELECT state FROM revisions WHERE id = 'revision'")
+                .fetch_one(&state.database)
+                .await
+                .unwrap();
+        let bundle_state: String = sqlx::query_scalar("SELECT state FROM audit_bundles")
+            .fetch_one(&state.database)
+            .await
+            .unwrap();
+        let decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_decisions")
+            .fetch_one(&state.database)
+            .await
+            .unwrap();
+        assert_eq!(revision_state, "superseded");
+        assert_eq!(bundle_state, "rejected");
+        assert_eq!(decisions, 0);
     }
 }

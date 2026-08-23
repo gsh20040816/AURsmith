@@ -27,6 +27,7 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[tokio::test]
     async fn migrations_apply_to_empty_database() {
@@ -74,5 +75,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(busy_timeout, 10_000);
+    }
+
+    #[tokio::test]
+    async fn stale_pipeline_cleanup_migration_is_idempotent_and_terminal() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, upstream_version, input_sha256, audit_policy_version, state, metadata_json, created_at) VALUES ('old', 'demo', ?, '1-1', ?, 'v1', 'audit_pending', '{}', ?), ('new', 'demo', ?, '2-1', ?, 'v1', 'published', '{}', ?)")
+            .bind("a".repeat(40))
+            .bind("b".repeat(64))
+            .bind(now - chrono::Duration::seconds(1))
+            .bind("c".repeat(40))
+            .bind("d".repeat(64))
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audit_bundles(sha256, revision_id, policy_version, payload_json, coverage_json, deterministic_findings_json, state, created_at) VALUES (?, 'old', 'v1', '{}', '{}', '[]', 'agent_pending', ?)")
+            .bind("e".repeat(64))
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO agent_runs(id, audit_bundle_sha256, tier, slot, attempt, adapter, model, adapter_version, prompt_version, status) VALUES ('run', ?, 'low', 1, 0, 'test', 'test', 'v1', 'v1', 'pending')")
+            .bind("e".repeat(64))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release_batches(id, state, graph_json, created_at, updated_at) VALUES ('batch', 'awaiting_audit', '{}', ?, ?)")
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release_batch_revisions(batch_id, revision_id, build_order) VALUES ('batch', 'old', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0035_supersede_stale_release_pipelines.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0035_supersede_stale_release_pipelines.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let old_revision: String =
+            sqlx::query_scalar("SELECT state FROM revisions WHERE id = 'old'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let audit: String = sqlx::query_scalar("SELECT state FROM audit_bundles")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let agent: String = sqlx::query_scalar("SELECT status FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let batch: String = sqlx::query_scalar("SELECT state FROM release_batches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(old_revision, "superseded");
+        assert_eq!(audit, "rejected");
+        assert_eq!(agent, "failed");
+        assert_eq!(batch, "superseded");
     }
 }
