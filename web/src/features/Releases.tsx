@@ -91,7 +91,7 @@ export function Releases() {
               <Empty title="尚无发布" detail="批准的构建产物完成签名和 repo-add 后会出现在这里。" glyph={<IconRocket size={22} />} />
             ) : (
               <div className="tbl-wrap">
-                <table className="tbl">
+                <table className="tbl release-table">
                   <thead>
                     <tr>
                       <th>Release</th>
@@ -99,7 +99,7 @@ export function Releases() {
                       <th>包</th>
                       <th>Manifest</th>
                       <th>时间</th>
-                      <th style={{ width: 150 }}></th>
+                      <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>

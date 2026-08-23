@@ -87,7 +87,7 @@ export function Builds() {
             <Empty title="没有构建任务" detail="加入软件包并批准审查后，Builder 会从这里领取任务。" />
           ) : (
             <div className="tbl-wrap">
-              <table className="tbl tbl--clickable">
+              <table className="tbl tbl--clickable build-table">
                 <thead>
                   <tr>
                     <th>任务</th>
@@ -96,7 +96,7 @@ export function Builds() {
                     <th>Revision</th>
                     <th>日志证据</th>
                     <th>更新</th>
-                    <th style={{ width: 120 }}></th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>

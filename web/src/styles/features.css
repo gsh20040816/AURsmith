@@ -129,12 +129,48 @@
   flex-wrap: wrap;
 }
 .pkg-tag {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
   font-size: 11px;
   padding: 1px 7px;
   border-radius: 6px;
   background: var(--neutral-soft);
   border: 1px solid var(--border);
   color: var(--text-secondary);
+}
+
+.package-table {
+  table-layout: fixed;
+  min-width: 980px;
+}
+.package-table th:nth-child(1) {
+  width: 32%;
+}
+.package-table th:nth-child(2) {
+  width: 116px;
+}
+.package-table th:nth-child(4) {
+  width: 72px;
+}
+.package-table th:nth-child(5) {
+  width: 220px;
+}
+.package-table td:nth-child(1) .tbl__sub,
+.package-table td:nth-child(3) .tbl__sub {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.package-table td:nth-child(2),
+.package-table td:nth-child(4) {
+  white-space: nowrap;
+}
+.package-table td:last-child .row {
+  flex-wrap: nowrap;
+}
+.package-table td:last-child .btn {
+  flex: none;
 }
 .pkg-tag--implicit {
   background: var(--info-soft);
@@ -225,8 +261,49 @@
 .finding-table td code {
   font-size: 12px;
 }
+.finding-table {
+  table-layout: fixed;
+  min-width: 760px;
+}
+.finding-table th:nth-child(1) {
+  width: 120px;
+}
+.finding-table th:nth-child(2) {
+  width: 100px;
+}
+.finding-table th:nth-child(3) {
+  width: 28%;
+}
+.finding-table td {
+  overflow-wrap: anywhere;
+}
 
 /* ---- Build -------------------------------------------------------------- */
+.build-table {
+  table-layout: fixed;
+  min-width: 960px;
+}
+.build-table th:nth-child(1) {
+  width: 180px;
+}
+.build-table th:nth-child(2) {
+  width: 170px;
+}
+.build-table th:nth-child(3) {
+  width: 80px;
+}
+.build-table th:nth-child(4) {
+  width: 160px;
+}
+.build-table th:nth-child(5) {
+  width: 120px;
+}
+.build-table th:nth-child(6) {
+  width: 150px;
+}
+.build-table th:nth-child(7) {
+  width: 100px;
+}
 .log-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -259,6 +336,28 @@
 }
 
 /* ---- Releases ----------------------------------------------------------- */
+.release-table {
+  table-layout: fixed;
+  min-width: 880px;
+}
+.release-table th:nth-child(1) {
+  width: 140px;
+}
+.release-table th:nth-child(2) {
+  width: 150px;
+}
+.release-table th:nth-child(3) {
+  width: 80px;
+}
+.release-table th:nth-child(4) {
+  width: 200px;
+}
+.release-table th:nth-child(5) {
+  width: 190px;
+}
+.release-table th:nth-child(6) {
+  width: 160px;
+}
 .release-positions {
   display: grid;
   grid-template-columns: 1fr 1fr;

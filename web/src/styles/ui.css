@@ -166,6 +166,7 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-1);
+  min-width: 0;
 }
 .card--flush {
   overflow: hidden;
@@ -391,6 +392,12 @@
   color: var(--ink);
   font-weight: 600;
   font-size: 13.5px;
+}
+.tbl__cell-main > code.inline {
+  justify-self: start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tbl__sub {
   color: var(--text-muted);

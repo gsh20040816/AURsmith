@@ -183,8 +183,8 @@ function AuditCard({
                 <table className="tbl finding-table">
                   <thead>
                     <tr>
-                      <th style={{ width: 100 }}>规则</th>
-                      <th style={{ width: 90 }}>级别</th>
+                      <th>规则</th>
+                      <th>级别</th>
                       <th>路径</th>
                       <th>说明</th>
                     </tr>

@@ -168,14 +168,14 @@ export function Packages() {
               <Empty title="尚未加入软件包" detail="从上方搜索 AUR，并加入需要的 pkgbase。" />
             ) : (
               <div className="tbl-wrap">
-                <table className="tbl tbl--clickable">
+                <table className="tbl tbl--clickable package-table">
                   <thead>
                     <tr>
                       <th>pkgbase</th>
                       <th>来源</th>
                       <th>版本 / 输出</th>
                       <th>引用</th>
-                      <th style={{ width: 190 }}>操作</th>
+                      <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>

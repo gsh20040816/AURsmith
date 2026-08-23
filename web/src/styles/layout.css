@@ -198,7 +198,7 @@
 /* ---- Content frame ------------------------------------------------------ */
 .content {
   padding: 26px 28px 56px;
-  max-width: 1200px;
+  min-width: 0;
   width: 100%;
 }
 .page-head {
