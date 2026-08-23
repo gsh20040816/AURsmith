@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::{ServeDir, ServeFile},
@@ -39,6 +39,11 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    router_with_static_root(state, "/srv")
+}
+
+fn router_with_static_root(state: AppState, static_root: impl Into<PathBuf>) -> Router {
+    let static_root = static_root.into();
     let authentication_state = state.clone();
     Router::new()
         .route("/healthz", get(health))
@@ -100,7 +105,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/{*path}", any(api_not_found))
         .fallback_service(
-            ServeDir::new("/srv").not_found_service(ServeFile::new("/srv/index.html")),
+            ServeDir::new(&static_root).fallback(ServeFile::new(static_root.join("index.html"))),
         )
         .with_state(state)
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -508,12 +513,57 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
+    use std::fs;
     use tower::ServiceExt;
 
     async fn test_router() -> Router {
         let database = crate::db::connect("sqlite::memory:").await.unwrap();
         insert_test_administrator(&database).await;
         router(AppState::new(database, test_config()))
+    }
+
+    #[tokio::test]
+    async fn spa_deep_links_return_index_without_masking_unknown_api_routes() {
+        let static_root = tempfile::tempdir().unwrap();
+        fs::write(
+            static_root.path().join("index.html"),
+            "<!doctype html><title>AURsmith fixture</title>",
+        )
+        .unwrap();
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        insert_test_administrator(&database).await;
+        let app = router_with_static_root(
+            AppState::new(database, test_config()),
+            static_root.path().to_path_buf(),
+        );
+
+        for method in ["GET", "HEAD"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/dashboard")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+        }
+
+        let cookie = login_cookie(&app).await;
+        let unknown_api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/not-real")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_api.status(), StatusCode::NOT_FOUND);
     }
 
     fn test_config() -> Config {
