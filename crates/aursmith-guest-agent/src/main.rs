@@ -158,6 +158,7 @@ fn declared_pgp_fingerprints(srcinfo: &str) -> anyhow::Result<Vec<String>> {
 
 fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
     let log = Path::new(OUTPUT).join("build.log");
+    upgrade_system(&log)?;
     install_batch_dependencies(Path::new(BUILD), &log)?;
     let status = run_as_builder_status(&makepkg_arguments(spec.allow_check), Some(&log))?;
     if !status.success() {
@@ -222,6 +223,28 @@ fn build(spec: &JobSpec) -> anyhow::Result<BuildResult> {
         log_sha256: file_digest(&log)?,
         finished_at: Utc::now(),
     })
+}
+
+fn upgrade_system(log: &Path) -> anyhow::Result<()> {
+    let stdout = OpenOptions::new().create(true).append(true).open(log)?;
+    let stderr = stdout.try_clone()?;
+    let status = Command::new("/usr/bin/pacman")
+        .args(system_upgrade_arguments())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()?;
+    if !status.success() {
+        bail!(
+            "{}: Build 系统升级失败，详情见 build.log",
+            classify_makepkg_failure(log)
+        );
+    }
+    Ok(())
+}
+
+fn system_upgrade_arguments() -> [&'static str; 2] {
+    ["-Syu", "--noconfirm"]
 }
 
 fn install_batch_dependencies(build: &Path, log: &Path) -> anyhow::Result<()> {
@@ -520,6 +543,7 @@ mod tests {
 
     #[test]
     fn makepkg_uses_standard_dependency_install_and_failure_classes() {
+        assert_eq!(system_upgrade_arguments(), ["-Syu", "--noconfirm"]);
         assert!(makepkg_arguments(true).contains(&"--syncdeps"));
         assert!(!makepkg_arguments(true).contains(&"--nocheck"));
         assert!(makepkg_arguments(false).contains(&"--nocheck"));
