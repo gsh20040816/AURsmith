@@ -6,7 +6,7 @@ COPY migrations ./migrations
 COPY crates ./crates
 RUN cargo build --locked --release -p aursmith-guest-agent
 
-FROM archlinux:base@sha256:345a872f6c95e082d4b8c050af637eebb57402c6e2177b411c3acf7df84eb33b
+FROM archlinux:base@sha256:b860afd5823683f7ea389ba5f00d812f4fe55f6f286dea329d2abeefa535e309
 ARG AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux
 ARG AURSMITH_ARCHLINUXCN_MIRROR=https://mirrors.ustc.edu.cn/archlinuxcn
 COPY deploy/common/pacman-aursmith.conf /etc/pacman.conf
