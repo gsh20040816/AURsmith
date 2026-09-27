@@ -99,7 +99,13 @@ async fn invoke(
     remote_command: &str,
     stdin: Option<Vec<u8>>,
 ) -> Result<WorkerReply, ApiError> {
-    invoke_with_timeout(config, remote_command, stdin, Duration::from_secs(20)).await
+    // Upstream operations include multiple serial HTTP/Git requests and retries.
+    // Keep local status/publication commands on their existing short deadline.
+    let seconds = match remote_command {
+        "aur-search" | "aur-info" | "aur-snapshot" | "aur-providers" | "official-info" => 180,
+        _ => 20,
+    };
+    invoke_with_timeout(config, remote_command, stdin, Duration::from_secs(seconds)).await
 }
 
 async fn invoke_with_timeout(
@@ -126,7 +132,14 @@ async fn invoke_with_timeout(
     };
     let output = timeout(command_timeout, exchange)
         .await
-        .map_err(|_| ApiError::internal("Publisher 本地调用超时"))?
+        .map_err(|_| {
+            tracing::warn!(command = remote_command, "Publisher 本地调用超时");
+            ApiError {
+                status: axum::http::StatusCode::GATEWAY_TIMEOUT,
+                code: "PUBLISHER_TIMEOUT",
+                message: "上游查询超时，请稍后重试".into(),
+            }
+        })?
         .map_err(ApiError::internal)?;
     let reply: WorkerReply = serde_json::from_str(&output).map_err(ApiError::internal)?;
     if !reply.ok {

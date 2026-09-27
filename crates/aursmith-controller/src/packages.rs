@@ -1197,7 +1197,19 @@ pub async fn select_provider(
     sqlx::query("UPDATE subscriptions SET selected_providers_json = ?, updated_at = ? WHERE package_base = ? AND kind = 'direct'")
         .bind(json_string(&selected)?).bind(Utc::now()).bind(&package_base)
         .execute(&state.database).await.map_err(ApiError::internal)?;
-    let result = refresh_one(&state, &package_base, &actor).await?;
+    // The selection is already durable. A failed upstream refresh must not
+    // report that saving it failed; leave a persisted retry for the scheduler.
+    let result = match refresh_one(&state, &package_base, &actor).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(%package_base, %error, "Provider 已保存，依赖刷新等待重试");
+            let next = Utc::now() + chrono::Duration::minutes(1);
+            sqlx::query("INSERT INTO package_sync_state(package_base, last_error, next_check_at) VALUES (?, ?, ?) ON CONFLICT(package_base) DO UPDATE SET last_error = excluded.last_error, next_check_at = excluded.next_check_at")
+                .bind(&package_base).bind(error.to_string()).bind(next)
+                .execute(&state.database).await.map_err(ApiError::internal)?;
+            json!({"state": "refresh_pending", "message": "选择已保存，依赖刷新未完成，将自动重试", "next_check_at": next})
+        }
+    };
     Ok(Json(json!({
         "package_base": package_base,
         "dependency_name": dependency_name,

@@ -91,7 +91,7 @@ export const api = {
       { method: "POST", body: JSON.stringify({ allow_check: allowCheck }) }
     ),
   selectProvider: (packageBase: string, dependencyName: string, selectedPackageBase: string) =>
-    request<{ package_base: string; dependency_name: string; selected_package_base: string }>(
+    request<{ package_base: string; dependency_name: string; selected_package_base: string; refresh: { state?: string; message?: string } }>(
       `/api/v1/packages/${encodeURIComponent(packageBase)}/providers/${encodeURIComponent(dependencyName)}`,
       { method: "POST", body: JSON.stringify({ selected_package_base: selectedPackageBase }) }
     ),

@@ -230,8 +230,27 @@ export function Packages() {
             setDetail(await api.packageDetail(detail.package_base));
           }}
           onProvider={async (dep, candidate) => {
-            await operate(`provider-${dep}-${candidate}`, () => api.selectProvider(detail.package_base, dep, candidate), "已选择 Provider");
-            setDetail(await api.packageDetail(detail.package_base));
+            if (busyKey) return;
+            setBusyKey(`provider-${dep}-${candidate}`);
+            try {
+              const result = await api.selectProvider(detail.package_base, dep, candidate);
+              if (result.refresh.state === "refresh_pending") {
+                toast.warning("选择已保存", result.refresh.message);
+              } else {
+                toast.success("已选择 Provider");
+              }
+              subs.reload();
+              try {
+                const updated = await api.packageDetail(detail.package_base);
+                setDetail((current) => current?.package_base === updated.package_base ? updated : current);
+              } catch {
+                toast.warning("选择已保存", "详情刷新失败，请重新打开详情查看");
+              }
+            } catch (reason) {
+              toast.error("操作失败", reason instanceof Error ? reason.message : undefined);
+            } finally {
+              setBusyKey("");
+            }
           }}
           onRebuild={async () => {
             await operate(`rebuild-${detail.package_base}`, () => api.rebuildPackage(detail.package_base), "已创建手工重建任务");
@@ -355,9 +374,9 @@ function PackageDetailDrawer({
                   {dep.state === "needs_selection" ? (
                     <span className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
                       {dep.candidates.map((c) => (
-                        <button key={c} className="btn btn--sm" style={{ border: "1px solid var(--accent-border)", color: "var(--accent)", background: "var(--accent-soft)" }} onClick={() => void onProvider(dep.name, c)}>
-                          选择 {c}
-                        </button>
+                        <Button key={c} size="sm" disabled={!!busyKey} loading={busyKey === `provider-${dep.name}-${c}`} style={{ border: "1px solid var(--accent-border)", color: "var(--accent)", background: "var(--accent-soft)" }} onClick={() => void onProvider(dep.name, c)}>
+                          {busyKey === `provider-${dep.name}-${c}` ? "保存并刷新中…" : `选择 ${c}`}
+                        </Button>
                       ))}
                     </span>
                   ) : (

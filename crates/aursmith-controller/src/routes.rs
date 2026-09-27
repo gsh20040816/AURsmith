@@ -627,6 +627,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_selection_survives_publisher_failure_and_schedules_retry() {
+        let database = crate::db::connect("sqlite::memory:").await.unwrap();
+        insert_test_administrator(&database).await;
+        sqlx::query("INSERT INTO subscriptions(id, package_base, kind, followed_outputs_json, selected_providers_json, created_at, updated_at) VALUES ('sub', 'demo', 'direct', '[]', '{}', '2026-01-01', '2026-01-01')")
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO package_bases(name, version, outputs_json, dependencies_json, optional_dependencies_json, provides_json, architectures_json, last_synced_at) VALUES ('demo', '1-1', '[\"demo\"]', '[]', '[]', '[]', '[]', '2026-01-01')")
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO revisions(id, package_base, aur_commit, upstream_version, input_sha256, audit_policy_version, state, metadata_json, created_at) VALUES ('rev', 'demo', 'abc', '1-1', 'abc', 'v1', 'audit_approved', '{}', '2026-01-01')")
+            .execute(&database).await.unwrap();
+        sqlx::query("INSERT INTO revision_dependencies(revision_id, dependency_name, dependency_kind, provider_state, candidates_json) VALUES ('rev', 'virtual-api', 'build', 'needs_selection', '[\"provider-a\",\"provider-b\"]')")
+            .execute(&database).await.unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.publisher_socket = temporary
+            .path()
+            .join("absent.sock")
+            .to_string_lossy()
+            .into_owned();
+        let app = router(AppState::new(database.clone(), config));
+        let cookie = login_cookie(&app).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/packages/demo/providers/virtual-api")
+                    .header("cookie", cookie)
+                    .header("origin", "https://aursmith.test")
+                    .header("X-AURsmith-CSRF", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"selected_package_base": "provider-a"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["refresh"]["state"], "refresh_pending");
+        let selected: String = sqlx::query_scalar(
+            "SELECT selected_providers_json FROM subscriptions WHERE id = 'sub'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&selected).unwrap()["virtual-api"],
+            "provider-a"
+        );
+        let next: String = sqlx::query_scalar(
+            "SELECT next_check_at FROM package_sync_state WHERE package_base = 'demo'",
+        )
+        .fetch_one(&database)
+        .await
+        .unwrap();
+        let next = chrono::DateTime::parse_from_rfc3339(&next).unwrap();
+        assert!(next > Utc::now());
+        assert!(next < Utc::now() + chrono::Duration::minutes(2));
+    }
+
+    #[tokio::test]
     async fn removed_management_platform_routes_are_not_reachable() {
         let app = test_router().await;
         let cookie = login_cookie(&app).await;
