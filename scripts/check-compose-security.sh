@@ -12,6 +12,10 @@ export AURSMITH_REVERSE_PUBLISHER_ENDPOINT="${AURSMITH_REVERSE_PUBLISHER_ENDPOIN
 
 for stack in controller builder; do
   json="$(docker compose -f "deploy/${stack}/compose.yaml" config --format json)"
+  if jq -e '.services[] | select(.init != true)' <<<"${json}" >/dev/null; then
+    echo "${stack}: 所有常驻服务必须使用 Docker 默认 init 回收孤儿子进程" >&2
+    exit 1
+  fi
   if jq -e '.services[] | select(.privileged == true)' <<<"${json}" >/dev/null; then
     echo "${stack}: 禁止 privileged" >&2
     exit 1

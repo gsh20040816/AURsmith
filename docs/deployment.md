@@ -18,6 +18,8 @@ docker compose --env-file runtime/deployment/controller.env \
 
 部署前先确认没有 `issued/signing` 发布、`issued/export_ready` 上传或 `dispatched/running/uncertain` Build。使用 SQLite `.backup` 生成一致性数据库备份；仓库目录、Publisher Journal 和 GPG 私钥由宿主备份工具分别备份并核对权限与摘要。先在备份副本应用全部 migration，执行 `PRAGMA foreign_key_check` 和 `PRAGMA integrity_check`，再部署生产镜像。
 
+所有常驻 AURsmith 服务通过 Compose `init: true` 使用 Docker 默认 init，负责转发信号并回收孤儿子进程；三个 low Runner 和 high Runner 继承同一配置。修改此项后必须重建容器，单纯 restart 不会更新容器的 init 设置。Build image 只用于构建镜像，不启动常驻服务。
+
 ## 家庭 Builder
 
 Builder 使用 `deploy/builder/compose.yaml`。先构建固定 Build image，再启动 worker：

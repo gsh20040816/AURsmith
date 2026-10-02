@@ -13,6 +13,7 @@ services:
         AURSMITH_ARCHLINUXCN_MIRROR: ${AURSMITH_ARCHLINUXCN_MIRROR:-https://mirrors.ustc.edu.cn/archlinuxcn}
 
   worker:
+    init: true
     build:
       context: ../..
       dockerfile: deploy/images/worker.Dockerfile
