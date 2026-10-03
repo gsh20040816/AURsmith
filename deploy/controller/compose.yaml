@@ -2,6 +2,7 @@ name: aursmith
 
 services:
   controller:
+    init: true
     build:
       context: ../..
       dockerfile: deploy/images/controller.Dockerfile
@@ -43,6 +44,7 @@ services:
     restart: unless-stopped
 
   agent-low-1: &agent-runner
+    init: true
     build:
       context: ../..
       dockerfile: deploy/images/agent-runner.Dockerfile
@@ -100,6 +102,7 @@ services:
     networks: [agent-high-control, agent-high-provider]
 
   agent-credential-gateway:
+    init: true
     build:
       context: ../..
       dockerfile: deploy/images/agent-gateway.Dockerfile
@@ -132,6 +135,7 @@ services:
     restart: unless-stopped
 
   publisher:
+    init: true
     build:
       context: ../..
       dockerfile: deploy/images/worker.Dockerfile
@@ -180,6 +184,7 @@ services:
     restart: unless-stopped
 
   publisher-ssh:
+    init: true
     build:
       context: ../..
       dockerfile: deploy/images/worker.Dockerfile
