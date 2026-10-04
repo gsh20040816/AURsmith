@@ -23,6 +23,8 @@ TLS 握手和证书校验由 Publisher 完成，通道不解密 TLS。
 提交并推送修复后，在 netcup 同步该提交，再安装服务：
 
 ```sh
+install -d -m 0755 /usr/local/libexec
+install -m 0644 deploy/netcup/arch-ipv6-proxy.py /usr/local/libexec/aursmith-arch-ipv6-proxy.py
 install -m 0644 deploy/netcup/aursmith-arch-ipv6-proxy.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now aursmith-arch-ipv6-proxy
