@@ -122,7 +122,10 @@ impl AurClient {
             .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
             .build()?;
         // Scope the optional IPv6 CONNECT bridge to official metadata only.
-        let official_http = if let Some(proxy) = std::env::var("AURSMITH_ARCH_HTTPS_PROXY").ok().filter(|value| !value.is_empty()) {
+        let official_http = if let Some(proxy) = std::env::var("AURSMITH_ARCH_HTTPS_PROXY")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
             Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(20))
@@ -195,7 +198,9 @@ impl AurClient {
         url.query_pairs_mut().append_pair("q", name);
         let mut delay = Duration::from_millis(500);
         let payload = loop {
-            let response = self.send_with_retry_using(&self.official_http, url.clone()).await?;
+            let response = self
+                .send_with_retry_using(&self.official_http, url.clone())
+                .await?;
             if response.status().is_success() {
                 break response
                     .json::<OfficialSearchResponse>()
@@ -222,7 +227,12 @@ impl AurClient {
             .collect())
     }
 
-    async fn rpc(&self, url: Url, expected_type: &str, search_query: Option<&str>) -> anyhow::Result<Vec<AurPackage>> {
+    async fn rpc(
+        &self,
+        url: Url,
+        expected_type: &str,
+        search_query: Option<&str>,
+    ) -> anyhow::Result<Vec<AurPackage>> {
         let _permit = self
             .upstream_gate
             .acquire()
@@ -231,7 +241,10 @@ impl AurClient {
         let response = self.send_with_retry(url).await?.error_for_status()?;
         let mut payload: RpcResponse = response.json().await.context("AUR RPC 返回无效 JSON")?;
         if payload.response_type == "error" {
-            bail!("AUR RPC: {}", payload.error.as_deref().unwrap_or("unknown error"));
+            bail!(
+                "AUR RPC: {}",
+                payload.error.as_deref().unwrap_or("unknown error")
+            );
         }
         if payload.version != 5 || payload.response_type != expected_type {
             bail!("AUR RPC 返回类型不符合预期");
@@ -722,11 +735,20 @@ fn rank_search_results(packages: &mut [AurPackage], query: &str) {
     let query = query.to_ascii_lowercase();
     packages.sort_by_cached_key(|package| {
         let name = package.name.to_ascii_lowercase();
-        let rank = if name == query { 0 }
-            else if name.strip_prefix(&query).is_some_and(|suffix| suffix.starts_with('-')) { 1 }
-            else if name.starts_with(&query) { 2 }
-            else if name.contains(&query) { 3 }
-            else { 4 };
+        let rank = if name == query {
+            0
+        } else if name
+            .strip_prefix(&query)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+        {
+            1
+        } else if name.starts_with(&query) {
+            2
+        } else if name.contains(&query) {
+            3
+        } else {
+            4
+        };
         (rank, name)
     });
 }
@@ -753,9 +775,12 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "Name": name, "PackageBase": name, "Version": "1-1",
                 "LastModified": 1
-            })).unwrap()
+            }))
+            .unwrap()
         };
-        let mut packages = (0..300).map(|i| make(&format!("api-{i}"))).collect::<Vec<_>>();
+        let mut packages = (0..300)
+            .map(|i| make(&format!("api-{i}")))
+            .collect::<Vec<_>>();
         packages.extend([make("piano"), make("pi-coding-agent-bin"), make("pi")]);
         rank_search_results(&mut packages, "pi");
         packages.truncate(MAXIMUM_RPC_RESULTS);
@@ -770,7 +795,8 @@ mod tests {
         let response: RpcResponse = serde_json::from_value(serde_json::json!({
             "version": 5, "type": "error", "results": [],
             "error": "Too many package results."
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(response.error.as_deref(), Some("Too many package results."));
     }
 
