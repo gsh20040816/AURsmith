@@ -170,7 +170,8 @@ impl AurClient {
             .map_err(|_| anyhow::anyhow!("AUR base URL 不能作为路径基址"))?
             .push(query);
         url.query_pairs_mut().append_pair("by", field);
-        self.rpc(url, "search", Some(query)).await
+        self.rpc(url, "search", (field != "provides").then_some(query))
+            .await
     }
 
     pub async fn info(&self, names: &[String]) -> anyhow::Result<Vec<AurPackage>> {
