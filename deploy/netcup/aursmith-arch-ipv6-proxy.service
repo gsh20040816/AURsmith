@@ -1,0 +1,19 @@
+[Unit]
+Description=AURsmith restricted Arch HTTPS IPv6 CONNECT bridge
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/aursmith/deploy/netcup/arch-ipv6-proxy.py
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

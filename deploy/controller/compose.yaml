@@ -150,6 +150,7 @@ services:
       AURSMITH_WORKER_DATABASE: sqlite:///var/lib/aursmith/runtime/worker.db
       AURSMITH_WORKER_SOCKET: /run/aursmith/worker.sock
       AURSMITH_AUR_BASE_URL: ${AURSMITH_AUR_BASE_URL:-https://aur.archlinux.org/}
+      AURSMITH_ARCH_HTTPS_PROXY: ${AURSMITH_ARCH_HTTPS_PROXY:-}
       AURSMITH_PUBLISHER_STAGING_DIR: /staging
       AURSMITH_REPOSITORY_DIR: /repository
       AURSMITH_REPOSITORY_ARCH: x86_64

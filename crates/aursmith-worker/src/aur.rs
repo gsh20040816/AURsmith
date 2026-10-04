@@ -64,6 +64,8 @@ struct RpcResponse {
     #[serde(rename = "type")]
     response_type: String,
     results: Vec<AurPackage>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +103,7 @@ pub struct SnapshotFile {
 #[derive(Clone)]
 pub struct AurClient {
     http: Client,
+    official_http: Client,
     base: Url,
     upstream_gate: Arc<Semaphore>,
 }
@@ -118,15 +121,34 @@ impl AurClient {
             .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
             .build()?;
+        // Scope the optional IPv6 CONNECT bridge to official metadata only.
+        let official_http = if let Some(proxy) = std::env::var("AURSMITH_ARCH_HTTPS_PROXY").ok().filter(|value| !value.is_empty()) {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .proxy(reqwest::Proxy::https(&proxy).context("Arch HTTPS proxy 无效")?)
+                .user_agent(concat!("AURsmith/", env!("CARGO_PKG_VERSION")))
+                .build()?
+        } else {
+            http.clone()
+        };
         Ok(Self {
             http,
+            official_http,
             base,
             upstream_gate: Arc::new(Semaphore::new(MAXIMUM_CONCURRENT_UPSTREAM_REQUESTS)),
         })
     }
 
     pub async fn search(&self, query: &str) -> anyhow::Result<Vec<AurPackage>> {
-        self.search_by(query, "name-desc").await
+        match self.search_by(query, "name-desc").await {
+            Err(error) if error.to_string() == "AUR RPC: Too many package results." => {
+                self.search_by(query, "name").await
+            }
+            result => result,
+        }
     }
 
     pub async fn providers(&self, dependency: &str) -> anyhow::Result<Vec<AurPackage>> {
@@ -145,7 +167,7 @@ impl AurClient {
             .map_err(|_| anyhow::anyhow!("AUR base URL 不能作为路径基址"))?
             .push(query);
         url.query_pairs_mut().append_pair("by", field);
-        self.rpc(url, "search").await
+        self.rpc(url, "search", Some(query)).await
     }
 
     pub async fn info(&self, names: &[String]) -> anyhow::Result<Vec<AurPackage>> {
@@ -159,7 +181,7 @@ impl AurClient {
                 pairs.append_pair("arg[]", validate_package_base(name)?);
             }
         }
-        self.rpc(url, "multiinfo").await
+        self.rpc(url, "multiinfo", None).await
     }
 
     pub async fn official(&self, name: &str) -> anyhow::Result<Vec<OfficialPackage>> {
@@ -173,7 +195,7 @@ impl AurClient {
         url.query_pairs_mut().append_pair("q", name);
         let mut delay = Duration::from_millis(500);
         let payload = loop {
-            let response = self.send_with_retry(url.clone()).await?;
+            let response = self.send_with_retry_using(&self.official_http, url.clone()).await?;
             if response.status().is_success() {
                 break response
                     .json::<OfficialSearchResponse>()
@@ -200,16 +222,23 @@ impl AurClient {
             .collect())
     }
 
-    async fn rpc(&self, url: Url, expected_type: &str) -> anyhow::Result<Vec<AurPackage>> {
+    async fn rpc(&self, url: Url, expected_type: &str, search_query: Option<&str>) -> anyhow::Result<Vec<AurPackage>> {
         let _permit = self
             .upstream_gate
             .acquire()
             .await
             .context("Publisher 上游并发闸门已关闭")?;
         let response = self.send_with_retry(url).await?.error_for_status()?;
-        let payload: RpcResponse = response.json().await.context("AUR RPC 返回无效 JSON")?;
+        let mut payload: RpcResponse = response.json().await.context("AUR RPC 返回无效 JSON")?;
+        if payload.response_type == "error" {
+            bail!("AUR RPC: {}", payload.error.as_deref().unwrap_or("unknown error"));
+        }
         if payload.version != 5 || payload.response_type != expected_type {
             bail!("AUR RPC 返回类型不符合预期");
+        }
+        if let Some(query) = search_query {
+            rank_search_results(&mut payload.results, query);
+            payload.results.truncate(MAXIMUM_RPC_RESULTS);
         }
         if payload.results.len() > MAXIMUM_RPC_RESULTS {
             bail!("AUR RPC 返回结果超过本地安全上限");
@@ -243,9 +272,13 @@ impl AurClient {
     }
 
     async fn send_with_retry(&self, url: Url) -> anyhow::Result<Response> {
+        self.send_with_retry_using(&self.http, url).await
+    }
+
+    async fn send_with_retry_using(&self, http: &Client, url: Url) -> anyhow::Result<Response> {
         let mut delay = Duration::from_millis(500);
         for attempt in 1..=MAXIMUM_TRANSPORT_ATTEMPTS {
-            match self.http.get(url.clone()).send().await {
+            match http.get(url.clone()).send().await {
                 Ok(response) => return Ok(response),
                 Err(_) if attempt < MAXIMUM_TRANSPORT_ATTEMPTS => {
                     tokio::time::sleep(delay).await;
@@ -685,6 +718,19 @@ mod official_tests {
     }
 }
 
+fn rank_search_results(packages: &mut [AurPackage], query: &str) {
+    let query = query.to_ascii_lowercase();
+    packages.sort_by_cached_key(|package| {
+        let name = package.name.to_ascii_lowercase();
+        let rank = if name == query { 0 }
+            else if name.strip_prefix(&query).is_some_and(|suffix| suffix.starts_with('-')) { 1 }
+            else if name.starts_with(&query) { 2 }
+            else if name.contains(&query) { 3 }
+            else { 4 };
+        (rank, name)
+    });
+}
+
 fn validate_package_base(value: &str) -> anyhow::Result<&str> {
     if value.is_empty()
         || value.len() > 128
@@ -700,6 +746,33 @@ fn validate_package_base(value: &str) -> anyhow::Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broad_search_keeps_exact_and_package_family_matches_before_incidental_matches() {
+        let make = |name: &str| -> AurPackage {
+            serde_json::from_value(serde_json::json!({
+                "Name": name, "PackageBase": name, "Version": "1-1",
+                "LastModified": 1
+            })).unwrap()
+        };
+        let mut packages = (0..300).map(|i| make(&format!("api-{i}"))).collect::<Vec<_>>();
+        packages.extend([make("piano"), make("pi-coding-agent-bin"), make("pi")]);
+        rank_search_results(&mut packages, "pi");
+        packages.truncate(MAXIMUM_RPC_RESULTS);
+        assert_eq!(packages[0].name, "pi");
+        assert_eq!(packages[1].name, "pi-coding-agent-bin");
+        assert_eq!(packages[2].name, "piano");
+        assert_eq!(packages.len(), MAXIMUM_RPC_RESULTS);
+    }
+
+    #[test]
+    fn rpc_preserves_upstream_error_for_name_search_fallback() {
+        let response: RpcResponse = serde_json::from_value(serde_json::json!({
+            "version": 5, "type": "error", "results": [],
+            "error": "Too many package results."
+        })).unwrap();
+        assert_eq!(response.error.as_deref(), Some("Too many package results."));
+    }
 
     #[tokio::test]
     async fn cloned_clients_share_the_upstream_concurrency_limit() {
