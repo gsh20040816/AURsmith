@@ -71,9 +71,8 @@ export function Audits() {
   return (
     <>
       <PageHead
-        eyebrow="diff-first 3+1"
         title="审查"
-        lede="报告只覆盖固定 AUR 包装层；上游下载内容未被审查时必须明确说明，不作为模型理解证明。"
+        lede="仅覆盖固定 AUR 包装层；上游下载内容未纳入审查。"
         actions={
           <>
             <Segmented
@@ -144,7 +143,7 @@ function AuditCard({
   const warning = audit.findings.filter((f) => f.severity === "suspicious").length;
 
   return (
-    <Card className="audit-card">
+    <Card className={`audit-card${audit.state === "manual_review" ? " audit-card--attention" : ""}`}>
       <CardHead>
         <div className="audit-card__title">
           <div className="row" style={{ gap: 8 }}>

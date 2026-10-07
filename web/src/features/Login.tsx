@@ -2,18 +2,13 @@ import { FormEvent, useState } from "react";
 import { api } from "../lib/api";
 import { useApp } from "../lib/appctx";
 import { Button } from "../components/ui";
-import { IconBox, IconCheck, IconChevronRight } from "../components/icons";
+import { IconBox } from "../components/icons";
 
-const STAGES = [
-  { name: "同步", detail: "固定 AUR commit" },
-  { name: "审查", detail: "diff-first 3+1" },
-  { name: "构建", detail: "隔离 Docker" },
-  { name: "发布", detail: "GPG 原子切换" }
-];
+const STEPS = ["同步", "审查", "构建", "发布"];
 
 export function Login({ initialError = "" }: { initialError?: string }) {
   const { login } = useApp();
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(initialError);
@@ -34,52 +29,60 @@ export function Login({ initialError = "" }: { initialError?: string }) {
 
   return (
     <div className="login">
-      <div className="login__brand">
-        <div className="login__brand-head">
+      <div className="login__inner">
+        <div className="login__brand-row">
           <div className="sidebar__brand-mark">
-            <IconBox size={16} />
+            <IconBox size={14} />
           </div>
           <div className="wordmark">AURsmith</div>
         </div>
-        <div className="login__hero">
-          <h1>每一个包，<br />先审查再安装。</h1>
-          <p>私人 AUR 二进制仓库：同步 → 三遍独立审查 → 家庭 Builder 联网构建 → GPG 签名发布。只服务一位管理员与少量 Arch 客户端。</p>
-        </div>
-        <div className="login__pipeline">
-          <h3 style={{ color: "var(--success)", marginBottom: 14 }}>流程</h3>
-          <div className="pipeline" style={{ padding: 0 }}>
-            {STAGES.map((s, i) => (
-              <div className="pipe-stage is-active" key={s.name}>
-                <div className="pipe-stage__node">
-                  {i < STAGES.length - 1 ? <IconCheck size={14} /> : <IconChevronRight size={14} />}
-                </div>
-                <div className="pipe-stage__name">{s.name}</div>
-                <div className="pipe-stage__detail">{s.detail}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
 
-      <div className="login__form">
         <form className="login__card stack" onSubmit={submit}>
           <div style={{ display: "grid", gap: 4 }}>
-            <h1 style={{ fontSize: 24 }}>回到控制台</h1>
-            <p className="u-secondary" style={{ fontSize: 13 }}>登录只管理私有仓库，不会远程操作 Arch 客户端。</p>
+            <h1>登录</h1>
+            <p className="u-muted" style={{ fontSize: 13 }}>
+              管理私有 AUR 仓库控制台。
+            </p>
           </div>
           <div className="field">
             <label htmlFor="login-user">管理员名称</label>
-            <input id="login-user" className="input" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" />
+            <input
+              id="login-user"
+              className="input"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="用户名"
+              autoComplete="username"
+              autoFocus
+            />
           </div>
           <div className="field">
             <label htmlFor="login-pass">密码</label>
-            <input id="login-pass" className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="输入管理员密码" autoComplete="current-password" />
+            <input
+              id="login-pass"
+              className="input"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="输入管理员密码"
+              autoComplete="current-password"
+            />
           </div>
-          {error && <div className="notice notice--danger" role="alert">{error}</div>}
+          {error && (
+            <div className="notice notice--danger" role="alert">
+              {error}
+            </div>
+          )}
           <Button variant="primary" type="submit" loading={loading}>
             登录
           </Button>
         </form>
+
+        <div className="login__steps" aria-hidden="true">
+          {STEPS.map((s) => (
+            <span key={s}>{s}</span>
+          ))}
+        </div>
       </div>
     </div>
   );

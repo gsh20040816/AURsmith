@@ -1,7 +1,7 @@
 /* ============================================================================
    AURsmith console — design tokens
-   A light, precise "engineering console" system: cool neutral surfaces, one
-   warm ember accent used sparingly, and a strict color-coded state language.
+   Dark engineering console for one admin. Saturated color means state only
+   (running / blocked / failed / ok), never brand decoration.
    ========================================================================== */
 
 :root {
@@ -12,69 +12,70 @@
   --font-mono: "JetBrains Mono", "SF Mono", "Menlo", "Consolas", "Liberation Mono",
     "Noto Sans Mono", ui-monospace, monospace;
 
-  /* ---- Ink / text ------------------------------------------------------- */
-  --ink: #12141a;
-  --text: #191c22;
-  --text-secondary: #59606b;
-  --text-muted: #858d98;
-  --text-faint: #a8b0bb;
-
   /* ---- Surfaces --------------------------------------------------------- */
-  --bg: #f5f6f8;            /* app canvas */
-  --bg-tint: #eef0f4;
-  --surface: #ffffff;
-  --surface-muted: #f9fafb;
-  --surface-2: #f1f3f6;
-  --surface-overlay: #ffffff;
+  --bg: #0e1116;
+  --bg-tint: #12161c;
+  --surface: #151a21;
+  --surface-muted: #13181f;
+  --surface-2: #1b222c;
+  --surface-overlay: #1b222c;
 
   /* ---- Lines ------------------------------------------------------------ */
-  --border: #e6e8ec;
-  --border-strong: #d5d9e0;
-  --border-focus: #98a0ad;
+  --border: #2a3340;
+  --border-strong: #3a4556;
+  --border-focus: #3d8bfd;
 
-  /* ---- Accent (single indigo) — used for actions + key highlights --------- */
-  --accent: #4f46e5;
-  --accent-strong: #4238c8;
-  --accent-soft: #eef0fe;
-  --accent-border: #c9ccf8;
+  /* ---- Ink / text ------------------------------------------------------- */
+  --ink: #e8edf4;
+  --text: #c5ced9;
+  --text-secondary: #8b96a5;
+  --text-muted: #6a7585;
+  --text-faint: #556070;
 
-  /* ---- Primary interactive (same accent) --------------------------------- */
-  --primary: #4f46e5;
-  --primary-hover: #4238c8;
-  --primary-soft: #eef0fe;
+  /* ---- Accent / primary (cool blue — state + focus + primary action) ---- */
+  --accent: #3d8bfd;
+  --accent-strong: #5a9dff;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-border: color-mix(in srgb, var(--accent) 36%, transparent);
+
+  --primary: var(--accent);
+  --primary-hover: var(--accent-strong);
+  --primary-soft: var(--accent-soft);
 
   /* ---- Status language --------------------------------------------------- */
-  --success: #177a53;
-  --success-soft: #e2f5ec;
-  --success-border: #b2e0c8;
-  --warning: #a8640a;
-  --warning-soft: #fdf2df;
-  --warning-border: #efd6a3;
-  --danger: #bb3430;
-  --danger-soft: #fbe8e7;
-  --danger-border: #eec0bc;
-  --info: #2a63a8;
-  --info-soft: #e7f1fa;
-  --info-border: #bcd7ee;
-  --neutral-soft: #eef1f4;
-  --neutral-border: #dce1e6;
+  --success: #3dd68c;
+  --success-soft: color-mix(in srgb, var(--success) 16%, transparent);
+  --success-border: color-mix(in srgb, var(--success) 36%, transparent);
+  --warning: #e6b84d;
+  --warning-soft: color-mix(in srgb, var(--warning) 16%, transparent);
+  --warning-border: color-mix(in srgb, var(--warning) 36%, transparent);
+  --danger: #f07178;
+  --danger-soft: color-mix(in srgb, var(--danger) 16%, transparent);
+  --danger-border: color-mix(in srgb, var(--danger) 36%, transparent);
+  --info: #5db0ff;
+  --info-soft: color-mix(in srgb, var(--info) 16%, transparent);
+  --info-border: color-mix(in srgb, var(--info) 36%, transparent);
+  --neutral-soft: var(--surface-2);
+  --neutral-border: var(--border);
 
-  /* ---- Code accents ------------------------------------------------------ */
-  --code-bg: #f2f4f7;
-  --hash: #55607a;
+  /* ---- Code / logs ------------------------------------------------------- */
+  --code-bg: #0a0d11;
+  --log-bg: #0a0d11;
+  --log-fg: #c7d2de;
+  --hash: #7d8aa0;
 
   /* ---- Radius ------------------------------------------------------------ */
-  --radius-xs: 5px;
-  --radius-sm: 8px;
-  --radius-md: 11px;
-  --radius-lg: 15px;
-  --radius-xl: 20px;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
   --radius-full: 999px;
 
-  /* ---- Elevation --------------------------------------------------------- */
-  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.05);
-  --shadow-2: 0 2px 6px rgba(16, 24, 40, 0.06), 0 8px 22px rgba(16, 24, 40, 0.07);
-  --shadow-3: 0 10px 30px rgba(16, 24, 40, 0.12), 0 30px 70px rgba(16, 24, 40, 0.12);
+  /* ---- Elevation (border-first; shadows for overlays only) --------------- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --shadow-2: 0 4px 16px rgba(0, 0, 0, 0.36);
+  --shadow-3: 0 12px 40px rgba(0, 0, 0, 0.5);
 
   /* ---- Spacing ----------------------------------------------------------- */
   --space-1: 4px;
@@ -88,12 +89,12 @@
   --space-12: 48px;
 
   /* ---- Layout ------------------------------------------------------------ */
-  --sidebar-w: 248px;
-  --topbar-h: 62px;
+  --sidebar-w: 220px;
+  --topbar-h: 48px;
 
   /* ---- Motion ------------------------------------------------------------ */
   --speed-fast: 120ms;
-  --speed: 200ms;
-  --speed-slow: 260ms;
+  --speed: 160ms;
+  --speed-slow: 200ms;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
 }

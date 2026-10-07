@@ -8,7 +8,7 @@
 
 html {
   -webkit-text-size-adjust: 100%;
-  color-scheme: light;
+  color-scheme: dark;
 }
 
 body {
@@ -34,10 +34,10 @@ p {
 }
 
 h1 {
-  font-size: 22px;
-  font-weight: 650;
+  font-size: 18px;
+  font-weight: 600;
   letter-spacing: -0.01em;
-  line-height: 1.2;
+  line-height: 1.25;
   color: var(--ink);
 }
 
@@ -80,7 +80,7 @@ button:disabled {
 }
 
 ::selection {
-  background: rgba(79, 70, 229, 0.16);
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 /* ---- Scrollbars --------------------------------------------------------- */
@@ -112,8 +112,8 @@ code,
 
 code.inline {
   background: var(--code-bg);
-  border: 1px solid transparent;
-  border-radius: 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
   padding: 1px 5px;
   font-size: 0.8em;
   color: var(--text);
@@ -158,7 +158,12 @@ code.hash {
   display: inline-block;
   height: 12px;
   border-radius: 6px;
-  background: linear-gradient(90deg, #e9edf1 25%, #f4f6f8 37%, #e9edf1 63%);
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 25%,
+    var(--border) 37%,
+    var(--surface-2) 63%
+  );
   background-size: 400px 100%;
   animation: skeleton-shimmer 1.4s ease infinite;
 }

@@ -21,7 +21,7 @@ export function Client() {
   if (loading) {
     return (
       <div className="stack">
-        <PageHead eyebrow="首次接入" title="客户端" lede="先带外核对完整 GPG 指纹，再安装 keyring 与仓库配置。" />
+        <PageHead title="客户端" lede="先带外核对 GPG 指纹，再安装 keyring 与仓库配置。" />
         <Card><CardBody><div className="stack" style={{ gap: 10 }}>
           <span className="skeleton" style={{ width: "100%", height: 44 }} />
           <span className="skeleton" style={{ width: "60%" }} />
@@ -34,7 +34,7 @@ export function Client() {
   if (error || !data) {
     return (
       <>
-        <PageHead eyebrow="首次接入" title="客户端" lede="先带外核对完整 GPG 指纹，再安装 keyring 与仓库配置。" />
+        <PageHead title="客户端" lede="先带外核对 GPG 指纹，再安装 keyring 与仓库配置。" />
         <div className="notice notice--danger" role="alert">
           <IconAlert size={16} />
           <div><b>客户端配置读取失败。</b> {error ?? "接口未返回配置"}</div>
@@ -46,15 +46,14 @@ export function Client() {
   return (
     <>
       <PageHead
-        eyebrow="首次接入"
         title="客户端"
-        lede="先带外核对完整 GPG 指纹，再安装 keyring 与仓库配置；客户端不会远程操作，只读取签名仓库。"
+        lede="先带外核对 GPG 指纹，再安装 keyring；客户端只读取签名仓库。"
       />
 
       <div className="stack">
         <Card>
           <CardHead>
-            <CardTitle eyebrow="完整指纹" title="仓库 GPG 主指纹" sub="通过独立可信渠道人工核对后再导入" />
+            <CardTitle title="GPG 主指纹" sub="带外核对后再导入" />
             <Button size="sm" variant="ghost" icon={<IconCopy size={14} />} onClick={() => void copy(data.gpg_fingerprint, "指纹")}>复制</Button>
           </CardHead>
           <CardBody>
@@ -81,7 +80,7 @@ export function Client() {
 
         <Card>
           <CardHead>
-            <CardTitle eyebrow="pacman.conf" title="仓库配置" />
+            <CardTitle title="仓库配置" />
             <div className="row">
               <Badge tone="accent">SigLevel Required</Badge>
               <Button size="sm" variant="ghost" icon={<IconCopy size={14} />} onClick={() => void copy(data.repository_config, "仓库配置")}>复制</Button>
@@ -96,7 +95,7 @@ export function Client() {
 
         <Card>
           <CardHead>
-            <CardTitle eyebrow="安装步骤" title="首装命令" />
+            <CardTitle title="首装命令" />
             <Badge tone="info">{data.commands.length} 步</Badge>
           </CardHead>
           <CardBody>
@@ -129,7 +128,7 @@ function KeyringStat({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: "12px 14px" }}>
       <div className="u-muted" style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
-      <div style={{ fontSize: 15, fontWeight: 650, marginTop: 6, color: "var(--ink)" }}>{value}</div>
+      <div style={{ fontSize: 15, fontWeight: 600, marginTop: 6, color: "var(--ink)" }}>{value}</div>
     </div>
   );
 }

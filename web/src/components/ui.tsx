@@ -29,7 +29,7 @@ export function Button({
 }: ButtonProps) {
   const cls = [
     "btn",
-    variant === "default" ? "" : variant === "primary" ? "btn--primary" : variant === "accent" ? "btn--accent" : variant === "ghost" ? "btn--ghost" : "btn--danger",
+    variant === "default" ? "" : variant === "primary" || variant === "accent" ? "btn--primary" : variant === "ghost" ? "btn--ghost" : "btn--danger",
     size === "sm" ? "btn--sm" : "",
     className ?? ""
   ]

@@ -75,9 +75,8 @@ export function Packages() {
   return (
     <>
       <PageHead
-        eyebrow="pkgbase"
-        title="AUR 软件包"
-        lede="只有加入与删除两种生命周期操作；依赖随根订阅自动加入，删除时同步清理不再可达的隐式依赖。"
+        title="软件包"
+        lede="加入或删除订阅；隐式依赖随根包自动维护。"
         actions={
           <Button variant="primary" icon={<IconPlus size={15} />} onClick={() => document.getElementById("pkg-search")?.focus()}>
             加入软件包
@@ -156,7 +155,7 @@ export function Packages() {
 
         <Card>
           <CardHead>
-            <CardTitle eyebrow="订阅" title="显式包与必要依赖" />
+            <CardTitle title="订阅" sub="显式包与必要依赖" />
             <div className="row">
               <Badge tone="accent">{shown.filter((s) => s.kind === "direct").length} 显式</Badge>
               <Badge tone="info">{shown.filter((s) => s.kind === "implicit").length} 依赖</Badge>
@@ -300,7 +299,6 @@ function PackageDetailDrawer({
       open
       onClose={onClose}
       title={`${detail.package_base} · ${detail.version}`}
-      eyebrow="pkgbase 详情"
       footer={
         <div className="row" style={{ justifyContent: "flex-start" }}>
           <Button variant="primary" size="sm" loading={busyKey === `rebuild-${detail.package_base}`} onClick={() => setConfirmRebuild(true)}>
