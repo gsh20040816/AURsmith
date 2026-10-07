@@ -51,9 +51,8 @@ export function Releases() {
   return (
     <>
       <PageHead
-        eyebrow="current / previous"
         title="发布"
-        lede="Publisher 在 staging 中签名并生成仓库数据库，校验完成后原子切换；只保留 current 和 previous。"
+        lede="签名校验后原子切换；仅保留 current / previous。"
         actions={<Button variant="ghost" onClick={releases.reload} icon={<IconRefresh size={15} />}>刷新</Button>}
       />
 
@@ -83,7 +82,7 @@ export function Releases() {
 
         <Card>
           <CardHead>
-            <CardTitle eyebrow="发布历史" title="所有 Release" />
+            <CardTitle title="发布历史" />
             <Badge tone="neutral">{list.length} 条</Badge>
           </CardHead>
           <CardBody flush>

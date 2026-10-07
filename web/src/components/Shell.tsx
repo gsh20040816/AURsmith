@@ -2,7 +2,7 @@ import { ReactNode, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useApp } from "../lib/appctx";
 import { api } from "../lib/api";
-import { IconBell, IconBox, IconGrid, IconHammer, IconPackage, IconRocket, IconShield, IconTerminal } from "./icons";
+import { IconBox, IconGrid, IconHammer, IconPackage, IconRocket, IconShield, IconTerminal } from "./icons";
 import { CommandPalette } from "./CommandPalette";
 import { Avatar } from "./Avatar";
 import { useToast } from "./Toast";
@@ -15,13 +15,13 @@ import { Client } from "../features/Client";
 
 type NavItem = { to: string; label: string; icon: ReactNode; badge?: number };
 
-const TITLES: Record<string, { title: string; sub: string }> = {
-  "/dashboard": { title: "总览", sub: "真实运行状态" },
-  "/packages": { title: "软件包", sub: "订阅与依赖闭包" },
-  "/audits": { title: "审查", sub: "diff-first 3+1" },
-  "/builds": { title: "构建", sub: "固定 Builder 队列" },
-  "/releases": { title: "发布", sub: "current / previous" },
-  "/client": { title: "客户端", sub: "首次接入与 keyring" }
+const TITLES: Record<string, { title: string }> = {
+  "/dashboard": { title: "总览" },
+  "/packages": { title: "软件包" },
+  "/audits": { title: "审查" },
+  "/builds": { title: "构建" },
+  "/releases": { title: "发布" },
+  "/client": { title: "客户端" }
 };
 
 export function Shell() {
@@ -32,6 +32,17 @@ export function Shell() {
   const [auditAttention, setAuditAttention] = useState(0);
   const [activeJobs, setActiveJobs] = useState(0);
   const [keyringGeneration, setKeyringGeneration] = useState<number | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -133,18 +144,13 @@ export function Shell() {
         <header className="topbar">
           <div className="topbar__title">
             <strong>{current.title}</strong>
-            <span>{current.sub}</span>
           </div>
           <div className="topbar__spacer" />
           <button className="btn btn--ghost topbar__search" aria-label="跳转页面" onClick={() => setPalette(true)}>
-            <IconGrid size={15} />
-            <span className="u-muted" style={{ flex: 1 }}>跳转页面…</span>
+            <IconGrid size={14} />
             <kbd className="key">⌘K</kbd>
           </button>
           <div className="topbar__actions">
-            <button className="btn btn--ghost btn--icon" aria-label="通知">
-              <IconBell size={16} />
-            </button>
             <div className="row" style={{ gap: 8 }}>
               <Avatar name={session?.username ?? "a"} />
               <button

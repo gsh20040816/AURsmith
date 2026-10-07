@@ -54,13 +54,12 @@ export function Builds() {
   return (
     <>
       <PageHead
-        eyebrow="固定 Builder"
-        title="构建任务"
-        lede="只显示 Build、attempt、有限重试、最后错误和有界日志。构建在一个一次性联网 Docker 容器中完成，产物经 write-only rrsync 推送。"
+        title="构建"
+        lede="固定 Builder 队列；有界日志与有限重试。"
         actions={<Button variant="ghost" onClick={jobs.reload} icon={<IconRefresh size={15} />}>刷新</Button>}
       />
 
-      <div className="grid grid--stats" style={{ marginBottom: 16 }}>
+      <div className="grid grid--stats-4" style={{ marginBottom: 16 }}>
         <Stat label="构建中" value={running} icon={<IconHammer size={17} />} foot="运行中的 attempt" />
         <Stat label="排队中" value={queued} icon={<IconHammer size={17} />} foot="等待空槽位" />
         <Stat label="失败" value={failed} icon={<IconHammer size={17} />} foot="需人工处置" />
@@ -76,7 +75,7 @@ export function Builds() {
 
       <Card>
         <CardHead>
-          <CardTitle eyebrow="Job 队列" title="任务" sub="按优先级领取，全局并发槽位控制" />
+          <CardTitle title="任务" sub="按优先级领取" />
           <div className="row">
             <Badge tone="info">{list.length} 总任务</Badge>
             <Button size="sm" variant="ghost" onClick={jobs.reload} icon={<IconRefresh size={14} />}>刷新</Button>
@@ -150,7 +149,6 @@ export function Builds() {
         open={!!logJob}
         onClose={() => setLogJob(null)}
         title={logJob ? `构建日志 · ${shortHash(logJob.id, 6)}` : ""}
-        eyebrow="有界构建日志"
       >
         {logError ? (
           <div className="notice notice--danger" role="alert">

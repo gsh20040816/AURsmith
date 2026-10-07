@@ -19,7 +19,7 @@ describe("AURsmith 控制台", () => {
 
   it("只展示固定两机核心流程", async () => {
     render(<App />);
-    expect(await screen.findByText("审查后再构建，签名后再发布")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "总览" })).toBeInTheDocument();
     expect(screen.getByLabelText("软件包锻造流程")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "客户端" })).toHaveAttribute("href", "/client");
     expect(screen.queryByRole("link", { name: /Worker/ })).not.toBeInTheDocument();
