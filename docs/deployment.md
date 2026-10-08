@@ -4,7 +4,7 @@
 
 ## 0. 部署前必须处理
 
-- **固定 Docker CLI 镜像摘要**：`deploy/Dockerfile` 的 `docker-cli` target 目前是 `FROM docker:28-cli`（未固定 digest）。上线前在可信网络执行 `docker buildx imagetools inspect docker:28-cli`，把 `@sha256:…` 写进 Dockerfile 并提交。其余基础镜像已固定。
+- **固定基础镜像摘要**：`deploy/Dockerfile` 的全部基础镜像（含 Docker CLI）已固定 digest；升级时先核对新摘要，再构建并验证。
 - **Cloudflare 请求体上限**：免费/Pro 套餐单个请求体上限 100 MB。Builder 以 32 MiB 分片上传，Caddy 片段限制 `request_body max_size 40MB`；不要把分片调大到超过 Cloudflare 上限。
 - 秘密文件以宿主权限挂载进容器，容器内进程是 UID 10001：秘密文件需属主 10001（`chown 10001:10001 file && chmod 0400 file`）或属组可读。
 

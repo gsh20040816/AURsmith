@@ -48,8 +48,7 @@ ENTRYPOINT ["/usr/local/bin/aursmithd", "signer"]
 ARG AURSMITH_SOURCE_GIT_COMMIT
 LABEL org.opencontainers.image.revision=$AURSMITH_SOURCE_GIT_COMMIT
 
-# 部署前建议把 docker CLI 镜像也固定到 digest（与其他基础镜像一致）。
-FROM docker:28-cli AS docker-cli
+FROM docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d AS docker-cli
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS builder
 RUN apt-get update \
