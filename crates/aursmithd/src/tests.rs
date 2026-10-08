@@ -529,6 +529,50 @@ async fn full_pipeline_from_revision_to_signed_repository_and_rollback() {
     assert!(!publish::reconcile(&fixture.state).await.unwrap());
     build_and_upload(&fixture, &packages, "2-1").await;
     assert!(publish::reconcile(&fixture.state).await.unwrap());
+
+    // 安全基线：staging 中被篡改的产物不得签名，旧 current 保持不变。
+    let second_plan = std::fs::read_dir(&inbox)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("demo-2-1-x86_64.pkg.tar.zst").is_file())
+        .unwrap();
+    let staged = second_plan.join("demo-2-1-x86_64.pkg.tar.zst");
+    let original = std::fs::read(&staged).unwrap();
+    let mut tampered = original.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xff;
+    std::fs::write(&staged, &tampered).unwrap();
+    assert_eq!(signer.process_inbox().unwrap(), 1);
+    let failed_result = fixture
+        .state
+        .config
+        .exchange_dir
+        .join("outbox")
+        .join(format!(
+            "{}.json",
+            second_plan.file_name().unwrap().to_string_lossy()
+        ));
+    let failed: SignerResult =
+        serde_json::from_slice(&std::fs::read(&failed_result).unwrap()).unwrap();
+    assert_eq!(failed.state, SignerState::Failed);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("产物与计划不一致"),
+        "{:?}",
+        failed.error
+    );
+    assert_eq!(
+        std::fs::read_link(arch.join("releases/current")).unwrap(),
+        first_release
+    );
+    assert!(!arch.join("demo-2-1-x86_64.pkg.tar.zst").exists());
+    std::fs::write(&staged, &original).unwrap();
+    std::fs::remove_file(&failed_result).unwrap();
+
     assert_eq!(signer.process_inbox().unwrap(), 1);
     publish::collect_signer_results(&fixture.state)
         .await
