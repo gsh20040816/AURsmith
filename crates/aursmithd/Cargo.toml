@@ -1,0 +1,34 @@
+[package]
+name = "aursmithd"
+description = "AURsmith 公网主服务：Web/API、AUR 同步、2+1 审查、构建调度、期望状态发布，以及无网络签名器子命令"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aursmith-core = { path = "../aursmith-core" }
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http.workspace = true
+tower.workspace = true

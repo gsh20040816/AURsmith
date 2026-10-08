@@ -292,6 +292,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "aursmithd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aursmith-core",
+ "axum",
+ "base64",
+ "chrono",
+ "clap",
+ "futures-util",
+ "hex",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1908,6 +1937,12 @@ dependencies = [
  "digest",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"
