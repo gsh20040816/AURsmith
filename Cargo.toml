@@ -2,6 +2,7 @@
 members = [
   "crates/aursmith-core",
   "crates/aursmithd",
+  "crates/aursmith-builder",
   "crates/aursmith-domain",
   "crates/aursmith-protocol",
   "crates/aursmith-controller",

@@ -1,0 +1,28 @@
+[package]
+name = "aursmith-builder"
+description = "AURsmith 家用 Builder：通过 HTTPS 领取构建、在一次性 Docker 容器中执行 makepkg、分片上传产物；guest 子命令在构建容器内运行"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aursmith-core = { path = "../aursmith-core" }
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
