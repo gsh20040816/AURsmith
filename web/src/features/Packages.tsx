@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { usePolling, useStable } from "../lib/hooks";
-import { shortHash } from "../lib/format";
+import { relativeTime, shortHash } from "../lib/format";
 import { type AurPackage, type PackageDetail, type Subscription } from "../lib/types";
 import { Badge, Button, Card, CardBody, CardHead, CardTitle, Empty, PageHead, SearchBox, StatusBadge } from "../components/ui";
 import { Confirm, Drawer } from "../components/Overlay";
@@ -44,7 +44,7 @@ export function Packages() {
   }, [query, toast]);
 
   const subbed = (base: string) =>
-    (subs.data?.items ?? []).some((s) => s.package_base === base && s.kind === "direct");
+    (subs.data?.items ?? []).some((s) => s.package_base === base && s.direct);
 
   const operate = async (key: string, fn: () => Promise<unknown>, successMsg: string) => {
     setBusyKey(key);
@@ -157,8 +157,8 @@ export function Packages() {
           <CardHead>
             <CardTitle title="订阅" sub="显式包与必要依赖" />
             <div className="row">
-              <Badge tone="accent">{shown.filter((s) => s.kind === "direct").length} 显式</Badge>
-              <Badge tone="info">{shown.filter((s) => s.kind === "implicit").length} 依赖</Badge>
+              <Badge tone="accent">{shown.filter((s) => s.direct).length} 显式</Badge>
+              <Badge tone="info">{shown.filter((s) => !s.direct).length} 依赖</Badge>
               <Button variant="ghost" size="sm" onClick={subs.reload} icon={<IconRefresh size={14} />}>刷新</Button>
             </div>
           </CardHead>
@@ -173,37 +173,42 @@ export function Packages() {
                       <th>pkgbase</th>
                       <th>来源</th>
                       <th>版本 / 输出</th>
-                      <th>引用</th>
+                      <th>审查 / 构建</th>
                       <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {shown.map((item) => (
-                      <tr key={item.id} onClick={() => void openDetail(item)}>
+                      <tr key={item.package_base} onClick={() => void openDetail(item)}>
                         <td>
                           <div className="tbl__cell-main">
                             <strong>{item.package_base}</strong>
-                            <span className="tbl__sub">{item.description ?? "—"}</span>
+                            <span className="tbl__sub">{item.sync_error ? `同步失败：${item.sync_error}` : item.description ?? "—"}</span>
                           </div>
                         </td>
                         <td>
-                          <span className={`pkg-tag ${item.kind === "direct" ? "pkg-tag--direct" : "pkg-tag--implicit"}`}>
-                            {item.kind === "direct" ? "显式加入" : "必要依赖"}
+                          <span className={`pkg-tag ${item.direct ? "pkg-tag--direct" : "pkg-tag--implicit"}`}>
+                            {item.direct ? "显式加入" : `依赖 · ${item.required_by.join(", ")}`}
                           </span>
                         </td>
                         <td>
                           <div className="tbl__cell-main">
                             <code className="inline">{item.version ?? "等待同步"}</code>
-                            <span className="tbl__sub">{item.outputs.join(" · ") || "—"}</span>
+                            <span className="tbl__sub">{item.outputs?.join(" · ") || "—"}</span>
                           </div>
                         </td>
-                        <td><code className="inline">{item.reference_count}</code></td>
+                        <td>
+                          <div className="tbl__cell-main">
+                            <StatusBadge meta={item.unresolved_providers.length ? { tone: "warning", label: "需选择 provider" } : statusMeta(item.revision_state)} />
+                            <span className="tbl__sub">构建 {statusMeta(item.build_state).label}</span>
+                          </div>
+                        </td>
                         <td onClick={(e) => e.stopPropagation()}>
                           <div className="row" style={{ gap: 6 }}>
                             <Button size="sm" variant="ghost" onClick={() => void openDetail(item)}>详情</Button>
-                            {item.kind === "direct" && (
+                            {item.direct && (
                               <>
-                                <Button size="sm" variant="ghost" onClick={() => void operate(`refresh-${item.id}`, () => api.refreshPackage(item.package_base), "已检查更新")}>检查更新</Button>
+                                <Button size="sm" variant="ghost" onClick={() => void operate(`refresh-${item.package_base}`, () => api.refreshPackage(item.package_base), "已检查更新")}>检查更新</Button>
                                 <Button size="sm" variant="ghost" className="is-danger" onClick={() => setDeleteTarget(item)}>删除</Button>
                               </>
                             )}
@@ -232,12 +237,8 @@ export function Packages() {
             if (busyKey) return;
             setBusyKey(`provider-${dep}-${candidate}`);
             try {
-              const result = await api.selectProvider(detail.package_base, dep, candidate);
-              if (result.refresh.state === "refresh_pending") {
-                toast.warning("选择已保存", result.refresh.message);
-              } else {
-                toast.success("已选择 Provider");
-              }
+              await api.selectProvider(detail.package_base, dep, candidate);
+              toast.success("已选择 Provider", `${candidate} 会加入订阅闭包并开始同步。`);
               subs.reload();
               try {
                 const updated = await api.packageDetail(detail.package_base);
@@ -262,13 +263,13 @@ export function Packages() {
         onClose={() => setDeleteTarget(null)}
         onConfirm={() => {
           if (!deleteTarget) return;
-          void operate(`delete-${deleteTarget.id}`, () => api.deleteSubscription(deleteTarget.package_base), "已删除订阅").then(() => {
+          void operate(`delete-${deleteTarget.package_base}`, () => api.unsubscribe(deleteTarget.package_base), "已删除订阅").then(() => {
             setDeleteTarget(null);
           });
         }}
         danger
         title={`删除 ${deleteTarget?.package_base}？`}
-        body="它及其不再需要的依赖会在下一次原子发布中移出仓库；仍被其他显式订阅引用的共享依赖会保留。"
+        body="它及其不再需要的依赖会在下一次期望状态发布中移出仓库；仍被其他显式订阅引用的共享依赖会保留。"
         confirmLabel="确认删除"
         busy={busyKey.startsWith("delete-")}
       />
@@ -298,7 +299,7 @@ function PackageDetailDrawer({
     <Drawer
       open
       onClose={onClose}
-      title={`${detail.package_base} · ${detail.version}`}
+      title={`${detail.package_base} · ${detail.version ?? "等待同步"}`}
       footer={
         <div className="row" style={{ justifyContent: "flex-start" }}>
           <Button variant="primary" size="sm" loading={busyKey === `rebuild-${detail.package_base}`} onClick={() => setConfirmRebuild(true)}>
@@ -318,57 +319,86 @@ function PackageDetailDrawer({
           {detail.maintainer ? ` · 维护者 ${detail.maintainer}` : " · 孤儿包"}
         </p>
         <div className="row" style={{ gap: 6 }}>
-          {detail.outputs.map((o) => <code className="inline" key={o}>{o}</code>)}
+          {(detail.outputs ?? []).map((o) => <code className="inline" key={o}>{o}</code>)}
         </div>
 
         <Section title="构建策略">
-          <div className="doctor-list">
-            <div className="doctor-row">
-              <div className="doctor-row__name">
-                <span className="doctor-row__check ok"><IconCheck size={13} /></span>
-                <span><code className="inline">check()</code> {detail.build_policy.allow_check ? "默认执行" : "已显式禁用"}</span>
+          <div className="check-list">
+            <div className="check-row">
+              <div className="check-row__name">
+                <span className="check-row__check ok"><IconCheck size={13} /></span>
+                <span><code className="inline">check()</code> {detail.allow_check ? "默认执行" : "已显式禁用"}</span>
               </div>
               <Button
                 size="sm"
                 variant="ghost"
                 loading={busyKey === `policy-${detail.package_base}`}
-                onClick={() => void onSetPolicy(!detail.build_policy.allow_check)}
+                onClick={() => void onSetPolicy(!detail.allow_check)}
               >
-                {detail.build_policy.allow_check ? "禁用 check()" : "恢复 check()"}
+                {detail.allow_check ? "禁用 check()" : "恢复 check()"}
               </Button>
             </div>
           </div>
-          {!detail.build_policy.allow_check && (
-            <p className="u-muted" style={{ fontSize: 12 }}>该设置只影响之后创建的 Job，需记录理由。</p>
+          {!detail.allow_check && (
+            <p className="u-muted" style={{ fontSize: 12 }}>该设置只影响之后排队的构建。</p>
           )}
         </Section>
 
+        {detail.sync.error && (
+          <div className="notice notice--danger" style={{ margin: 0 }}>
+            <IconAlert size={16} />
+            <div style={{ fontSize: 12.5 }}>AUR 同步失败：{detail.sync.error}</div>
+          </div>
+        )}
+        {!detail.direct && detail.required_by.length > 0 && (
+          <p className="u-muted" style={{ fontSize: 12.5 }}>作为依赖被 {detail.required_by.join(", ")} 需要。</p>
+        )}
+
         <Section title={`Revision (${revisions.length})`}>
-          <div className="doctor-list">
+          <div className="check-list">
             {revisions.map((rev) => (
-              <div className="doctor-row" key={rev.id}>
-                <div className="doctor-row__name">
+              <div className="check-row" key={rev.id}>
+                <div className="check-row__name">
                   <StatusBadge meta={statusMeta(rev.state)} />
                   <span>
-                    <strong>{rev.upstream_version}</strong>
-                    <span className="u-muted"> · commit {shortHash(rev.aur_commit)}</span>
+                    <strong>{rev.version}</strong>
+                    <span className="u-muted"> · commit {shortHash(rev.aur_commit)}{rev.vcs_commit ? ` · vcs ${shortHash(rev.vcs_commit)}` : ""}</span>
                   </span>
                 </div>
-                <span className="doctor-row__msg">{rev.published_version ?? "尚未构建"}</span>
+                <span className="check-row__msg">{rev.first_time ? "首次添加" : relativeTime(rev.created_at)}</span>
+              </div>
+            ))}
+          </div>
+        </Section>
+
+        <Section title={`最近构建 (${detail.builds.length})`}>
+          <div className="check-list">
+            {detail.builds.length === 0 && <div className="check-row"><span className="u-muted">尚无构建</span></div>}
+            {detail.builds.map((build) => (
+              <div className="check-row" key={build.id}>
+                <div className="check-row__name">
+                  <StatusBadge meta={statusMeta(build.state)} />
+                  <span>
+                    <strong>{build.version}</strong>
+                    <span className="u-muted"> · 第 {build.attempt} 次{build.error_code ? ` · ${build.error_code}` : ""}</span>
+                  </span>
+                </div>
+                <span className="check-row__msg">{relativeTime(build.finished_at ?? build.created_at)}</span>
               </div>
             ))}
           </div>
         </Section>
 
         <Section title="依赖解析">
-          <div className="doctor-list">
-            {detail.dependency_resolution.map((dep) => (
-              <div className="doctor-row" key={`${dep.kind}-${dep.name}`}>
-                <div className="doctor-row__name">
+          <div className="check-list">
+            {detail.dependencies.length === 0 && <div className="check-row"><span className="u-muted">没有依赖</span></div>}
+            {detail.dependencies.map((dep) => (
+              <div className="check-row" key={`${dep.kind}-${dep.name}`}>
+                <div className="check-row__name">
                   <span className={`pkg-tag ${dep.state === "needs_selection" ? "pkg-tag--direct" : "pkg-tag--implicit"}`}>{dep.kind}</span>
                   <span>{dep.name}</span>
                 </div>
-                <span className="doctor-row__msg">
+                <span className="check-row__msg">
                   {dep.state === "needs_selection" ? (
                     <span className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
                       {dep.candidates.map((c) => (
@@ -378,7 +408,7 @@ function PackageDetailDrawer({
                       ))}
                     </span>
                   ) : (
-                    dep.target_package_base ?? dep.state
+                    dep.target ?? (dep.state === "official" ? "官方仓库" : dep.state)
                   )}
                 </span>
               </div>

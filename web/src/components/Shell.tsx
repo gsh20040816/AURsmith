@@ -8,9 +8,9 @@ import { Avatar } from "./Avatar";
 import { useToast } from "./Toast";
 import { Dashboard } from "../features/Dashboard";
 import { Packages } from "../features/Packages";
-import { Audits } from "../features/Audits";
+import { Reviews } from "../features/Reviews";
 import { Builds } from "../features/Builds";
-import { Releases } from "../features/Releases";
+import { Publications } from "../features/Publications";
 import { Client } from "../features/Client";
 
 type NavItem = { to: string; label: string; icon: ReactNode; badge?: number };
@@ -18,9 +18,9 @@ type NavItem = { to: string; label: string; icon: ReactNode; badge?: number };
 const TITLES: Record<string, { title: string }> = {
   "/dashboard": { title: "总览" },
   "/packages": { title: "软件包" },
-  "/audits": { title: "审查" },
+  "/reviews": { title: "审查" },
   "/builds": { title: "构建" },
-  "/releases": { title: "发布" },
+  "/publications": { title: "发布" },
   "/client": { title: "客户端" }
 };
 
@@ -29,9 +29,10 @@ export function Shell() {
   const toast = useToast();
   const location = useLocation();
   const [palette, setPalette] = useState(false);
-  const [auditAttention, setAuditAttention] = useState(0);
-  const [activeJobs, setActiveJobs] = useState(0);
-  const [keyringGeneration, setKeyringGeneration] = useState<number | null>(null);
+  const [reviewAttention, setReviewAttention] = useState(0);
+  const [activeBuilds, setActiveBuilds] = useState(0);
+  const [signerOk, setSignerOk] = useState<boolean | null>(null);
+  const [builderOk, setBuilderOk] = useState<boolean | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -49,15 +50,12 @@ export function Shell() {
     let reported = false;
     const load = async () => {
       try {
-        const [audits, jobs, client] = await Promise.all([
-          api.audits(),
-          api.jobs(),
-          api.clientBootstrap()
-        ]);
+        const status = await api.status();
         if (!alive) return;
-        setAuditAttention(audits.items.filter((a) => a.state === "manual_review").length);
-        setActiveJobs(jobs.items.filter((j) => ["queued", "no_eligible_worker", "dispatched", "running", "uncertain"].includes(j.status)).length);
-        setKeyringGeneration(client.keyring_generation);
+        setReviewAttention(status.counts.manual_review);
+        setActiveBuilds(status.counts.queued + status.counts.running);
+        setSignerOk(status.checks.find((c) => c.id === "signer")?.ok ?? null);
+        setBuilderOk(status.checks.find((c) => c.id === "builder")?.ok ?? null);
         reported = false;
       } catch (reason) {
         if (!alive || reported) return;
@@ -77,9 +75,9 @@ export function Shell() {
     const op: NavItem[] = [{ to: "/dashboard", label: "总览", icon: <IconGrid size={16} /> }];
     const repo: NavItem[] = [
       { to: "/packages", label: "软件包", icon: <IconPackage size={16} /> },
-      { to: "/audits", label: "审查", icon: <IconShield size={16} />, badge: auditAttention || undefined },
-      { to: "/builds", label: "构建", icon: <IconHammer size={16} />, badge: activeJobs || undefined },
-      { to: "/releases", label: "发布", icon: <IconRocket size={16} /> }
+      { to: "/reviews", label: "审查", icon: <IconShield size={16} />, badge: reviewAttention || undefined },
+      { to: "/builds", label: "构建", icon: <IconHammer size={16} />, badge: activeBuilds || undefined },
+      { to: "/publications", label: "发布", icon: <IconRocket size={16} /> }
     ];
     const access: NavItem[] = [{ to: "/client", label: "客户端", icon: <IconTerminal size={16} /> }];
     return [
@@ -87,7 +85,7 @@ export function Shell() {
       { label: "仓库", items: repo },
       { label: "接入", items: access }
     ];
-  }, [auditAttention, activeJobs]);
+  }, [reviewAttention, activeBuilds]);
 
   const current = TITLES[location.pathname] ?? TITLES["/dashboard"];
 
@@ -126,15 +124,12 @@ export function Shell() {
         <div className="sidebar__foot">
           <div className="sidebar__env">
             <div className="sidebar__env-row">
-              <span>节点</span>
-              <strong className="dual">
-                <span>公网</span>
-                <span>Builder</span>
-              </strong>
+              <span>Builder</span>
+              <strong>{builderOk == null ? "—" : builderOk ? "在线" : "离线"}</strong>
             </div>
             <div className="sidebar__env-row">
-              <span>keyring</span>
-              <strong>{keyringGeneration == null ? "未发布" : `gen ${keyringGeneration}`}</strong>
+              <span>签名器</span>
+              <strong>{signerOk == null ? "—" : signerOk ? "正常" : "失败"}</strong>
             </div>
           </div>
         </div>
@@ -172,9 +167,9 @@ export function Shell() {
           <Routes>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/packages" element={<Packages />} />
-            <Route path="/audits" element={<Audits />} />
+            <Route path="/reviews" element={<Reviews />} />
             <Route path="/builds" element={<Builds />} />
-            <Route path="/releases" element={<Releases />} />
+            <Route path="/publications" element={<Publications />} />
             <Route path="/client" element={<Client />} />
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="*" element={<Navigate to="/dashboard" replace />} />

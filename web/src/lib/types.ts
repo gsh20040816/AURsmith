@@ -1,12 +1,20 @@
-/* Domain types returned by the AURsmith controller API. */
+/* aursmithd 管理 API 返回的领域类型。 */
 
-export type Session = { id: string; username: string };
+export type Session = { username: string };
 
-export type DoctorCheck = { id: string; ok: boolean; message: string };
-export type Doctor = {
+export type StatusCheck = { id: "database" | "review" | "builder" | "signer" | string; ok: boolean; message: string };
+export type SystemStatus = {
   ready: boolean;
   checked_at: string;
-  checks: DoctorCheck[];
+  checks: StatusCheck[];
+  counts: {
+    subscriptions: number;
+    pending_review: number;
+    manual_review: number;
+    queued: number;
+    running: number;
+    failed: number;
+  };
 };
 
 export type AurPackage = {
@@ -24,150 +32,167 @@ export type AurPackage = {
   provides: string[];
 };
 
+export type RevisionState = "pending_review" | "manual_review" | "approved" | "rejected" | "superseded";
+export type BuildState = "queued" | "running" | "uploading" | "succeeded" | "failed";
+
+/** 订阅闭包中的一个 pkgbase：direct 为显式订阅，否则是必要依赖。 */
 export type Subscription = {
-  id: string;
   package_base: string;
-  kind: "direct" | "implicit";
-  reference_count: number;
-  followed_outputs: string[];
+  direct: boolean;
+  required_by: string[];
   version: string | null;
   description: string | null;
-  outputs: string[];
   maintainer: string | null;
   out_of_date: number | null;
+  outputs: string[] | null;
+  sync_error: string | null;
+  last_checked_at: string | null;
+  revision_state: RevisionState | null;
+  revision_version: string | null;
+  build_state: BuildState | null;
+  build_version: string | null;
+  unresolved_providers: string[];
 };
 
-export type Revision = {
+export type RevisionRef = { id: string; state: RevisionState } | null;
+
+export type PackageRevision = {
   id: string;
   aur_commit: string;
   vcs_commit: string | null;
-  upstream_version: string;
-  published_version: string | null;
-  state: string;
-  release_state: string | null;
+  version: string;
+  state: RevisionState;
+  first_time: boolean;
   created_at: string;
+  decided_at: string | null;
 };
 
-export type DependencyResolution = {
+export type ResolvedDependency = {
   name: string;
   kind: string;
-  target_package_base: string | null;
-  state: "official_or_unknown" | "resolved" | "needs_selection" | "cycle";
+  state: "official" | "aur" | "needs_selection" | "unknown";
+  target: string | null;
+  selected: string | null;
   candidates: string[];
+};
+
+export type ArtifactRecord = {
+  file: string;
+  sha256: string;
+  size: number;
+  package_name: string;
+  package_version: string;
+  architecture: string;
+};
+
+export type Build = {
+  id: string;
+  package_base: string;
+  revision_id: string;
+  version: string;
+  aur_commit: string;
+  vcs_commit: string | null;
+  state: BuildState;
+  attempt: number;
+  reason: "approved" | "manual";
+  builder_id: string | null;
+  error_code: string | null;
+  error_class: "transient" | "deterministic" | "config" | null;
+  artifacts: ArtifactRecord[] | null;
+  has_log: boolean;
+  lease_expires_at: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  waiting_reason?: string | null;
 };
 
 export type PackageDetail = {
   package_base: string;
-  version: string;
+  direct: boolean;
+  in_closure: boolean;
+  required_by: string[];
+  version: string | null;
   description: string | null;
   maintainer: string | null;
-  outputs: string[];
-  build_policy: { allow_check: boolean };
-  revisions: Revision[];
-  dependency_resolution: DependencyResolution[];
+  outputs: string[] | null;
+  allow_check: boolean;
+  sync: { last_checked_at: string | null; next_check_at: string; error: string | null };
+  revisions: PackageRevision[];
+  dependencies: ResolvedDependency[];
+  builds: Build[];
 };
 
-export type AuditRun = {
-  tier: "low" | "high";
-  slot: number;
-  attempt: number;
-  adapter: string;
-  provider: string;
-  model: string;
-  adapter_version: string;
-  status: string;
-  verdict: "approve" | "reject" | "error" | null;
-  report: { summary?: string; findings?: unknown[]; files_read?: string[] } | null;
-  started_at: string | null;
-  finished_at: string | null;
+export type AgentFinding = {
+  severity: "info" | "warning" | "high" | "critical";
+  category: string;
+  message: string;
+  file: string | null;
+  line: number | null;
+  evidence: string;
 };
 
-export type AuditFinding = {
+export type ScanFinding = {
   rule_id: string;
   severity: "information" | "suspicious" | "block";
   path: string;
   summary: string;
 };
 
-export type Audit = {
-  sha256: string;
+export type ReviewRecord = {
+  kind: "scan" | "reuse" | "agent" | "human";
+  role: "low" | "high" | null;
+  model: string | null;
+  verdict: "approve" | "reject" | "error";
+  summary: string;
+  /** scan：ScanFinding[]；agent：{ findings, files_read }；其他为 null。 */
+  findings: ScanFinding[] | { findings: AgentFinding[]; files_read: string[] } | null;
+  created_at: string;
+};
+
+export type ReviewItem = {
   revision_id: string;
-  state:
-    | "agent_pending"
-    | "agent_running"
-    | "manual_review"
-    | "approved"
-    | "rejected"
-    | "blocked";
-  policy_version: string;
   package_base: string;
+  version: string;
   aur_commit: string;
-  findings: AuditFinding[];
-  coverage: {
-    aur_wrapper?: { mode: string; files: string[] };
-    upstream_source?: { mode: string; sources?: unknown[]; statement: string };
-    audit_reuse?: { mode: string; source_bundle_sha256: string };
-  };
-  runs: AuditRun[];
+  vcs_commit: string | null;
+  state: RevisionState;
+  first_time: boolean;
+  baseline_revision_id: string | null;
   created_at: string;
+  decided_at: string | null;
+  reviews: ReviewRecord[];
 };
 
-export type Job = {
+export type Publication = {
   id: string;
-  kind: "build";
-  status: string;
-  priority: number;
-  failure_code: string | null;
-  revision_sha256: string | null;
-  attempt_count: number;
-  has_logs: boolean;
-  next_attempt_at: string | null;
+  plan_sha256: string;
+  state: "pending" | "published" | "failed";
+  current: boolean;
+  error: string | null;
+  manifest_sha256: string | null;
+  keyring_fingerprint: string | null;
+  artifacts: ArtifactRecord[];
   created_at: string;
-  updated_at: string;
+  finished_at: string | null;
 };
 
-export type Release = {
-  id: string;
-  batch_id: string;
-  state: string;
-  position: "current" | "previous" | "failed";
-  manifest_sha256: string;
-  artifact_count: number;
-  last_error: string | null;
-  committed_at: string | null;
-  created_at: string;
+export type Publications = {
+  items: Publication[];
+  desired: { plan_sha256: string; artifact_count: number; withheld: string[] };
 };
 
 export type ClientBootstrap = {
   repository_config: string;
   gpg_fingerprint: string;
   gpg_key_url: string;
-  keyring_generation: number | null;
-  keyring_published_at: string | null;
-  keyring_next_due_at: string | null;
-  client_ca_url: string | null;
   commands: string[];
   warnings: string[];
 };
 
-export type LogDocument = {
-  job_id: string;
-  kind: "build";
-  sha256: string;
-  document: {
-    schema_version: number;
-    status: string;
-    failure_code: string | null;
-    guest_result: unknown;
-    logs: Array<{
-      path: string;
-      size: number;
-      sha256: string | null;
-      truncated: boolean;
-      content_base64?: string;
-      content_utf8?: string | null;
-      omitted_reason?: string;
-    }>;
-  };
-  created_at: string;
+export type BuildLog = {
+  build_id: string;
+  state: BuildState;
+  error_code: string | null;
+  log: string;
 };

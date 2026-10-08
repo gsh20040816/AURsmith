@@ -44,11 +44,11 @@
   font-weight: 600;
 }
 
-.doctor-list {
+.check-list {
   display: grid;
   gap: 0;
 }
-.doctor-row {
+.check-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -56,17 +56,17 @@
   padding: 9px 0;
   border-bottom: 1px solid var(--border);
 }
-.doctor-row:last-child {
+.check-row:last-child {
   border-bottom: none;
 }
-.doctor-row__name {
+.check-row__name {
   display: flex;
   align-items: center;
   gap: 10px;
   color: var(--text-secondary);
   font-size: 13px;
 }
-.doctor-row__check {
+.check-row__check {
   width: 20px;
   height: 20px;
   border-radius: 50%;
@@ -74,15 +74,15 @@
   place-items: center;
   flex: none;
 }
-.doctor-row__check.ok {
+.check-row__check.ok {
   background: var(--success-soft);
   color: var(--success);
 }
-.doctor-row__check.bad {
+.check-row__check.bad {
   background: var(--danger-soft);
   color: var(--danger);
 }
-.doctor-row__msg {
+.check-row__msg {
   color: var(--text-muted);
   font-size: 12px;
   text-align: right;
@@ -183,16 +183,16 @@
   color: var(--accent);
 }
 
-/* ---- Audit -------------------------------------------------------------- */
-.audit-card {
+/* ---- Reviews -------------------------------------------------------------- */
+.review-card {
   padding: 0;
 }
-.audit-card--attention {
+.review-card--attention {
   border-color: var(--warning-border);
   box-shadow: inset 3px 0 0 var(--warning);
 }
 
-.audit-card__head {
+.review-card__head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -200,20 +200,20 @@
   padding: 16px 18px;
   border-bottom: 1px solid var(--border);
 }
-.audit-card__title {
+.review-card__title {
   display: grid;
   gap: 3px;
 }
-.audit-card__title strong {
+.review-card__title strong {
   font-size: 16px;
   color: var(--ink);
 }
-.audit-card__title span {
+.review-card__title span {
   color: var(--text-muted);
   font-size: 12px;
   font-family: var(--font-mono);
 }
-.audit-card__body {
+.review-card__body {
   display: grid;
   gap: 16px;
   padding: 16px 18px;
@@ -341,65 +341,65 @@
   color: #5c6b7a;
 }
 
-/* ---- Releases ----------------------------------------------------------- */
-.release-table {
+/* ---- Publications ----------------------------------------------------------- */
+.publication-table {
   table-layout: fixed;
   min-width: 880px;
 }
-.release-table th:nth-child(1) {
+.publication-table th:nth-child(1) {
   width: 140px;
 }
-.release-table th:nth-child(2) {
+.publication-table th:nth-child(2) {
   width: 150px;
 }
-.release-table th:nth-child(3) {
+.publication-table th:nth-child(3) {
   width: 80px;
 }
-.release-table th:nth-child(4) {
+.publication-table th:nth-child(4) {
   width: 200px;
 }
-.release-table th:nth-child(5) {
+.publication-table th:nth-child(5) {
   width: 190px;
 }
-.release-table th:nth-child(6) {
+.publication-table th:nth-child(6) {
   width: 160px;
 }
-.release-positions {
+.publication-positions {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px;
 }
-.release-card {
+.publication-card {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 16px 18px;
   background: var(--surface);
 }
-.release-card--current {
+.publication-card--current {
   border-color: var(--border);
   border-left: 3px solid var(--success);
   background: var(--surface);
 }
-.release-card--prev {
+.publication-card--prev {
   border-color: var(--border);
 }
-.release-card__label {
+.publication-card__label {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 10px;
 }
-.release-card__label strong {
+.publication-card__label strong {
   color: var(--ink);
   font-size: 15px;
 }
-.release-card__meta {
+.publication-card__meta {
   display: grid;
   gap: 6px;
   color: var(--text-secondary);
   font-size: 12.5px;
 }
-.release-card__meta .row {
+.publication-card__meta .row {
   justify-content: space-between;
 }
 
@@ -435,7 +435,7 @@
 /* ---- Ping grid (misc) --------------------------------------------------- */
 @media (max-width: 860px) {
   .dash-hero,
-  .release-positions {
+  .publication-positions {
     grid-template-columns: 1fr;
   }
   .log-grid {
@@ -471,10 +471,10 @@
 .dash-agent-details .dash-agent-body {
   padding: 14px 16px;
 }
-.doctor-row.is-bad .doctor-row__name {
+.check-row.is-bad .check-row__name {
   color: var(--ink);
   font-weight: 500;
 }
-.doctor-row.is-ok {
+.check-row.is-ok {
   opacity: 0.72;
 }

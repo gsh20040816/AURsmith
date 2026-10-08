@@ -5,9 +5,9 @@ import { IconBox, IconGrid, IconHammer, IconPackage, IconRocket, IconShield, Ico
 const ITEMS: Array<{ to: string; label: string; hint: string; icon: ReactNode }> = [
   { to: "/dashboard", label: "总览", hint: "系统状态与流程", icon: <IconGrid size={16} /> },
   { to: "/packages", label: "软件包", hint: "订阅与依赖闭包", icon: <IconPackage size={16} /> },
-  { to: "/audits", label: "审查", hint: "diff-first 3+1", icon: <IconShield size={16} /> },
+  { to: "/reviews", label: "审查", hint: "2+1 Agent 与人工审批", icon: <IconShield size={16} /> },
   { to: "/builds", label: "构建", hint: "Builder 队列与日志", icon: <IconHammer size={16} /> },
-  { to: "/releases", label: "发布", hint: "current / previous", icon: <IconRocket size={16} /> },
+  { to: "/publications", label: "发布", hint: "期望状态与签名发布", icon: <IconRocket size={16} /> },
   { to: "/client", label: "客户端", hint: "接入与 keyring", icon: <IconTerminal size={16} /> }
 ];
 

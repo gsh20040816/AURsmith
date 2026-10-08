@@ -1,6 +1,5 @@
 import { api } from "../lib/api";
 import { useAsync } from "../lib/hooks";
-import { relativeTime } from "../lib/format";
 import { Badge, Button, Card, CardBody, CardHead, CardTitle, PageHead } from "../components/ui";
 import { useToast } from "../components/Toast";
 import { IconAlert, IconCopy, IconTerminal } from "../components/icons";
@@ -66,10 +65,9 @@ export function Client() {
               ))}
             </div>
 
-            <div className="grid grid--3" style={{ marginTop: 16 }}>
-              <KeyringStat label="keyring generation" value={`gen ${data.keyring_generation ?? "—"}`} />
-              <KeyringStat label="上次发布" value={data.keyring_published_at ? relativeTime(data.keyring_published_at) : "等待首次发布"} />
-              <KeyringStat label="下次到期" value={data.keyring_next_due_at ? relativeTime(data.keyring_next_due_at) : "—"} />
+            <div className="row" style={{ marginTop: 16, gap: 8 }}>
+              <span className="u-muted" style={{ fontSize: 12.5 }}>公钥地址</span>
+              <code className="inline">{data.gpg_key_url}</code>
             </div>
 
             {data.warnings.map((w) => (
@@ -116,19 +114,10 @@ export function Client() {
         <div className="notice notice--info">
           <IconTerminal size={16} />
           <div>
-            <b>换钥流程必须由管理员主动安排。</b>旧钥泄露时重新进行带外信任；正常换钥保持旧/新钥重叠期，回退 previous 不会静默恢复已不再受当前信任集合接受的仓库。
+            <b>签名私钥只存在于无网络的签名器中。</b>aursmith-keyring 只在签名密钥更换时重建；换钥需要重新进行带外指纹核对。
           </div>
         </div>
       </div>
     </>
-  );
-}
-
-function KeyringStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: "12px 14px" }}>
-      <div className="u-muted" style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
-      <div style={{ fontSize: 15, fontWeight: 600, marginTop: 6, color: "var(--ink)" }}>{value}</div>
-    </div>
   );
 }
