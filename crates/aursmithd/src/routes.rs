@@ -217,6 +217,13 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         }),
     ];
     let ready = checks.iter().all(|check| check["ok"] == true);
+    let failed_recently: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM builds WHERE state = 'failed' AND finished_at > ?",
+    )
+    .bind(Utc::now() - Duration::days(1))
+    .fetch_one(&state.db)
+    .await
+    .map_err(ApiError::internal)?;
     Ok(Json(json!({
         "ready": ready,
         "checked_at": Utc::now(),
@@ -227,7 +234,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
             "manual_review": count(&state, "SELECT COUNT(*) FROM revisions WHERE state = 'manual_review'").await?,
             "queued": count(&state, "SELECT COUNT(*) FROM builds WHERE state = 'queued'").await?,
             "running": count(&state, "SELECT COUNT(*) FROM builds WHERE state IN ('running', 'uploading')").await?,
-            "failed": count(&state, "SELECT COUNT(*) FROM builds WHERE state = 'failed' AND finished_at > datetime('now', '-1 day')").await?,
+            "failed": failed_recently,
         },
     })))
 }
