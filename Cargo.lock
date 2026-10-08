@@ -176,6 +176,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aursmith-core"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "aursmith-domain"
 version = "0.1.0"
 dependencies = [
