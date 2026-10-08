@@ -59,6 +59,7 @@ fn default_timeout() -> u64 {
 pub struct Agent {
     api: Api,
     endpoint: String,
+    opencode_session: bool,
     model: String,
     api_key: String,
     reasoning_effort: Option<String>,
@@ -126,6 +127,7 @@ impl Agent {
         Ok(Self {
             api: config.api,
             endpoint: format!("{}/{suffix}", config.base_url.trim().trim_end_matches('/')),
+            opencode_session: base.host_str() == Some("opencode.ai"),
             model: config.model,
             api_key,
             reasoning_effort: config.reasoning_effort,
@@ -171,6 +173,15 @@ impl Agent {
                     }],
                     "tool_choice": {"type": "tool", "name": "submit_review"}
                 })),
+        };
+        // Go 按会话路由；同一份审查输入的重试必须保持会话 ID 稳定。
+        let request = if self.opencode_session {
+            request.header(
+                "x-opencode-session",
+                aursmith_core::sha256_hex(input.as_bytes()),
+            )
+        } else {
+            request
         };
         let response = request.send().await.context("LLM 请求失败")?;
         let status = response.status();
@@ -598,4 +609,53 @@ pub async fn retry(
     Ok(Json(
         json!({"revision_id": revision_id, "state": "pending_review"}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, http::HeaderMap, routing::post};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn opencode_requests_keep_sessions_stable_and_other_providers_omit_them() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let headers = captured.clone();
+        let app = Router::new().route("/chat/completions", post(move |h: HeaderMap| {
+            let headers = headers.clone();
+            async move {
+                headers.lock().unwrap().push(h.get("x-opencode-session").cloned());
+                Json(json!({"choices": [{"message": {"content": json!({
+                    "verdict": "approve", "summary": "safe", "findings": [], "files_read": ["PKGBUILD"]
+                }).to_string()}}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        std::fs::write(&key, "test-key").unwrap();
+        let client = reqwest::Client::new();
+        for base_url in ["https://opencode.ai/zen/go/v1", "https://api.openai.com/v1"] {
+            let mut agent = Agent::new(ModelConfig {
+                api: Api::Openai,
+                base_url: base_url.into(),
+                model: "test".into(),
+                api_key_file: key.clone(),
+                reasoning_effort: None,
+            })
+            .unwrap();
+            agent.endpoint = endpoint.clone();
+            for input in ["same revision", "same revision", "new revision"] {
+                agent.review(&client, input).await.unwrap();
+            }
+        }
+        let captured = captured.lock().unwrap();
+        assert!(captured[0].is_some());
+        assert_eq!(captured[0], captured[1]);
+        assert_ne!(captured[0], captured[2]);
+        assert!(captured[3..].iter().all(Option::is_none));
+        server.abort();
+    }
 }
