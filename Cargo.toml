@@ -3,15 +3,6 @@ members = [
   "crates/aursmith-core",
   "crates/aursmithd",
   "crates/aursmith-builder",
-  "crates/aursmith-domain",
-  "crates/aursmith-protocol",
-  "crates/aursmith-controller",
-  "crates/aursmith-worker",
-  "crates/aursmithctl",
-  "crates/aursmith-agent-runner",
-  "crates/aursmith-agent-gateway",
-  "crates/aursmith-guest-agent",
-  "crates/aursmith-repository",
 ]
 resolver = "2"
 
@@ -36,7 +27,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 similar = "2.7"
-hmac = "0.12"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
 thiserror = "2.0"
 tempfile = "3.23"

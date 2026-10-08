@@ -110,42 +110,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "aursmith-agent-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "futures-util",
- "reqwest",
- "serde",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "aursmith-agent-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "clap",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "aursmith-builder"
 version = "0.1.0"
 dependencies = [
@@ -169,36 +133,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aursmith-controller"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aursmith-domain",
- "aursmith-protocol",
- "axum",
- "base64",
- "chrono",
- "clap",
- "futures-util",
- "hex",
- "hmac",
- "http",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tempfile",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "aursmith-core"
 version = "0.1.0"
 dependencies = [
@@ -209,108 +143,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "aursmith-domain"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "chrono",
- "hex",
- "serde",
- "sha2",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "aursmith-guest-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aursmith-domain",
- "aursmith-protocol",
- "chrono",
- "hex",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "aursmith-protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aursmith-domain",
- "base64",
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "aursmith-repository"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aursmith-protocol",
- "chrono",
- "hex",
- "serde_json",
- "sha2",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aursmith-worker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aursmith-domain",
- "aursmith-protocol",
- "aursmith-repository",
- "axum",
- "base64",
- "chrono",
- "clap",
- "hex",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tempfile",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "aursmithctl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aursmith-domain",
- "aursmith-protocol",
- "chrono",
- "clap",
- "hex",
- "serde_json",
- "sqlx",
- "tempfile",
- "tokio",
  "uuid",
 ]
 
