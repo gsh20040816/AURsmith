@@ -134,7 +134,7 @@ export type AgentFinding = {
 
 export type ScanFinding = {
   rule_id: string;
-  severity: "information" | "suspicious" | "block";
+  severity: "suspicious" | "block";
   path: string;
   summary: string;
 };

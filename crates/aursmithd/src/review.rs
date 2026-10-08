@@ -430,7 +430,6 @@ async fn set_outcome(state: &AppState, revision_id: &str, outcome: Outcome) -> a
     let next = match outcome {
         Outcome::Approved => "approved",
         Outcome::ManualReview => "manual_review",
-        Outcome::Rejected => "rejected",
     };
     sqlx::query("UPDATE revisions SET state = ?, decided_at = CASE WHEN ? = 'manual_review' THEN NULL ELSE ? END WHERE id = ? AND state = 'pending_review'")
         .bind(next)

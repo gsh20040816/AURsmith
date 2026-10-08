@@ -47,13 +47,12 @@ pub fn after_lows(first: Verdict, second: Verdict) -> LowStage {
     }
 }
 
-/// 审查最终去向。
+/// 审查最终去向。Agent 不能自动拒绝：最坏结果是人工审批（只有确定性扫描的 Block 会自动拒绝）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Approved,
     ManualReview,
-    Rejected,
 }
 
 /// 根据 Agent 结论计算最终去向。`high` 只有在 `after_lows` 要求升级时才应该存在；
