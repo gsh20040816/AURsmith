@@ -1,0 +1,25 @@
+{
+  "timeout_seconds": 600,
+  "low": [
+    {
+      "api": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-5-mini",
+      "api_key_file": "/run/secrets/low_agent_1_api_key",
+      "reasoning_effort": "medium"
+    },
+    {
+      "api": "anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "model": "claude-haiku-4-5",
+      "api_key_file": "/run/secrets/low_agent_2_api_key"
+    }
+  ],
+  "high": {
+    "api": "openai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-5",
+    "api_key_file": "/run/secrets/high_agent_api_key",
+    "reasoning_effort": "high"
+  }
+}

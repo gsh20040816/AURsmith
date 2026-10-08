@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restricted CONNECT tunnel; TLS stays between Publisher and archlinux.org."""
+"""Restricted CONNECT tunnel; TLS stays between aursmithd and archlinux.org."""
 import ipaddress
 import select
 import socket

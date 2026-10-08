@@ -85,6 +85,11 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
     },
+    /// 容器健康检查：请求本机 /healthz。
+    Healthcheck {
+        #[arg(long, default_value = "http://127.0.0.1:8080/healthz")]
+        url: String,
+    },
     /// 无网络签名器：处理 exchange inbox，签名并原子切换仓库。
     Signer {
         #[arg(
@@ -212,6 +217,18 @@ async fn main() -> anyhow::Result<()> {
             let mut connection = connect_plain(&database_url).await?;
             let counts = state::verify(&mut connection, &document).await?;
             print(&serde_json::json!({"verified": true, "counts": counts}))
+        }
+        Command::Healthcheck { url } => {
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()?
+                .get(&url)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                anyhow::bail!("健康检查失败：HTTP {}", response.status());
+            }
+            Ok(())
         }
         Command::Signer {
             exchange_dir,

@@ -1,6 +1,10 @@
 aursmith.shgao.top {
 	@health path /healthz
 	respond @health 404
+	# Builder 上传分片为 32 MiB；Cloudflare 代理时单个请求体上限 100 MB。
+	request_body {
+		max_size 40MB
+	}
 	reverse_proxy 127.0.0.1:18443
 	header {
 		X-Content-Type-Options nosniff
@@ -15,8 +19,10 @@ repo.shgao.top {
 		rewrite * /repo/archlinux{path}
 		reverse_proxy 127.0.0.1:19129
 	}
+	# signer 写入的仓库目录（AURSMITH_REPOSITORY_HOST_DIR），直接静态提供。
 	handle {
-		reverse_proxy 127.0.0.1:18081
+		root * /srv/aursmith/repo
+		file_server
 	}
 	@database path *.db *.db.* *.files *.files.* *.sig
 	header @database Cache-Control "no-cache, must-revalidate"

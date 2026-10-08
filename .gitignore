@@ -10,3 +10,5 @@
 *.db-wal
 /runtime
 /deploy/*/secrets
+/deploy/*/.env
+/deploy/server/review.json
