@@ -1,0 +1,55 @@
+# 家用 Builder：只主动访问公网 aursmithd（HTTPS），不需要 SSH、不暴露端口。
+name: aursmith-builder
+
+services:
+  # 一次性构建容器镜像；`docker compose --profile build-image build build-image`。
+  build-image:
+    profiles: [build-image]
+    image: aursmith-build:latest
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      target: build
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+        AURSMITH_ARCH_MIRROR: ${AURSMITH_ARCH_MIRROR:-https://mirrors.ustc.edu.cn/archlinux}
+        AURSMITH_ARCHLINUXCN_MIRROR: ${AURSMITH_ARCHLINUXCN_MIRROR:-https://mirrors.ustc.edu.cn/archlinuxcn}
+
+  builder:
+    init: true
+    image: aursmith/builder:${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      target: builder
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    group_add:
+      - ${DOCKER_GID:?请设置宿主机 Docker socket 所属 GID}
+    environment:
+      AURSMITH_SERVER_URL: ${AURSMITH_SERVER_URL:?必须设置公网 aursmithd HTTPS 地址}
+      AURSMITH_BUILDER_TOKEN_FILE: /run/secrets/builder_token
+      AURSMITH_BUILDER_ID: ${AURSMITH_BUILDER_ID:-home}
+      # 宿主机与容器内必须是同一个绝对路径：docker run 的 bind mount 由宿主机 dockerd 解析。
+      AURSMITH_JOBS_DIR: ${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}
+      AURSMITH_BUILD_CONCURRENCY: ${AURSMITH_BUILD_CONCURRENCY:-1}
+      AURSMITH_BUILD_CPUS: ${AURSMITH_BUILD_CPUS:-4}
+      AURSMITH_BUILD_MEMORY_MIB: ${AURSMITH_BUILD_MEMORY_MIB:-8192}
+      AURSMITH_BUILD_TIMEOUT_SECONDS: ${AURSMITH_BUILD_TIMEOUT_SECONDS:-14400}
+      AURSMITH_BUILD_IMAGE: aursmith-build:latest
+      RUST_LOG: ${RUST_LOG:-info}
+    secrets:
+      - builder_token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}:${AURSMITH_JOBS_DIR:?必须设置 Builder 宿主机绝对 jobs 路径}
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    restart: unless-stopped
+
+secrets:
+  builder_token:
+    file: ${AURSMITH_BUILDER_TOKEN_HOST_FILE:-./secrets/builder_token}

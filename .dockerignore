@@ -9,3 +9,5 @@ deploy/*/secrets
 *.db
 *.db-shm
 *.db-wal
+deploy/*/.env
+deploy/server/review.json

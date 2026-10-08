@@ -1,8 +1,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# 运行全部快速测试，不包含需要 KVM Guest 镜像的集成测试。
+# Rust 格式/lint/测试 + Web 测试与构建 + Compose 静态检查。
 test:
     bash scripts/test-all.sh
-# 渲染并检查四套 Compose 配置。
+
+# 只做 Compose 静态安全检查（不需要 docker）。
 compose-check:
-    bash scripts/check-compose-security.sh
+    python3 scripts/check-compose.py

@@ -2,6 +2,22 @@
 
 本项目使用语义化版本号。正式版发布前以预发布版本记录可部署里程碑；所有已知缺口必须同时写入发布说明和验收矩阵。
 
+## 未发布：架构全面简化
+
+### 变更
+
+- 9 个 crate / 7 个二进制合并为 `aursmith-core`、`aursmithd`、`aursmith-builder`（3 crate / 2 二进制）。
+- 审查由 3+1 改为 2+1：两个低成本 Agent 都批准才通过；任一拒绝、分歧或无效输出升级到高成本 Agent；高成本拒绝或出错进入人工审批；首次添加始终人工审批。`aursmithd` 直接调用 OpenAI / Anthropic API，删除 Runner 容器与凭据网关。
+- 公网节点从 8 个容器 / 11 个网络收敛为 `aursmithd` + 无网络 `signer` 2 个容器 / 1 个网络；仓库目录由宿主 Caddy 直接提供。
+- Builder 从 SSH/rrsync 推送改为 HTTPS 租约 + 32 MiB 分片上传（适配 Cloudflare 100 MB 请求体上限）。
+- 发布改为期望状态：`aursmithd` 写出内容寻址的 `plan.json`，signer 校验、签名、原子切换 `current`/`previous`；删除 ReleaseBatch、签名信封、授权阶段。
+- 3 个 SQLite 数据库 / 27 张表 / 35 个迁移合并为 1 个数据库 / 9 张表 / 1 个初始 schema；新增 `export`、`import`、`verify`、`legacy-export` 迁移工具。
+- 5 个 Dockerfile 合并为 1 个多 target `deploy/Dockerfile`；部署变量 86 → 32。
+
+### 迁移
+
+- 需要按 `docs/deployment.md` 第 2 节执行 `legacy-export` → `import` → `verify`，并在迁移后全量重建。旧构建与发布记录不迁移；GPG 钥匙沿用。
+
 ## 0.1.0-alpha.1（2026-08-10）
 
 首个单用户可部署预发布版本。

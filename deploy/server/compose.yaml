@@ -1,0 +1,99 @@
+# 公网节点：只有两个容器。
+#   aursmithd  Web/API、AUR 同步、2+1 审查、构建调度、期望状态发布计划
+#   signer     无网络签名器，唯一持有仓库签名私钥
+# pacman 仓库目录由宿主机 Caddy 直接以静态文件提供（见 ../netcup/Caddyfile.snippet）。
+name: aursmith
+
+x-hardening: &hardening
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+
+services:
+  aursmithd:
+    <<: *hardening
+    image: aursmith/aursmithd:${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      target: aursmithd
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    environment:
+      AURSMITH_PUBLIC_ORIGIN: ${AURSMITH_PUBLIC_ORIGIN:?必须设置管理站点的固定 HTTPS Origin}
+      AURSMITH_REPOSITORY_BASE_URL: ${AURSMITH_REPOSITORY_BASE_URL:?必须设置 pacman 仓库公开 HTTPS 地址}
+      AURSMITH_REPOSITORY_NAME: ${AURSMITH_REPOSITORY_NAME:-aursmith}
+      AURSMITH_BUILDER_TOKEN_SHA256: ${AURSMITH_BUILDER_TOKEN_SHA256:?必须设置 Builder Bearer token 的 SHA-256}
+      AURSMITH_REVIEW_CONFIG: /etc/aursmith/review.json
+      AURSMITH_UPDATE_INTERVAL_MINUTES: ${AURSMITH_UPDATE_INTERVAL_MINUTES:-30}
+      AURSMITH_SESSION_IDLE_MINUTES: ${AURSMITH_SESSION_IDLE_MINUTES:-60}
+      AURSMITH_SESSION_ABSOLUTE_HOURS: ${AURSMITH_SESSION_ABSOLUTE_HOURS:-168}
+      AURSMITH_ARCH_HTTPS_PROXY: ${AURSMITH_ARCH_HTTPS_PROXY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - data:/var/lib/aursmith
+      - exchange:/var/lib/aursmith-exchange
+      - ${AURSMITH_REVIEW_CONFIG_FILE:-./review.json}:/etc/aursmith/review.json:ro
+    secrets:
+      - low_agent_1_api_key
+      - low_agent_2_api_key
+      - high_agent_api_key
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    ports:
+      - ${AURSMITH_WEB_BIND:-127.0.0.1:18443}:8080
+    networks: [aursmith]
+    healthcheck:
+      test: [CMD, /usr/local/bin/aursmithd, healthcheck]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  signer:
+    <<: *hardening
+    image: aursmith/signer:${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      target: signer
+      args:
+        AURSMITH_SOURCE_GIT_COMMIT: ${AURSMITH_SOURCE_GIT_COMMIT:-development}
+    # 安全基线 1：签名私钥只存在于这个没有任何网络的容器里。
+    network_mode: none
+    environment:
+      AURSMITH_EXCHANGE_DIR: /var/lib/aursmith-exchange
+      AURSMITH_REPOSITORY_DIR: /srv/repo
+      AURSMITH_SIGNER_GPG_KEY_FILE: /run/secrets/repository_gpg_key
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - exchange:/var/lib/aursmith-exchange
+      - ${AURSMITH_REPOSITORY_HOST_DIR:?必须设置宿主机仓库目录（Caddy 直接提供）}:/srv/repo
+    secrets:
+      - repository_gpg_key
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /run/aursmith-gnupg:uid=10001,gid=10001,mode=0700,size=16m
+
+secrets:
+  low_agent_1_api_key:
+    file: ${AURSMITH_LOW_AGENT_1_API_KEY_FILE:-./secrets/low_agent_1_api_key}
+  low_agent_2_api_key:
+    file: ${AURSMITH_LOW_AGENT_2_API_KEY_FILE:-./secrets/low_agent_2_api_key}
+  high_agent_api_key:
+    file: ${AURSMITH_HIGH_AGENT_API_KEY_FILE:-./secrets/high_agent_api_key}
+  repository_gpg_key:
+    file: ${AURSMITH_GPG_PRIVATE_KEY_FILE:-./secrets/repository_gpg_private_key.asc}
+
+volumes:
+  data:
+  exchange:
+
+networks:
+  # 固定网段：可选的 Arch IPv6 CONNECT 通道（../netcup/arch-ipv6-proxy.py）只接受这个网段。
+  aursmith:
+    ipam:
+      config:
+        - subnet: 192.168.64.0/20
+          gateway: 192.168.64.1

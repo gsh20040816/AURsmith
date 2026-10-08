@@ -2,7 +2,7 @@ import { ReactNode, useMemo } from "react";
 import { api } from "../lib/api";
 import { usePolling, useStable } from "../lib/hooks";
 import { relativeTime, shortHash, formatCount } from "../lib/format";
-import { auditState, jobState, statusMeta } from "../lib/status";
+import { statusMeta } from "../lib/status";
 import { Badge, Button, Card, CardBody, CardHead, CardTitle, PageHead, Stat, StatusBadge } from "../components/ui";
 import { Pipeline } from "../components/Pipeline";
 import { useToast } from "../components/Toast";
@@ -10,113 +10,85 @@ import { IconAlert, IconCheck, IconClock, IconHammer, IconPackage, IconRefresh, 
 
 export function Dashboard() {
   const toast = useToast();
-  const loadDoctor = useStable(() => api.doctor());
-  const loadSubs = useStable(() => api.subscriptions());
-  const loadJobs = useStable(() => api.jobs());
-  const loadAudits = useStable(() => api.audits());
-  const loadReleases = useStable(() => api.releases());
+  const loadStatus = useStable(() => api.status());
+  const loadReviews = useStable(() => api.reviews());
+  const loadBuilds = useStable(() => api.builds());
+  const loadPublications = useStable(() => api.publications());
 
-  const doctor = usePolling(loadDoctor, 15000);
-  const subs = usePolling(loadSubs, 15000);
-  const jobs = usePolling(loadJobs, 15000);
-  const audits = usePolling(loadAudits, 15000);
-  const releases = usePolling(loadReleases, 15000);
+  const status = usePolling(loadStatus, 15000);
+  const reviews = usePolling(loadReviews, 15000);
+  const builds = usePolling(loadBuilds, 15000);
+  const publications = usePolling(loadPublications, 15000);
 
-  const pkgs = subs.data?.items ?? [];
-  const jobsList = jobs.data?.items ?? [];
-  const auditsList = audits.data?.items ?? [];
-  const releasesList = releases.data?.items ?? [];
+  const counts = status.data?.counts;
+  const reviewList = reviews.data?.items ?? [];
+  const buildList = builds.data?.items ?? [];
+  const publicationList = publications.data?.items ?? [];
+  const desired = publications.data?.desired;
 
-  const packageCount = pkgs.length;
-  const activeJobs = jobsList.filter((j) => ["queued", "no_eligible_worker", "dispatched", "running", "uncertain"].includes(j.status)).length;
-  const queued = jobsList.filter((j) => j.status === "queued").length;
-  const attention = auditsList.filter((a) => a.state === "manual_review").length;
-  const activeAudits = auditsList.filter((a) => ["agent_pending", "agent_running"].includes(a.state)).length;
-  const currentRelease = releasesList.find((r) => r.position === "current");
-  const failedRelease = releasesList.find((r) => r.position === "failed");
+  const attention = counts?.manual_review ?? 0;
+  const pendingReview = counts?.pending_review ?? 0;
+  const activeBuilds = (counts?.queued ?? 0) + (counts?.running ?? 0);
+  const current = publicationList.find((p) => p.current);
+  const latest = publicationList[0];
+  const converged = !!current && !!desired && current.plan_sha256 === desired.plan_sha256;
 
   const stages = useMemo(
     () => [
       { name: "同步", detail: "固定 AUR commit", state: "done" as const },
       {
         name: "审查",
-        detail: attention ? `${attention} 需人工处置` : activeAudits ? `${activeAudits} 正在运行` : "3+1 全部通过",
-        state: attention || activeAudits ? ("active" as const) : ("done" as const)
+        detail: attention ? `${attention} 需人工审批` : pendingReview ? `${pendingReview} 正在 2+1 审查` : "无待审 revision",
+        state: attention || pendingReview ? ("active" as const) : ("done" as const)
       },
       {
         name: "构建",
-        detail: activeJobs ? `${activeJobs} 个活动任务` : "队列空闲",
-        state: activeJobs ? ("active" as const) : ("idle" as const)
+        detail: activeBuilds ? `${activeBuilds} 个活动构建` : "队列空闲",
+        state: activeBuilds ? ("active" as const) : ("idle" as const)
       },
       {
         name: "发布",
-        detail: currentRelease ? `current · ${currentRelease.artifact_count} 个包` : "等待首个发布",
-        state: currentRelease ? ("done" as const) : ("idle" as const)
+        detail: converged ? `已收敛 · ${current?.artifacts.length ?? 0} 个包` : current ? "等待收敛到期望状态" : "等待首个发布",
+        state: converged ? ("done" as const) : current ? ("active" as const) : ("idle" as const)
       }
     ],
-    [attention, activeAudits, activeJobs, currentRelease]
+    [attention, pendingReview, activeBuilds, converged, current]
   );
 
-  const checks = doctor.data?.checks ?? [];
+  const checks = status.data?.checks ?? [];
+  const orderedChecks = [...checks.filter((c) => !c.ok), ...checks.filter((c) => c.ok)];
   const failedChecks = checks.filter((c) => !c.ok);
-  const okChecks = checks.filter((c) => c.ok);
-  const orderedChecks = [...failedChecks, ...okChecks];
-  const attentionBad = failedChecks.length > 0;
 
   const alerts = useMemo(() => {
     const items: Array<{ tone: "warning" | "danger"; text: string }> = [];
-    if (attention > 0) items.push({ tone: "warning", text: `${attention} 项审查待人工处置` });
-    if (attentionBad) items.push({ tone: "warning", text: `Doctor：${failedChecks.length} 项失败` });
-    if (failedRelease) items.push({ tone: "danger", text: `发布失败：${failedRelease.last_error || failedRelease.id}` });
+    if (attention > 0) items.push({ tone: "warning", text: `${attention} 个 revision 等待人工审批` });
+    if (latest?.state === "failed") items.push({ tone: "danger", text: `发布失败：${latest.error ?? latest.plan_sha256}` });
+    if ((desired?.withheld.length ?? 0) > 0) items.push({ tone: "warning", text: `暂缓发布：${desired?.withheld.join(", ")}` });
     return items;
-  }, [attention, attentionBad, failedChecks.length, failedRelease]);
+  }, [attention, latest, desired]);
 
   const activity = useMemo(() => {
     const items: Array<{ icon: ReactNode; title: string; sub: string; when: string }> = [];
-    for (const a of auditsList) {
-      const meta = auditState(a);
-      items.push({
-        icon: <IconShield size={15} />,
-        title: `${a.package_base} · 审查`,
-        sub: meta.label,
-        when: a.created_at
-      });
+    for (const r of reviewList.slice(0, 5)) {
+      items.push({ icon: <IconShield size={15} />, title: `${r.package_base} ${r.version}`, sub: statusMeta(r.state).label, when: r.decided_at ?? r.created_at });
     }
-    for (const j of jobsList.slice(0, 2)) {
-      const meta = jobState(j);
-      items.push({
-        icon: <IconHammer size={15} />,
-        title: `构建 ${shortHash(j.id, 6)}`,
-        sub: meta.label,
-        when: j.updated_at
-      });
+    for (const b of buildList.slice(0, 5)) {
+      items.push({ icon: <IconHammer size={15} />, title: `${b.package_base} 构建`, sub: statusMeta(b.state).label, when: b.finished_at ?? b.started_at ?? b.created_at });
+    }
+    for (const p of publicationList.slice(0, 3)) {
+      items.push({ icon: <IconRocket size={15} />, title: `发布 ${shortHash(p.plan_sha256, 8)}`, sub: statusMeta(p.state).label, when: p.finished_at ?? p.created_at });
     }
     items.sort((a, b) => new Date(b.when).getTime() - new Date(a.when).getTime());
-    return items.slice(0, 5);
-  }, [auditsList, jobsList]);
+    return items.slice(0, 6);
+  }, [reviewList, buildList, publicationList]);
 
-  const agentConfigs = useMemo(() => {
-    const seen = new Set<string>();
-    return auditsList
-      .flatMap((audit) => audit.runs)
-      .filter((run) => run.provider !== "unconfigured" && run.model !== "unconfigured")
-      .filter((run) => {
-        const key = `${run.tier}:${run.slot}:${run.provider}:${run.model}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, 4);
-  }, [auditsList]);
-
-  const loadError = doctor.error || subs.error || jobs.error || audits.error || releases.error;
+  const loadError = status.error || reviews.error || builds.error || publications.error;
 
   const refreshAll = () => {
-    doctor.reload();
-    subs.reload();
-    jobs.reload();
-    audits.reload();
-    releases.reload();
+    status.reload();
+    reviews.reload();
+    builds.reload();
+    publications.reload();
     toast.success("已刷新");
   };
 
@@ -158,70 +130,51 @@ export function Dashboard() {
 
         <div className="grid grid--stats">
           <Stat
-            label="待处置审查"
+            label="待人工审批"
             value={attention}
             unit="项"
             icon={<IconShield size={17} />}
-            foot={<span>{attention ? "需要人工裁决" : activeAudits ? "Agent 正在运行" : "无待办"}</span>}
+            foot={<span>{attention ? "首次添加或 Agent 未通过" : pendingReview ? "Agent 正在审查" : "无待办"}</span>}
           />
           <Stat
             label="活动构建"
-            value={activeJobs}
-            unit="任务"
+            value={activeBuilds}
+            unit="个"
             icon={<IconHammer size={17} />}
-            foot={<span>排队 {queued}</span>}
+            foot={<span>近 24 小时失败 {counts?.failed ?? 0}</span>}
           />
           <Stat
-            label="current 包数"
-            value={currentRelease ? formatCount(currentRelease.artifact_count) : packageCount || "—"}
+            label="仓库包数"
+            value={current ? formatCount(current.artifacts.length) : counts?.subscriptions || "—"}
             unit="包"
-            icon={currentRelease ? <IconRocket size={17} /> : <IconPackage size={17} />}
-            foot={
-              <span>
-                {currentRelease
-                  ? `manifest ${shortHash(currentRelease.manifest_sha256, 10)}`
-                  : failedRelease
-                    ? "发布失败"
-                    : "尚无发布"}
-              </span>
-            }
+            icon={current ? <IconRocket size={17} /> : <IconPackage size={17} />}
+            foot={<span>{current ? `plan ${shortHash(current.plan_sha256, 10)}` : "尚无发布"}</span>}
           />
         </div>
 
         <div className="dash-hero">
           <Card>
             <CardHead>
-              <CardTitle title={doctor.data?.ready ? "Doctor：就绪" : `Doctor：${failedChecks.length || "—"} 项失败`} />
-              <StatusBadge
-                meta={
-                  doctor.data?.ready
-                    ? statusMeta("ready")
-                    : { tone: "warning", label: "未就绪" }
-                }
-              />
+              <CardTitle title={status.data?.ready ? "系统状态：就绪" : `系统状态：${failedChecks.length || "—"} 项异常`} />
+              <StatusBadge meta={status.data?.ready ? statusMeta("ready") : { tone: "warning", label: "未就绪" }} />
             </CardHead>
             <CardBody>
-              <div className="doctor-list">
-                {doctor.loading && checks.length === 0 &&
-                  Array.from({ length: 5 }).map((_, i) => (
-                    <div className="doctor-row" key={i}>
+              <div className="check-list">
+                {status.loading && checks.length === 0 &&
+                  Array.from({ length: 4 }).map((_, i) => (
+                    <div className="check-row" key={i}>
                       <span className="skeleton" style={{ width: 180 }} />
                     </div>
                   ))}
-                {!doctor.loading && checks.length === 0 && (
-                  <div className="doctor-row">
-                    <span className="u-muted">没有 Doctor 检查项</span>
-                  </div>
-                )}
                 {orderedChecks.map((check) => (
-                  <div className={`doctor-row ${check.ok ? "is-ok" : "is-bad"}`} key={check.id}>
-                    <div className="doctor-row__name">
-                      <span className={`doctor-row__check ${check.ok ? "ok" : "bad"}`}>
+                  <div className={`check-row ${check.ok ? "is-ok" : "is-bad"}`} key={check.id}>
+                    <div className="check-row__name">
+                      <span className={`check-row__check ${check.ok ? "ok" : "bad"}`}>
                         {check.ok ? <IconCheck size={13} /> : <IconAlert size={13} />}
                       </span>
                       <span>{check.message}</span>
                     </div>
-                    <span className="doctor-row__msg">{check.ok ? "OK" : "FAIL"}</span>
+                    <span className="check-row__msg">{check.ok ? "OK" : "FAIL"}</span>
                   </div>
                 ))}
               </div>
@@ -258,18 +211,10 @@ export function Dashboard() {
         </div>
 
         <details className="dash-agent-details">
-          <summary>Agent 配置</summary>
+          <summary>审查规则（2+1）</summary>
           <div className="dash-agent-body">
-            <div className="dash-status__ai">
-              {agentConfigs.map((run) => (
-                <span className="ai-chip" key={`${run.tier}-${run.slot}-${run.provider}-${run.model}`}>
-                  <b>{run.tier === "high" ? "high" : `low ${run.slot}`}</b> {run.provider} · {run.model}
-                </span>
-              ))}
-              {agentConfigs.length === 0 && <span className="u-muted">尚无已执行的 Agent 配置</span>}
-            </div>
-            <p className="u-muted" style={{ marginTop: 12, fontSize: 12.5, lineHeight: 1.6 }}>
-              三个 low 独立配置，仅 diff-first 覆盖 AUR 包装层；上游下载内容不纳入审查范围。
+            <p className="u-muted" style={{ fontSize: 12.5, lineHeight: 1.7 }}>
+              两个低档 Agent 独立审查固定 AUR 包装层（非首次时附带与上一已批准 revision 的 diff）。两者都批准即通过；任一拒绝、意见不一致或输出无效时交给高档 Agent；高档批准即通过，拒绝或出错进入人工审批。首次添加的软件包始终需要人工审批，Agent 结论仅作参考。上游下载内容不纳入审查范围。
             </p>
           </div>
         </details>

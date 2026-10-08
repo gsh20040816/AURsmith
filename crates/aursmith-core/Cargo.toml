@@ -1,0 +1,17 @@
+[package]
+name = "aursmith-core"
+description = "AURsmith 共享领域逻辑：名称校验、.SRCINFO、确定性扫描、2+1 审查规则、依赖图与线协议"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+argon2.workspace = true
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
