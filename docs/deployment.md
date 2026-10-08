@@ -69,10 +69,12 @@ docker compose ps        # aursmithd healthy；signer running
 4. **构建新镜像**：`cd deploy/server && docker compose build`。
 5. **导出旧状态**（只读打开备份副本）：
    ```sh
-   docker run --rm --read-only -v /root/aursmith-migration:/m aursmith/aursmithd:development \
+   docker run --rm --read-only --tmpfs /tmp:size=256m,mode=1777 \
+     -v /root/aursmith-migration:/m aursmith/aursmithd:development \
      legacy-export --legacy-database-url 'sqlite:///m/controller.db?mode=ro' --output /m/legacy-state.json
    ```
    导出内容：管理员（含口令哈希）、订阅、Provider 选择、包同步状态、每个包最新已批准 revision（作为新审查 baseline）。旧构建与发布记录不迁移。
+   SQLite 对较大的旧库排序时需要可写临时目录；只读容器必须保留上述 `/tmp` 挂载。
 6. **导入新库并校验**（新库必须为空，导入在单事务内逐表校验后才提交）：
    ```sh
    docker compose run --rm -v /root/aursmith-migration/legacy-state.json:/mnt/state.json:ro aursmithd import --input /mnt/state.json
@@ -80,9 +82,11 @@ docker compose ps        # aursmithd healthy；signer running
    ```
 7. **迁移仓库文件**（保持 current 可用，客户端在新栈第一次发布前不中断）：
    ```sh
-   rsync -a /var/lib/docker/volumes/aursmith-publisher_publisher-hot/_data/ /srv/aursmith/repo/
+   rsync -aH /var/lib/docker/volumes/aursmith-publisher_publisher-hot/_data/ /srv/aursmith/repo/
    chown -R 10001:10001 /srv/aursmith/repo
+   chmod -R a+rX /srv/aursmith/repo
    ```
+   `-H` 保留 release 与仓库根目录之间的硬链接；公开仓库文件需允许宿主 Caddy 读取。
 8. **切换 Caddy**：用新片段替换旧的 `repo.*` 与管理站点配置，`caddy reload`。
 9. **启动新栈**：`docker compose up -d`；登录 Web（旧管理员口令），确认订阅数、待审数与旧库一致。
 10. **全量重建**：在“订阅”页对需要的包点“重建”，或等下一次同步周期自动排队；首次发布会生成新的 keyring 包版本并原子切换 `current`。
