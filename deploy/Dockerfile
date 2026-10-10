@@ -68,6 +68,7 @@ FROM archlinux:base@sha256:b860afd5823683f7ea389ba5f00d812f4fe55f6f286dea329d2ab
 ARG AURSMITH_ARCH_MIRROR=https://mirrors.ustc.edu.cn/archlinux
 ARG AURSMITH_ARCHLINUXCN_MIRROR=https://mirrors.ustc.edu.cn/archlinuxcn
 COPY deploy/common/pacman-aursmith.conf /etc/pacman.conf
+COPY deploy/common/certificates/sectigo-dv-e36.pem /etc/aursmith/sectigo-dv-e36.pem
 RUN for mirror in "${AURSMITH_ARCH_MIRROR}" "${AURSMITH_ARCHLINUXCN_MIRROR}"; do \
       case "${mirror}" in https://*) ;; *) echo '镜像地址必须是 HTTPS URL' >&2; exit 1 ;; esac; \
       case "${mirror}" in *[[:space:]]*|*'@'*|*'?'*|*'#'*) echo '镜像地址不能包含空白、凭据、查询参数或片段' >&2; exit 1 ;; esac; \
@@ -79,11 +80,18 @@ RUN for mirror in "${AURSMITH_ARCH_MIRROR}" "${AURSMITH_ARCHLINUXCN_MIRROR}"; do
     && pacman -Sy --noconfirm --needed archlinux-keyring archlinuxcn-keyring \
     && pacman-key --populate archlinux archlinuxcn \
     && pacman -Syu --noconfirm --needed base-devel ca-certificates git gnupg sudo \
+        libx11 libxext libxrandr libxinerama libxcursor libxi \
+        mesa wayland libxkbcommon gtk3 gtk4 libadwaita \
+        qt6-base qt6-declarative qt6-webengine qt6-webchannel qt6-websockets \
+        appstream appstream-glib desktop-file-utils hicolor-icon-theme \
+    && openssl verify /etc/aursmith/sectigo-dv-e36.pem \
+    && cat /etc/ssl/certs/ca-certificates.crt /etc/aursmith/sectigo-dv-e36.pem > /etc/aursmith/download-ca.pem \
     && rm -rf /var/cache/pacman/pkg/* \
     && useradd --uid 1000 --create-home --shell /bin/bash builder \
     && printf 'builder ALL=(root) NOPASSWD: /usr/bin/pacman\n' > /etc/sudoers.d/aursmith-builder \
     && chmod 0440 /etc/sudoers.d/aursmith-builder \
     && install -d -o builder -g builder /build /mnt/aursmith-input /mnt/aursmith-output
+ENV CURL_CA_BUNDLE=/etc/aursmith/download-ca.pem
 COPY deploy/common/makepkg-aursmith.conf /etc/aursmith/makepkg.conf
 COPY --from=rust /src/target/release/aursmith-builder /usr/local/bin/aursmith-builder
 ENTRYPOINT ["/usr/local/bin/aursmith-builder", "guest"]

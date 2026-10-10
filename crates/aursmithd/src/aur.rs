@@ -484,6 +484,11 @@ async fn run_git_output(directory: &Path, arguments: &[&str]) -> anyhow::Result<
         .map(|value| value.trim().to_owned())
 }
 
+// makepkg 的 ?signed 是 VCS 校验标志，不是 Git ref 或 HTTP 查询参数。
+fn git_source_url(source: &str) -> anyhow::Result<Url> {
+    Url::parse(source.strip_suffix("?signed").unwrap_or(source)).context("Git VCS source URL 无效")
+}
+
 async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<String>> {
     let Some(source) = git_vcs_source(sources) else {
         return Ok(None);
@@ -493,7 +498,7 @@ async fn resolve_git_vcs_commit(sources: &[String]) -> anyhow::Result<Option<Str
         .map(|(_, value)| value)
         .unwrap_or(source)
         .trim_start_matches("git+");
-    let url = Url::parse(source).context("Git VCS source URL 无效")?;
+    let url = git_source_url(source)?;
     if !url.username().is_empty() || url.password().is_some() {
         bail!("Git VCS source URL 不允许内嵌凭据");
     }
@@ -635,7 +640,27 @@ fn validate_query(value: &str) -> anyhow::Result<&str> {
 
 #[cfg(test)]
 mod official_tests {
-    use super::OfficialPackage;
+    use super::{OfficialPackage, git_source_url};
+
+    #[test]
+    fn signed_git_sources_preserve_the_ref() {
+        for (source, fragment) in [
+            (
+                "https://example.org/repo.git#tag=7.4.1?signed",
+                Some("tag=7.4.1"),
+            ),
+            (
+                "https://example.org/repo.git#branch=main?signed",
+                Some("branch=main"),
+            ),
+            ("https://example.org/repo.git?signed", None),
+            ("https://example.org/repo.git#tag=v1", Some("tag=v1")),
+        ] {
+            let url = git_source_url(source).unwrap();
+            assert_eq!(url.fragment(), fragment);
+            assert_eq!(url.query(), None);
+        }
+    }
 
     #[test]
     fn official_provider_names_ignore_version_constraints() {

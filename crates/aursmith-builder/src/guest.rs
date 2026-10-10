@@ -96,19 +96,24 @@ fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
     if fingerprints.is_empty() {
         return Ok(());
     }
-    let mut arguments = vec![
-        "/usr/bin/gpg",
-        "--batch",
-        "--keyserver",
-        "hkps://keyserver.ubuntu.com",
-        "--recv-keys",
-    ];
-    arguments.extend(fingerprints.iter().map(String::as_str));
-    let status = run_as_builder(&arguments, None)?;
-    if !status.success() {
-        bail!("GUEST_PGP_FAILED: 无法从 keyserver 获取 validpgpkeys");
-    }
+    let log = Path::new(OUTPUT).join("build.log");
     for fingerprint in &fingerprints {
+        let mut imported = false;
+        for arguments in pgp_key_commands(fingerprint) {
+            let references = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            if run_as_builder(&references, Some(&log))?.success() {
+                imported = true;
+                break;
+            }
+        }
+        if !imported {
+            let code = if classify_makepkg_failure(&log) == "BUILD_NETWORK_TRANSIENT" {
+                "BUILD_NETWORK_TRANSIENT"
+            } else {
+                "GUEST_PGP_FAILED"
+            };
+            bail!("{code}: 无法获取声明的公钥 {fingerprint}，详情见 build.log");
+        }
         let output = Command::new("/usr/bin/runuser")
             .args(builder_command_arguments(&[
                 "/usr/bin/gpg",
@@ -134,6 +139,34 @@ fn import_declared_pgp_keys(build: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 固定的可信发现地址；取回后仍严格比对 .SRCINFO 的完整指纹。
+fn pgp_key_commands(fingerprint: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    if fingerprint == "EF6E286DDA85EA2A4BA7DE684E2C6E8793298290" {
+        commands.push(vec![
+            "/usr/bin/gpg".into(),
+            "--batch".into(),
+            "--auto-key-locate".into(),
+            "clear,wkd".into(),
+            "--locate-external-keys".into(),
+            "torbrowser@torproject.org".into(),
+        ]);
+    }
+    for server in ["hkps://keyserver.ubuntu.com", "hkps://keys.openpgp.org"] {
+        commands.push(vec![
+            "/usr/bin/gpg".into(),
+            "--batch".into(),
+            "--keyserver-options".into(),
+            "timeout=30".into(),
+            "--keyserver".into(),
+            server.into(),
+            "--recv-keys".into(),
+            fingerprint.into(),
+        ]);
+    }
+    commands
 }
 
 pub fn declared_pgp_fingerprints(srcinfo: &str) -> anyhow::Result<Vec<String>> {
@@ -477,6 +510,21 @@ fn run_checked(executable: &str, arguments: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tor_uses_wkd_before_keyservers_and_other_keys_use_fallback() {
+        let tor = pgp_key_commands("EF6E286DDA85EA2A4BA7DE684E2C6E8793298290");
+        assert_eq!(tor.len(), 3);
+        assert!(tor[0].iter().any(|arg| arg == "torbrowser@torproject.org"));
+        let other = pgp_key_commands("20EE325B86A81BCBD3E56798F04367096FBA95E8");
+        assert_eq!(other.len(), 2);
+        assert!(other[1].iter().any(|arg| arg == "hkps://keys.openpgp.org"));
+        assert!(
+            other
+                .iter()
+                .all(|cmd| cmd.last().unwrap() == "20EE325B86A81BCBD3E56798F04367096FBA95E8")
+        );
+    }
 
     #[test]
     fn makepkg_arguments_respect_check_policy() {

@@ -137,3 +137,18 @@ docker compose logs -f builder
 7. 独立 Arch 客户端执行 `pacman -Sy` 与一次安装验证。
 
 同机副本不是灾备；异机存储与密钥托管由宿主工具负责。
+
+## 构建环境兼容性
+
+构建镜像预装一组常用桌面库（X11、Wayland、Mesa、GTK3/4、libadwaita、Qt6 WebEngine、
+AppStream 等），清单见 `deploy/Dockerfile`。这些只是构建环境，不会自动成为产物的运行时依赖；
+上游漏报的运行时依赖仍需要包维护者修正。构建仍直接调用 `makepkg --syncdeps --cleanbuild`，
+不修改上游源码或为兼容性重写 PKGBUILD，不跳过 `check()`、源文件摘要、PGP 或 TLS 校验。
+
+公钥先按已知 Tor 指纹使用官方 WKD，其余按完整指纹依次查询 Ubuntu/OpenPGP keyserver；
+取回后验证声明指纹。MotionPro 下载站缺失的 Sectigo 中间证书经过系统根证书验证后加入
+curl 专用 bundle，见 `deploy/common/certificates/README.md`。
+
+大型 C++/Qt 构建可能超过默认 8 GiB 内存。desktop 单任务部署使用 32 GiB、4 CPU；
+调整 `.env` 的 `AURSMITH_BUILD_MEMORY_MIB=32768` 后重建 Builder 容器生效。
+不要把 CPU 配额误当成所有构建工具都遵守的编译线程数上限。
